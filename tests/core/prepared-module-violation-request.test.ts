@@ -5,6 +5,7 @@ import {
   type ModuleViolationContext,
 } from '../../packages/core/src/services/llm/provider.js';
 import { prepareModuleViolationRequest } from '../../packages/core/src/services/llm/prepared-module-violation-request.js';
+import { planModuleViolationWork } from '../../packages/core/src/services/llm/module-work-planner.js';
 
 const RULE_KEY = 'module/llm/dependency-review';
 
@@ -118,7 +119,11 @@ describe('prepared module violation requests', () => {
 
   it('makes the provider execute the exact prepared normal request with a unique attempt identity', async () => {
     const context = moduleContext(true);
-    const expected = prepareModuleViolationRequest(context, 'normal');
+    const planned = planModuleViolationWork(context, 'normal', {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     const transport: LlmTransport = async (request) => {
       captured = request;
@@ -146,8 +151,8 @@ describe('prepared module violation requests', () => {
     });
     expect(captured).toEqual({
       id: expect.stringMatching(/^llm\.module\.attempt:[a-f0-9-]{36}$/),
-      workId: undefined,
-      inputFingerprint: undefined,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: 'analyze.module',
       user: expected.prompt,
       system: expected.system,
@@ -160,7 +165,11 @@ describe('prepared module violation requests', () => {
 
   it('maps an in-flight lifecycle result through the prepared binding snapshots', async () => {
     const context = moduleContext(true);
-    const expected = prepareModuleViolationRequest(context, 'lifecycle');
+    const planned = planModuleViolationWork(context, 'lifecycle', {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     let started!: () => void;
     let release!: () => void;
@@ -213,8 +222,8 @@ describe('prepared module violation requests', () => {
     });
     expect(captured).toEqual({
       id: expect.stringMatching(/^llm\.module\.attempt:[a-f0-9-]{36}$/),
-      workId: undefined,
-      inputFingerprint: undefined,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: 'analyze.module-lifecycle',
       user: expected.prompt,
       system: expected.system,

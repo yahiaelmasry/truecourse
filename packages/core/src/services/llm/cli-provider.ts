@@ -37,7 +37,7 @@ import {
 import { planCodeViolationWork } from './code-work-planner.js';
 import { planDatabaseViolationWork } from './database-work-planner.js';
 import { planServiceViolationWork } from './service-work-planner.js';
-import { prepareModuleViolationRequest } from './prepared-module-violation-request.js';
+import { planModuleViolationWork } from './module-work-planner.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -676,7 +676,11 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: ModuleViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ModuleViolationsResult> {
-    const request = prepareModuleViolationRequest(context, 'normal');
+    const planned = planModuleViolationWork(context, 'normal', {
+      provider: this.transport ? 'transport:unverified' : 'claude-code',
+      requestedModel: this.modelFlag[1] ?? null,
+    });
+    const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const moduleIdToServiceId = new Map(
       request.moduleServiceBindings.map(({ moduleRuntimeId, serviceRuntimeId }) =>
@@ -687,6 +691,8 @@ export abstract class BaseCLIProvider implements LLMProvider {
     const t0 = Date.now();
     const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
       id: `llm.module.attempt:${randomUUID()}`,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       extraArgs: ['--tools', ''],
       label: request.label,
       timeoutMs: request.timeoutMs,
@@ -839,7 +845,11 @@ export abstract class BaseCLIProvider implements LLMProvider {
       const ctx = contexts.module;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['module', (async () => {
-          const request = prepareModuleViolationRequest(ctx, 'lifecycle');
+          const planned = planModuleViolationWork(ctx, 'lifecycle', {
+            provider: this.transport ? 'transport:unverified' : 'claude-code',
+            requestedModel: this.modelFlag[1] ?? null,
+          });
+          const request = planned.request;
           const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
           const moduleIdToServiceId = new Map(
             request.moduleServiceBindings.map(({ moduleRuntimeId, serviceRuntimeId }) =>
@@ -849,6 +859,8 @@ export abstract class BaseCLIProvider implements LLMProvider {
           const t0 = Date.now();
           const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
             id: `llm.module.attempt:${randomUUID()}`,
+            workId: planned.workId,
+            inputFingerprint: planned.inputFingerprint,
             extraArgs: ['--tools', ''],
             label: request.label,
             timeoutMs: request.timeoutMs,
