@@ -860,6 +860,7 @@ export async function runViolationPipeline(input: ViolationPipelineInput): Promi
         domainCodeBatches.get(domain)!.push({
           files,
           sourceScopes: batch.sourceScopes,
+          sources: batch.sources,
           llmRules: rules,
           tier: batch.tier,
           existingViolations: domainExisting.length > 0 ? domainExisting : undefined,

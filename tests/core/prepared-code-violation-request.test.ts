@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { LlmRequest, LlmTransport } from '../../packages/shared/src/llm/transport.js';
 import { createLLMProvider, type CodeViolationContext } from '../../packages/core/src/services/llm/provider.js';
 import { prepareCodeViolationRequest } from '../../packages/core/src/services/llm/prepared-code-violation-request.js';
+import { planCodeViolationWork } from '../../packages/core/src/services/llm/code-work-planner.js';
 
 function targetedContext(withPrior = false): CodeViolationContext {
   return {
@@ -73,7 +74,11 @@ describe('prepared code violation requests', () => {
 
   it('makes the provider execute the exact prepared targeted request', async () => {
     const context = targetedContext();
-    const expected = prepareCodeViolationRequest(context);
+    const planned = planCodeViolationWork(context, {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     const transport: LlmTransport = async (request) => {
       captured = request;
@@ -84,6 +89,9 @@ describe('prepared code violation requests', () => {
     await expect(provider.generateCodeViolations(context)).resolves.toEqual({ violations: [] });
 
     expect(captured).toEqual({
+      id: expect.stringMatching(/^llm\.code\.attempt:[a-f0-9-]{36}$/),
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: expected.stage,
       user: expected.prompt,
       system: expected.system,
@@ -96,7 +104,11 @@ describe('prepared code violation requests', () => {
 
   it('certifies an in-flight lifecycle result against the prepared ownership snapshot', async () => {
     const context = targetedContext(true);
-    const expected = prepareCodeViolationRequest(context);
+    const planned = planCodeViolationWork(context, {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     let started!: () => void;
     let release!: () => void;
@@ -141,6 +153,9 @@ describe('prepared code violation requests', () => {
       unchangedViolationIds: ['runtime-prior-id'],
     });
     expect(captured).toEqual({
+      id: expect.stringMatching(/^llm\.code\.attempt:[a-f0-9-]{36}$/),
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: expected.stage,
       user: expected.prompt,
       system: expected.system,

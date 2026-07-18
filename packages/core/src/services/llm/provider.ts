@@ -1,4 +1,4 @@
-import type { Violation } from '@truecourse/shared';
+import type { ContextRequirement, Violation } from '@truecourse/shared';
 import { ClaudeCodeProvider } from './cli-provider.js';
 import {
   getDefaultTransport,
@@ -118,10 +118,29 @@ export interface CodeSourceScope {
   ranges: CodeSourceRange[];
 }
 
+export type CodeMetadataField = NonNullable<ContextRequirement['metadataFields']>[number];
+
+export interface CodeContextSource {
+  path: string;
+  selection:
+    | { kind: 'metadata'; fields: CodeMetadataField[] }
+    | { kind: 'full-file' }
+    | {
+        kind: 'targeted';
+        functions: Array<{
+          name: string;
+          startLine: number;
+          endLine: number;
+        }>;
+      };
+}
+
 export interface CodeViolationContext {
   files: { path: string; content: string }[];
   /** Exact source ranges supplied to this work unit and therefore owned by its result. */
   sourceScopes: CodeSourceScope[];
+  /** Exact repository selections used to construct this work unit. */
+  sources?: CodeContextSource[];
   llmRules: { key: string; name: string; severity: string; prompt: string }[];
   /** Context tier — determines which prompt template to use */
   tier?: 'metadata' | 'targeted' | 'full-file';

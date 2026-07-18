@@ -40,9 +40,12 @@ export { parseLlmSessionLimitError };
 export { OUTPUT_ONLY_GUARDRAIL } from './guardrail.js';
 
 export interface LlmRequest {
-  /** Stable id (the runner's natural id, e.g. `contract.extract:<sliceId>`).
-   *  Falls back to a content hash when absent. */
+  /** Exact-input transport/resume key. Falls back to a content hash when absent. */
   id?: string;
+  /** Stable semantic work identity, when the caller has certified one. */
+  workId?: string;
+  /** Complete reuse-relevant input fingerprint for the certified work. */
+  inputFingerprint?: string;
   /** Pipeline stage, e.g. `spec.relevance` / `contract.extract` — informational. */
   stage?: string;
   /** Primary model (cli passes `--model`; agent treats it as a hint). */
@@ -730,7 +733,7 @@ export interface AgentTransportOptions {
 
 /**
  * Mailbox protocol under `ioDir`:
- *   requests/<id>.json   { id, stage, model, fallbackModel, responseFormat, schema, system, user }
+ *   requests/<id>.json   { id, workId?, inputFingerprint?, stage, model, fallbackModel, responseFormat, schema, system, user }
  *   responses/<id>.json  { text } | { error }
  * Both files are written atomically (write-tmp + rename) so neither side reads
  * a partial file. Each concurrent transport call owns one id; the runner's own
@@ -757,6 +760,8 @@ export function agentTransport(ioDir: string, opts: AgentTransportOptions = {}):
         JSON.stringify(
           {
             id,
+            workId: req.workId,
+            inputFingerprint: req.inputFingerprint,
             stage: req.stage,
             model: req.model,
             fallbackModel: req.fallbackModel,

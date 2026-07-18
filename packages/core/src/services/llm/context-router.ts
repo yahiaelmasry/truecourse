@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import type { AnalysisRule, FileAnalysis, ContextRequirement, ContextTier, FileFilter, FunctionFilter } from '@truecourse/shared';
 import { DATABASE_IMPORT_MAP, getAllTestPatterns } from '@truecourse/analyzer';
-import type { CodeSourceScope } from './provider.js';
+import type { CodeContextSource, CodeMetadataField, CodeSourceScope } from './provider.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -22,20 +22,7 @@ export interface ContextBatch {
   sources: ContextBatchSource[];
 }
 
-export interface ContextBatchSource {
-  path: string;
-  selection:
-    | { kind: 'metadata'; fields: MetadataField[] }
-    | { kind: 'full-file' }
-    | {
-        kind: 'targeted';
-        functions: Array<{
-          name: string;
-          startLine: number;
-          endLine: number;
-        }>;
-      };
-}
+export type ContextBatchSource = CodeContextSource;
 
 export interface PreFlightEstimate {
   tiers: Array<{
@@ -218,7 +205,7 @@ function extractTargetedFunctions(
 // Metadata summary builder
 // ---------------------------------------------------------------------------
 
-export type MetadataField = NonNullable<ContextRequirement['metadataFields']>[number];
+export type MetadataField = CodeMetadataField;
 
 function buildMetadataSummary(fa: FileAnalysis, fields: MetadataField[], lineCount: number): string {
   const parts: string[] = [`=== ${fa.filePath} (lines 1-${Math.max(1, lineCount)}) ===`];

@@ -37,13 +37,13 @@ import {
   FlowEnrichmentOutputSchema,
 } from './schemas.js';
 import {
-  prepareCodeViolationRequest,
   type PreparedCodeOwnership,
 } from './prepared-code-violation-request.js';
 import {
   serializePreparedRequestSchema,
   type PreparedLlmRequest,
 } from './prepared-request.js';
+import { planCodeViolationWork } from './code-work-planner.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -82,6 +82,10 @@ interface SpawnOptions {
   stage?: string;
   system?: string;
   responseFormat?: 'json' | 'text';
+  /** Stable semantic identity of the planned work unit. */
+  id?: string;
+  workId?: string;
+  inputFingerprint?: string;
 }
 
 interface CLIUsage {
@@ -301,6 +305,9 @@ export abstract class BaseCLIProvider implements LLMProvider {
     // it exactly as it does for the CLI's `result` field.
     if (this.transport) {
       return this.transport({
+        id: opts?.id,
+        workId: opts?.workId,
+        inputFingerprint: opts?.inputFingerprint,
         stage: opts?.stage ?? `analyze.${label}`,
         user: prompt,
         system: opts?.system ?? '',
@@ -955,7 +962,19 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: CodeViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<CodeViolationsResult> {
-    const request = prepareCodeViolationRequest(context);
+    const planned = planCodeViolationWork(context, {
+      // An injected transport does not currently expose its served provider.
+      // Keep that uncertainty explicit so future reuse fails closed until an
+      // execution receipt can prove the provider/model that answered.
+      provider: this.transport ? 'transport:unverified' : 'claude-code',
+      requestedModel: this.modelFlag[1] ?? null,
+      repositoryRoot: this._repoPath,
+    });
+    const request = planned.request;
+    // Keep transport attempts unique. A pre-execution plan has no served
+    // provider/model receipt (and Read-enabled work has no read-set receipt),
+    // so agentTransport must not resume a prior response yet.
+    const transportId = `llm.code.attempt:${randomUUID()}`;
     const hasExisting = request.resultContractId === 'analyze.code-lifecycle@1';
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
 
@@ -967,6 +986,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
 
     if (hasExisting) {
       const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+        id: transportId, workId: planned.workId, inputFingerprint: planned.inputFingerprint,
         extraArgs: codeExtraArgs, label: request.label, timeoutMs: request.timeoutMs, onStart: opts?.onStart,
       });
       certifyCodeResultOwnership(request.ownership, object.newViolations);
@@ -998,6 +1018,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     }
 
     const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+      id: transportId, workId: planned.workId, inputFingerprint: planned.inputFingerprint,
       extraArgs: codeExtraArgs, label: request.label, timeoutMs: request.timeoutMs, onStart: opts?.onStart,
     });
     certifyCodeResultOwnership(request.ownership, object.violations);
