@@ -7,7 +7,6 @@ import pLimit, { type LimitFunction } from 'p-limit';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { registerChildProcess, unregisterChildProcess } from '../analysis-registry.js';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { ZodType } from 'zod';
 import type { Violation } from '@truecourse/shared';
 import {
@@ -22,7 +21,6 @@ import {
   buildServiceTemplateVars,
   buildDatabaseTemplateVars,
   buildModuleTemplateVars,
-  buildCodeTemplateVars,
   buildFlowTemplateVars,
   resolveId,
   resolveIds,
@@ -36,10 +34,16 @@ import {
   ModuleViolationOutputSchema,
   DiffViolationOutputSchema,
   LifecycleServiceOutputSchema,
-  CodeViolationOutputSchema,
-  CodeViolationLifecycleOutputSchema,
   FlowEnrichmentOutputSchema,
 } from './schemas.js';
+import {
+  prepareCodeViolationRequest,
+  type PreparedCodeOwnership,
+} from './prepared-code-violation-request.js';
+import {
+  serializePreparedRequestSchema,
+  type PreparedLlmRequest,
+} from './prepared-request.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -74,6 +78,10 @@ interface SpawnOptions {
   extraArgs?: string[];
   /** Fires once the concurrency limiter grants a slot, before spawnCLI runs. */
   onStart?: () => void;
+  /** Exact provider-independent request metadata, when the request was prepared up front. */
+  stage?: string;
+  system?: string;
+  responseFormat?: 'json' | 'text';
 }
 
 interface CLIUsage {
@@ -86,12 +94,12 @@ interface CLIUsage {
 }
 
 function certifyCodeResultOwnership(
-  context: CodeViolationContext,
+  ownership: PreparedCodeOwnership,
   violations: CodeViolationRaw[],
 ): void {
-  const allowedRules = new Set(context.llmRules.map((rule) => rule.key));
-  const allowedSources = new Map<string, CodeViolationContext['sourceScopes'][number]['ranges']>();
-  for (const scope of context.sourceScopes) {
+  const allowedRules = new Set(ownership.ruleKeys);
+  const allowedSources = new Map<string, PreparedCodeOwnership['sourceScopes'][number]['ranges'][number][]>();
+  for (const scope of ownership.sourceScopes) {
     const ranges = allowedSources.get(scope.path) ?? [];
     ranges.push(...scope.ranges);
     allowedSources.set(scope.path, ranges);
@@ -113,7 +121,7 @@ function certifyCodeResultOwnership(
     }
 
     const rangeIsOwned = violation.lineEnd >= violation.lineStart && ranges.some((range) =>
-      context.tier === 'metadata'
+      ownership.tier === 'metadata'
         ? violation.lineStart === range.lineStart && violation.lineEnd === range.lineEnd
         : violation.lineStart >= range.lineStart && violation.lineEnd <= range.lineEnd,
     );
@@ -132,17 +140,17 @@ function certifyCodeResultOwnership(
 }
 
 function certifyNoPriorCodeCollision(
-  context: CodeViolationContext,
+  ownership: PreparedCodeOwnership,
   newViolations: CodeViolationRaw[],
 ): void {
-  const priorKeys = new Set((context.existingViolations ?? []).map((violation) =>
-    context.tier === 'metadata'
+  const priorKeys = new Set(ownership.priorFindings.map((violation) =>
+    ownership.tier === 'metadata'
       ? `${violation.ruleKey}\0${violation.filePath}\0${violation.title}`
       : `${violation.ruleKey}\0${violation.filePath}\0${violation.lineStart}\0${violation.lineEnd}\0${violation.title}`,
   ));
 
   for (const violation of newViolations) {
-    const key = context.tier === 'metadata'
+    const key = ownership.tier === 'metadata'
       ? `${violation.ruleKey}\0${violation.filePath}\0${violation.title}`
       : `${violation.ruleKey}\0${violation.filePath}\0${violation.lineStart}\0${violation.lineEnd}\0${violation.title}`;
     if (priorKeys.has(key)) {
@@ -274,8 +282,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
 
   /** Convert a Zod schema to JSON Schema string for --json-schema flag. */
   protected toJsonSchema(schema: ZodType): string {
-    const jsonSchema = zodToJsonSchema(schema, { target: 'openApi3' });
-    return JSON.stringify(jsonSchema);
+    return serializePreparedRequestSchema(schema);
   }
 
   /** Spawn CLI subprocess, pipe prompt via stdin, collect stdout. */
@@ -294,11 +301,11 @@ export abstract class BaseCLIProvider implements LLMProvider {
     // it exactly as it does for the CLI's `result` field.
     if (this.transport) {
       return this.transport({
-        stage: `analyze.${label}`,
+        stage: opts?.stage ?? `analyze.${label}`,
         user: prompt,
-        system: '',
+        system: opts?.system ?? '',
         schema: jsonSchemaStr,
-        responseFormat: 'json',
+        responseFormat: opts?.responseFormat ?? 'json',
         model: this.modelFlag[1],
         timeoutMs: timeout,
       }).then((text) => JSON.stringify({ result: text }));
@@ -421,6 +428,13 @@ export abstract class BaseCLIProvider implements LLMProvider {
    * The response is a JSON envelope with structured_output containing validated data.
    */
   protected parseAndValidate<T>(raw: string, schema: ZodType<T>): { data: T; usage?: CLIUsage } {
+    return this.parseAndValidatePrepared(raw, (value) => schema.parse(value));
+  }
+
+  private parseAndValidatePrepared<T>(
+    raw: string,
+    parse: (value: unknown) => T,
+  ): { data: T; usage?: CLIUsage } {
     const parsed = JSON.parse(raw.trim());
     const usage = this.extractCLIUsage(parsed);
 
@@ -431,13 +445,13 @@ export abstract class BaseCLIProvider implements LLMProvider {
     }
 
     if (parsed.structured_output) {
-      return { data: schema.parse(parsed.structured_output), usage };
+      return { data: parse(parsed.structured_output), usage };
     }
 
     // Fallback: try parsing the result field as JSON
     if (parsed.result) {
       const data = typeof parsed.result === 'string' ? JSON.parse(parsed.result) : parsed.result;
-      return { data: schema.parse(data), usage };
+      return { data: parse(data), usage };
     }
 
     throw new Error(`[CLI] No structured_output in response (subtype: ${parsed.subtype})`);
@@ -447,6 +461,23 @@ export abstract class BaseCLIProvider implements LLMProvider {
   protected async spawnAndParse<T>(
     prompt: string,
     schema: ZodType<T>,
+    opts?: SpawnOptions & { label?: string },
+  ): Promise<{ data: T; usage?: CLIUsage }> {
+    return this.spawnPreparedAndParse({
+      stage: `analyze.${opts?.label ?? 'call'}`,
+      system: '',
+      prompt,
+      schemaJson: this.toJsonSchema(schema),
+      responseFormat: 'json',
+      parse: (value) => schema.parse(value),
+    }, opts);
+  }
+
+  private async spawnPreparedAndParse<T>(
+    request: Pick<
+      PreparedLlmRequest<T>,
+      'stage' | 'system' | 'prompt' | 'schemaJson' | 'responseFormat' | 'parse'
+    >,
     opts?: SpawnOptions & { label?: string },
   ): Promise<{ data: T; usage?: CLIUsage }> {
     // Cap concurrent CLI spawns across all callers on this provider.
@@ -459,15 +490,20 @@ export abstract class BaseCLIProvider implements LLMProvider {
       if (this._sessionLimitError) throw this._sessionLimitError;
       opts?.onStart?.();
 
-      const jsonSchemaStr = this.toJsonSchema(schema);
+      const jsonSchemaStr = request.schemaJson;
       const label = opts?.label ?? 'call';
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
         try {
-          const raw = await this.spawnCLI(prompt, jsonSchemaStr, opts);
-          this.dumpDebug(label, prompt, raw, jsonSchemaStr);
-          return this.parseAndValidate(raw, schema);
+          const raw = await this.spawnCLI(request.prompt, jsonSchemaStr, {
+            ...opts,
+            stage: request.stage,
+            system: request.system,
+            responseFormat: request.responseFormat,
+          });
+          this.dumpDebug(label, request.prompt, raw, jsonSchemaStr);
+          return this.parseAndValidatePrepared(raw, request.parse);
         } catch (err) {
           lastError = err as Error;
           if (this._abortSignal?.aborted) throw lastError; // don't retry on cancel
@@ -919,40 +955,27 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: CodeViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<CodeViolationsResult> {
-    const hasExisting = context.existingViolations && context.existingViolations.length > 0;
-    let promptName: Parameters<typeof getPrompt>[0];
-    if (context.tier === 'metadata') {
-      promptName = hasExisting ? 'violations-code-metadata-lifecycle' : 'violations-code-metadata';
-    } else if (context.tier === 'targeted') {
-      promptName = hasExisting ? 'violations-code-targeted-lifecycle' : 'violations-code-targeted';
-    } else {
-      promptName = hasExisting ? 'violations-code-lifecycle' : 'violations-code';
-    }
+    const request = prepareCodeViolationRequest(context);
+    const hasExisting = request.resultContractId === 'analyze.code-lifecycle@1';
+    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
 
-    // Only use file-path mode (Read tool) when files have real paths, not pre-built content
-    // from the context router (which uses synthetic path 'context' for metadata/targeted tiers)
-    const hasRealPaths = context.files.length > 0 && context.files.every((f) => f.path !== 'context');
-    const { vars, idMap } = buildCodeTemplateVars(context, { useFilePaths: hasRealPaths });
-    const prompt = getPrompt(promptName, vars);
-
-    log.info(`[CLI] Code violations call starting (${context.files.length} files, ${hasExisting ? 'lifecycle' : 'first-run'})...`);
+    log.info(`[CLI] Code violations call starting (${request.ownership.fileCount} files, ${hasExisting ? 'lifecycle' : 'first-run'})...`);
     const t0 = Date.now();
 
     // Only give Read tool access when files have real paths to read
-    const codeExtraArgs = hasRealPaths ? ['--allowedTools', 'Read'] : ['--tools', ''];
-    const codeTimeoutMs = 300_000; // 5 minutes — code review uses Read tool, takes many turns
+    const codeExtraArgs = request.toolPolicy === 'read' ? ['--allowedTools', 'Read'] : ['--tools', ''];
 
     if (hasExisting) {
-      const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, CodeViolationLifecycleOutputSchema, {
-        extraArgs: codeExtraArgs, label: 'code-lifecycle', timeoutMs: codeTimeoutMs, onStart: opts?.onStart,
+      const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+        extraArgs: codeExtraArgs, label: request.label, timeoutMs: request.timeoutMs, onStart: opts?.onStart,
       });
-      certifyCodeResultOwnership(context, object.newViolations);
+      certifyCodeResultOwnership(request.ownership, object.newViolations);
       certifyCodeLifecyclePartition(
         object.resolvedViolationIds,
         object.unchangedViolationIds,
         idMap,
       );
-      certifyNoPriorCodeCollision(context, object.newViolations);
+      certifyNoPriorCodeCollision(request.ownership, object.newViolations);
       const dur = Date.now() - t0;
       log.info(`[CLI] Code violations call done in ${dur}ms — new: ${object.newViolations.length}, resolved: ${object.resolvedViolationIds.length}, unchanged: ${object.unchangedViolationIds.length}`);
       this.collectUsage('code', cliUsage, dur);
@@ -967,17 +990,17 @@ export abstract class BaseCLIProvider implements LLMProvider {
           title: v.title,
           content: v.content,
           fixPrompt: v.fixPrompt ?? null,
-          sourceTier: context.tier ?? 'full-file',
+          sourceTier: request.ownership.tier,
         })),
         resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
         unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
       };
     }
 
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, CodeViolationOutputSchema, {
-      extraArgs: codeExtraArgs, label: 'code', timeoutMs: codeTimeoutMs, onStart: opts?.onStart,
+    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+      extraArgs: codeExtraArgs, label: request.label, timeoutMs: request.timeoutMs, onStart: opts?.onStart,
     });
-    certifyCodeResultOwnership(context, object.violations);
+    certifyCodeResultOwnership(request.ownership, object.violations);
     const dur = Date.now() - t0;
     log.info(`[CLI] Code violations call done in ${dur}ms — ${object.violations.length} violations`);
     this.collectUsage('code', cliUsage, dur);
@@ -992,7 +1015,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
         title: v.title,
         content: v.content,
         fixPrompt: v.fixPrompt ?? null,
-        sourceTier: context.tier ?? 'full-file',
+        sourceTier: request.ownership.tier,
       })),
     };
   }
