@@ -18,7 +18,6 @@ import {
 import { config } from '../../config/index.js';
 import {
   getPrompt,
-  buildServiceTemplateVars,
   buildModuleTemplateVars,
   buildFlowTemplateVars,
   resolveId,
@@ -27,10 +26,8 @@ import {
   type PromptIdMap,
 } from './prompts.js';
 import {
-  ServiceViolationOutputSchema,
   ModuleViolationOutputSchema,
   DiffViolationOutputSchema,
-  LifecycleServiceOutputSchema,
   FlowEnrichmentOutputSchema,
 } from './schemas.js';
 import {
@@ -42,6 +39,7 @@ import {
 } from './prepared-request.js';
 import { planCodeViolationWork } from './code-work-planner.js';
 import { planDatabaseViolationWork } from './database-work-planner.js';
+import { prepareServiceViolationRequest } from './prepared-service-violation-request.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -551,13 +549,17 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: ServiceViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ServiceViolationsResult> {
-    const { vars, idMap } = buildServiceTemplateVars(context);
-    const prompt = getPrompt('violations-service', vars);
+    const request = prepareServiceViolationRequest(context, 'normal');
+    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
 
     log.info('[CLI] Service violations call starting...');
     const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, ServiceViolationOutputSchema, {
-      extraArgs: ['--tools', ''], label: 'service', onStart: opts?.onStart,
+    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+      id: `llm.service.attempt:${randomUUID()}`,
+      extraArgs: ['--tools', ''],
+      label: request.label,
+      timeoutMs: request.timeoutMs,
+      onStart: opts?.onStart,
     });
     const dur = Date.now() - t0;
     log.info(`[CLI] Service violations call done in ${dur}ms — ${object.violations.length} violations`);
@@ -783,13 +785,17 @@ export abstract class BaseCLIProvider implements LLMProvider {
       const ctx = contexts.service;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['service', (async () => {
-          const { vars, idMap } = buildServiceTemplateVars(ctx);
+          const request = prepareServiceViolationRequest(ctx, 'lifecycle');
+          const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
           idMaps.service = idMap;
-          const prompt = getPrompt('violations-service-lifecycle', vars);
           log.info('[CLI] Lifecycle service call starting...');
           const t0 = Date.now();
-          const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, LifecycleServiceOutputSchema, {
-            extraArgs: ['--tools', ''], label: 'service-lifecycle', onStart: () => onCallStart?.('service'),
+          const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+            id: `llm.service.attempt:${randomUUID()}`,
+            extraArgs: ['--tools', ''],
+            label: request.label,
+            timeoutMs: request.timeoutMs,
+            onStart: () => onCallStart?.('service'),
           });
           const dur = Date.now() - t0;
           log.info(`[CLI] Lifecycle service call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
