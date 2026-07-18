@@ -3,16 +3,12 @@ import { buildCodeTemplateVars, getPrompt } from './prompts.js';
 import {
   serializePreparedRequestSchema,
   type PreparedLlmRequest,
+  type PreparedPromptBinding,
 } from './prepared-request.js';
 import {
   CodeViolationLifecycleOutputSchema,
   CodeViolationOutputSchema,
 } from './schemas.js';
-
-export interface PreparedPromptBinding {
-  readonly promptId: string;
-  readonly runtimeId: string;
-}
 
 export interface PreparedCodeOwnership {
   readonly tier: 'metadata' | 'targeted' | 'full-file';

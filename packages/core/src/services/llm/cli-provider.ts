@@ -19,7 +19,6 @@ import { config } from '../../config/index.js';
 import {
   getPrompt,
   buildServiceTemplateVars,
-  buildDatabaseTemplateVars,
   buildModuleTemplateVars,
   buildFlowTemplateVars,
   resolveId,
@@ -29,8 +28,6 @@ import {
 } from './prompts.js';
 import {
   ServiceViolationOutputSchema,
-  DatabaseLifecycleViolationOutputSchema,
-  DatabaseViolationOutputSchema,
   ModuleViolationOutputSchema,
   DiffViolationOutputSchema,
   LifecycleServiceOutputSchema,
@@ -44,6 +41,7 @@ import {
   type PreparedLlmRequest,
 } from './prepared-request.js';
 import { planCodeViolationWork } from './code-work-planner.js';
+import { prepareDatabaseViolationRequest } from './prepared-database-violation-request.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -589,13 +587,18 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsResult> {
-    const { vars, idMap } = buildDatabaseTemplateVars(context);
-    const prompt = getPrompt('violations-database', vars);
+    const request = prepareDatabaseViolationRequest(context, 'normal');
+    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
+    const transportId = `llm.database.attempt:${randomUUID()}`;
 
     log.info('[CLI] Database violations call starting...');
     const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, DatabaseViolationOutputSchema, {
-      extraArgs: ['--tools', ''], label: 'database', onStart: opts?.onStart,
+    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+      id: transportId,
+      extraArgs: ['--tools', ''],
+      label: request.label,
+      timeoutMs: request.timeoutMs,
+      onStart: opts?.onStart,
     });
     const dur = Date.now() - t0;
     log.info(`[CLI] Database violations call done in ${dur}ms — ${object.violations.length} violations`);
@@ -622,20 +625,19 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsLifecycleResult> {
-    const { vars, idMap } = buildDatabaseTemplateVars(context);
-    const prompt = getPrompt('violations-database-lifecycle', vars);
+    const request = prepareDatabaseViolationRequest(context, 'lifecycle');
+    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
+    const transportId = `llm.database.attempt:${randomUUID()}`;
 
     log.info('[CLI] Lifecycle database call starting...');
     const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(
-      prompt,
-      DatabaseLifecycleViolationOutputSchema,
-      {
-        extraArgs: ['--tools', ''],
-        label: 'database-lifecycle',
-        onStart: opts?.onStart,
-      },
-    );
+    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+      id: transportId,
+      extraArgs: ['--tools', ''],
+      label: request.label,
+      timeoutMs: request.timeoutMs,
+      onStart: opts?.onStart,
+    });
     const dur = Date.now() - t0;
     log.info(`[CLI] Lifecycle database call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
     this.collectUsage('database', cliUsage, dur);

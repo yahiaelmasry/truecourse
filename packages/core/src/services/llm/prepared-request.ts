@@ -1,6 +1,11 @@
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { ZodTypeAny } from 'zod';
 
+export interface PreparedPromptBinding {
+  readonly promptId: string;
+  readonly runtimeId: string;
+}
+
 /** Neutral execution contract shared by every prepared LLM work family. */
 export interface PreparedLlmRequest<T> {
   readonly stage: string;
