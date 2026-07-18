@@ -5,6 +5,7 @@ import {
   type DatabaseViolationContext,
 } from '../../packages/core/src/services/llm/provider.js';
 import { prepareDatabaseViolationRequest } from '../../packages/core/src/services/llm/prepared-database-violation-request.js';
+import { planDatabaseViolationWork } from '../../packages/core/src/services/llm/database-work-planner.js';
 
 const RULE_KEY = 'database/llm/schema-review';
 
@@ -82,7 +83,11 @@ describe('prepared database violation requests', () => {
 
   it('makes the provider execute the exact prepared normal request', async () => {
     const context = databaseContext(true);
-    const expected = prepareDatabaseViolationRequest(context, 'normal');
+    const planned = planDatabaseViolationWork(context, 'normal', {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     const transport: LlmTransport = async (request) => {
       captured = request;
@@ -106,8 +111,8 @@ describe('prepared database violation requests', () => {
     });
     expect(captured).toEqual({
       id: expect.stringMatching(/^llm\.database\.attempt:[a-f0-9-]{36}$/),
-      workId: undefined,
-      inputFingerprint: undefined,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: expected.stage,
       user: expected.prompt,
       system: expected.system,
@@ -120,7 +125,11 @@ describe('prepared database violation requests', () => {
 
   it('maps an in-flight lifecycle result through the prepared binding snapshot', async () => {
     const context = databaseContext(true);
-    const expected = prepareDatabaseViolationRequest(context, 'lifecycle');
+    const planned = planDatabaseViolationWork(context, 'lifecycle', {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     let started!: () => void;
     let release!: () => void;
@@ -165,8 +174,8 @@ describe('prepared database violation requests', () => {
     });
     expect(captured).toEqual({
       id: expect.stringMatching(/^llm\.database\.attempt:[a-f0-9-]{36}$/),
-      workId: undefined,
-      inputFingerprint: undefined,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: expected.stage,
       user: expected.prompt,
       system: expected.system,

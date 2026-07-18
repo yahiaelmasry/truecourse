@@ -1,5 +1,3 @@
-import { createHash } from 'node:crypto';
-import { Buffer } from 'node:buffer';
 import path from 'node:path';
 import type {
   CodeContextSource,
@@ -10,46 +8,27 @@ import {
   prepareCodeViolationRequest,
   type PreparedCodeViolationRequest,
 } from './prepared-code-violation-request.js';
+import {
+  canonicalJson,
+  compareCanonicalText as compareText,
+  fingerprint,
+  type LlmWorkComponentFingerprints,
+  type LlmWorkExecutionIntent,
+} from './work-identity.js';
 
-export interface CodeWorkExecutionIntent {
+export interface CodeWorkExecutionIntent extends LlmWorkExecutionIntent {
   readonly provider: string;
   readonly requestedModel: string | null;
   readonly repositoryRoot?: string | null;
 }
 
-export interface CodeWorkComponentFingerprints {
-  readonly repository: string;
-  readonly baseline: string;
-  readonly rules: string;
-  readonly configuration: string;
-  readonly request: string;
-  readonly execution: string;
-  readonly resultContract: string;
-}
+export type CodeWorkComponentFingerprints = LlmWorkComponentFingerprints;
 
 export interface PlannedCodeViolationWork {
   readonly workId: string;
   readonly inputFingerprint: string;
   readonly componentFingerprints: CodeWorkComponentFingerprints;
   readonly request: PreparedCodeViolationRequest;
-}
-
-function compareText(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
-}
-
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, entry]) => entry !== undefined)
-    .sort(([left], [right]) => compareText(left, right));
-  return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`;
-}
-
-function fingerprint(value: unknown): string {
-  return `sha256:${createHash('sha256').update(canonicalJson(value)).digest('hex')}`;
 }
 
 function normalizeRepositoryPath(filePath: string, repositoryRoot?: string | null): string {

@@ -41,7 +41,7 @@ import {
   type PreparedLlmRequest,
 } from './prepared-request.js';
 import { planCodeViolationWork } from './code-work-planner.js';
-import { prepareDatabaseViolationRequest } from './prepared-database-violation-request.js';
+import { planDatabaseViolationWork } from './database-work-planner.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -587,7 +587,11 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsResult> {
-    const request = prepareDatabaseViolationRequest(context, 'normal');
+    const planned = planDatabaseViolationWork(context, 'normal', {
+      provider: this.transport ? 'transport:unverified' : 'claude-code',
+      requestedModel: this.modelFlag[1] ?? null,
+    });
+    const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const transportId = `llm.database.attempt:${randomUUID()}`;
 
@@ -595,6 +599,8 @@ export abstract class BaseCLIProvider implements LLMProvider {
     const t0 = Date.now();
     const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
       id: transportId,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       extraArgs: ['--tools', ''],
       label: request.label,
       timeoutMs: request.timeoutMs,
@@ -625,7 +631,11 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsLifecycleResult> {
-    const request = prepareDatabaseViolationRequest(context, 'lifecycle');
+    const planned = planDatabaseViolationWork(context, 'lifecycle', {
+      provider: this.transport ? 'transport:unverified' : 'claude-code',
+      requestedModel: this.modelFlag[1] ?? null,
+    });
+    const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const transportId = `llm.database.attempt:${randomUUID()}`;
 
@@ -633,6 +643,8 @@ export abstract class BaseCLIProvider implements LLMProvider {
     const t0 = Date.now();
     const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
       id: transportId,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       extraArgs: ['--tools', ''],
       label: request.label,
       timeoutMs: request.timeoutMs,
