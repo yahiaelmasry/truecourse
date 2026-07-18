@@ -18,7 +18,6 @@ import {
 import { config } from '../../config/index.js';
 import {
   getPrompt,
-  buildModuleTemplateVars,
   buildFlowTemplateVars,
   resolveId,
   resolveIds,
@@ -26,8 +25,6 @@ import {
   type PromptIdMap,
 } from './prompts.js';
 import {
-  ModuleViolationOutputSchema,
-  DiffViolationOutputSchema,
   FlowEnrichmentOutputSchema,
 } from './schemas.js';
 import {
@@ -40,6 +37,7 @@ import {
 import { planCodeViolationWork } from './code-work-planner.js';
 import { planDatabaseViolationWork } from './database-work-planner.js';
 import { planServiceViolationWork } from './service-work-planner.js';
+import { prepareModuleViolationRequest } from './prepared-module-violation-request.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -678,20 +676,21 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: ModuleViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ModuleViolationsResult> {
-    const { vars, idMap } = buildModuleTemplateVars(context);
-    const prompt = getPrompt('violations-module', vars);
-
+    const request = prepareModuleViolationRequest(context, 'normal');
+    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const moduleIdToServiceId = new Map(
-      context.modules.filter((m) => m.serviceId).map((m) => [m.id, m.serviceId!]),
+      request.moduleServiceBindings.map(({ moduleRuntimeId, serviceRuntimeId }) =>
+        [moduleRuntimeId, serviceRuntimeId]),
     );
 
     log.info(`[CLI] Module violations call starting (${context.modules.length} modules)...`);
     const t0 = Date.now();
-    // Module context is a connected graph — use a longer timeout instead of batching
-    // to avoid losing cross-module dependency edges
-    const moduleTimeoutMs = 300_000; // 5 minutes
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, ModuleViolationOutputSchema, {
-      extraArgs: ['--tools', ''], label: 'module', timeoutMs: moduleTimeoutMs, onStart: opts?.onStart,
+    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+      id: `llm.module.attempt:${randomUUID()}`,
+      extraArgs: ['--tools', ''],
+      label: request.label,
+      timeoutMs: request.timeoutMs,
+      onStart: opts?.onStart,
     });
     const dur = Date.now() - t0;
     log.info(`[CLI] Module violations call done in ${dur}ms — ${object.violations.length} violations`);
@@ -839,17 +838,21 @@ export abstract class BaseCLIProvider implements LLMProvider {
     if (contexts.module) {
       const ctx = contexts.module;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
-        const modIdToSvcId = new Map(
-          ctx.modules.filter((m) => m.serviceId).map((m) => [m.id, m.serviceId!]),
-        );
         promises.push(['module', (async () => {
-          const { vars, idMap } = buildModuleTemplateVars(ctx);
-          idMaps.module = idMap;
-          const prompt = getPrompt('violations-module-lifecycle', vars);
+          const request = prepareModuleViolationRequest(ctx, 'lifecycle');
+          const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
+          const moduleIdToServiceId = new Map(
+            request.moduleServiceBindings.map(({ moduleRuntimeId, serviceRuntimeId }) =>
+              [moduleRuntimeId, serviceRuntimeId]),
+          );
           log.info('[CLI] Lifecycle module call starting...');
           const t0 = Date.now();
-          const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, DiffViolationOutputSchema, {
-            extraArgs: ['--tools', ''], label: 'module-lifecycle', onStart: () => onCallStart?.('module'),
+          const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
+            id: `llm.module.attempt:${randomUUID()}`,
+            extraArgs: ['--tools', ''],
+            label: request.label,
+            timeoutMs: request.timeoutMs,
+            onStart: () => onCallStart?.('module'),
           });
           const dur = Date.now() - t0;
           log.info(`[CLI] Lifecycle module call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
@@ -861,7 +864,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
               const realModuleId = resolveId(i.targetModuleId, idMap);
               return {
                 ...i,
-                targetServiceId: (realModuleId ? modIdToSvcId.get(realModuleId) : null) ?? null,
+                targetServiceId: (realModuleId ? moduleIdToServiceId.get(realModuleId) : null) ?? null,
                 targetModuleId: realModuleId ?? null,
                 targetMethodId: resolveId(i.targetMethodId, idMap) ?? null,
                 targetModuleName: i.targetModuleName ?? null,
