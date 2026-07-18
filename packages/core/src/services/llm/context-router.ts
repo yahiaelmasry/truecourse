@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import type { AnalysisRule, FileAnalysis, ContextRequirement, ContextTier, FileFilter, FunctionFilter } from '@truecourse/shared';
 import { DATABASE_IMPORT_MAP, getAllTestPatterns } from '@truecourse/analyzer';
 import type { CodeSourceScope } from './provider.js';
@@ -62,6 +63,14 @@ export const PROMPT_OVERHEAD_TOKENS = 500; // prompt template + instructions per
 const TOKENS_PER_RULE = 50; // rule key + name + prompt line in the system message
 const TOKENS_PER_FILE_PATH = 25; // "=== /path/to/file.ts ===\nRead this file..." per file in CLI mode
 const MAX_CHARS_PER_BATCH = 100_000;
+
+function compareText(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+function uniqueSorted(values: readonly string[]): string[] {
+  return [...new Set(values)].sort(compareText);
+}
 
 // ---------------------------------------------------------------------------
 // File filter matching
@@ -199,7 +208,10 @@ function extractTargetedFunctions(
     }
   }
 
-  return results;
+  return results.sort((left, right) =>
+    left.startLine - right.startLine
+    || left.endLine - right.endLine
+    || compareText(left.name, right.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -221,40 +233,44 @@ function buildMetadataSummary(fa: FileAnalysis, fields: MetadataField[], lineCou
           const params = f.params.map((p) => `${p.name}${p.type ? ': ' + p.type : ''}`).join(', ');
           const ret = f.returnType ? `: ${f.returnType}` : '';
           return `${f.name}(${params})${ret}${tags.length ? ' [' + tags.join(', ') + ']' : ''}`;
-        });
+        }).sort(compareText);
         if (fns.length) parts.push(`Functions: ${fns.join(', ')}`);
         break;
       }
       case 'classes': {
         const cls = fa.classes.map((c) => {
-          const methods = c.methods.map((m) => m.name).join(', ');
+          const methods = c.methods.map((m) => m.name).sort(compareText).join(', ');
           return `${c.name}${c.superClass ? ' extends ' + c.superClass : ''} { ${methods} }`;
-        });
+        }).sort(compareText);
         if (cls.length) parts.push(`Classes: ${cls.join(', ')}`);
         break;
       }
       case 'imports': {
-        const imps = fa.imports.map((i) => i.source);
+        const imps = fa.imports.map((i) => i.source).sort(compareText);
         if (imps.length) parts.push(`Imports: ${imps.join(', ')}`);
         break;
       }
       case 'exports': {
-        const exps = fa.exports.map((e) => (e.isDefault ? `default ${e.name}` : e.name));
+        const exps = fa.exports
+          .map((e) => (e.isDefault ? `default ${e.name}` : e.name))
+          .sort(compareText);
         if (exps.length) parts.push(`Exports: ${exps.join(', ')}`);
         break;
       }
       case 'calls': {
-        const uniqueCallees = [...new Set(fa.calls.map((c) => c.callee))];
+        const uniqueCallees = uniqueSorted(fa.calls.map((c) => c.callee));
         if (uniqueCallees.length) parts.push(`Calls: ${uniqueCallees.slice(0, 30).join(', ')}${uniqueCallees.length > 30 ? ` (+${uniqueCallees.length - 30} more)` : ''}`);
         break;
       }
       case 'httpCalls': {
-        const http = fa.httpCalls.map((h) => `${h.method} ${h.url}`);
+        const http = fa.httpCalls.map((h) => `${h.method} ${h.url}`).sort(compareText);
         if (http.length) parts.push(`HTTP calls: ${http.join(', ')}`);
         break;
       }
       case 'routeRegistrations': {
-        const routes = (fa.routeRegistrations || []).map((r) => `${r.httpMethod} ${r.path}`);
+        const routes = (fa.routeRegistrations || [])
+          .map((r) => `${r.httpMethod} ${r.path}`)
+          .sort(compareText);
         if (routes.length) parts.push(`Routes: ${routes.join(', ')}`);
         break;
       }
@@ -281,12 +297,53 @@ interface GroupedRules {
   fullFile: { rules: RuleDto[]; requirement: ContextRequirement }[];
 }
 
+function normalizeFileFilter(filter: FileFilter | undefined): FileFilter | undefined {
+  if (!filter) return undefined;
+  const normalized: FileFilter = {
+    ...(filter.hasAsyncFunctions === undefined ? {} : { hasAsyncFunctions: filter.hasAsyncFunctions }),
+    ...(filter.hasRouteHandlers === undefined ? {} : { hasRouteHandlers: filter.hasRouteHandlers }),
+    ...(filter.hasDbCalls === undefined ? {} : { hasDbCalls: filter.hasDbCalls }),
+    ...(filter.hasCatchBlocks === undefined ? {} : { hasCatchBlocks: filter.hasCatchBlocks }),
+    ...(filter.hasImportsFrom === undefined ? {} : { hasImportsFrom: uniqueSorted(filter.hasImportsFrom) }),
+    ...(filter.hasCallsTo === undefined ? {} : { hasCallsTo: uniqueSorted(filter.hasCallsTo) }),
+    ...(filter.isTestFile === undefined ? {} : { isTestFile: filter.isTestFile }),
+    ...(filter.languages === undefined ? {} : { languages: uniqueSorted(filter.languages) }),
+  };
+  return Object.keys(normalized).length === 0 ? undefined : normalized;
+}
+
+function normalizeFunctionFilter(filter: FunctionFilter | undefined): FunctionFilter | undefined {
+  if (!filter) return undefined;
+  const normalized: FunctionFilter = {
+    ...(filter.isAsync === undefined ? {} : { isAsync: filter.isAsync }),
+    ...(filter.isRouteHandler === undefined ? {} : { isRouteHandler: filter.isRouteHandler }),
+    ...(filter.containsCatchBlock === undefined ? {} : { containsCatchBlock: filter.containsCatchBlock }),
+    ...(filter.callsAny === undefined ? {} : { callsAny: uniqueSorted(filter.callsAny) }),
+  };
+  return Object.keys(normalized).length === 0 ? undefined : normalized;
+}
+
+function normalizeContextRequirement(requirement: ContextRequirement): ContextRequirement {
+  const fileFilter = normalizeFileFilter(requirement.fileFilter);
+  const functionFilter = normalizeFunctionFilter(requirement.functionFilter);
+  return {
+    tier: requirement.tier,
+    ...(fileFilter ? { fileFilter } : {}),
+    ...(functionFilter ? { functionFilter } : {}),
+    ...(requirement.metadataFields === undefined
+      ? {}
+      : { metadataFields: uniqueSorted(requirement.metadataFields) as MetadataField[] }),
+  };
+}
+
 function contextKey(req: ContextRequirement): string {
   return JSON.stringify({
     tier: req.tier,
-    ff: req.fileFilter || {},
-    fnf: req.functionFilter || {},
-    mf: req.metadataFields || [],
+    ff: req.fileFilter ?? null,
+    fnf: req.functionFilter ?? null,
+    mf: req.metadataFields === undefined
+      ? { kind: 'default' }
+      : { kind: 'explicit', fields: req.metadataFields },
   });
 }
 
@@ -294,14 +351,24 @@ function groupRulesByContext(rules: AnalysisRule[]): GroupedRules {
   const result: GroupedRules = { metadata: [], targeted: [], fullFile: [] };
   const groups = new Map<string, { rules: RuleDto[]; requirement: ContextRequirement }>();
 
-  for (const rule of rules) {
+  const orderedRules = [...rules].sort((left, right) => {
+    const byKey = compareText(left.key, right.key);
+    if (byKey !== 0) return byKey;
+    return compareText(
+      JSON.stringify([left.name, left.severity, left.prompt ?? '']),
+      JSON.stringify([right.name, right.severity, right.prompt ?? '']),
+    );
+  });
+
+  for (const rule of orderedRules) {
     if (!rule.contextRequirement) continue;
 
     const dto: RuleDto = { key: rule.key, name: rule.name, severity: rule.severity, prompt: rule.prompt! };
-    const key = contextKey(rule.contextRequirement);
+    const requirement = normalizeContextRequirement(rule.contextRequirement);
+    const key = contextKey(requirement);
     let group = groups.get(key);
     if (!group) {
-      group = { rules: [], requirement: rule.contextRequirement };
+      group = { rules: [], requirement };
       groups.set(key, group);
     }
     group.rules.push(dto);
@@ -319,6 +386,10 @@ function groupRulesByContext(rules: AnalysisRule[]): GroupedRules {
         result.fullFile.push(group);
         break;
     }
+  }
+
+  for (const tier of [result.metadata, result.targeted, result.fullFile]) {
+    tier.sort((left, right) => compareText(contextKey(left.requirement), contextKey(right.requirement)));
   }
 
   return result;
@@ -635,6 +706,7 @@ function estimateContextInner(
   options?: { useFilePaths?: boolean },
 ): PreFlightEstimate {
   const grouped = groupRulesByContext(rules);
+  const orderedFileAnalyses = [...fileAnalyses].sort((left, right) => compareText(left.filePath, right.filePath));
   const tiers: PreFlightEstimate['tiers'] = [];
   const useFilePaths = options?.useFilePaths ?? false;
 
@@ -650,7 +722,7 @@ function estimateContextInner(
 
   // Metadata tiers — always inline content (summaries)
   for (const group of grouped.metadata) {
-    const { content, fileCount } = buildMetadataContent(group, fileAnalyses, fileContents);
+    const { content, fileCount } = buildMetadataContent(group, orderedFileAnalyses, fileContents);
     if (fileCount > 0) {
       const contentTokens = Math.ceil(content.length / CHARS_PER_TOKEN);
       tiers.push({
@@ -664,7 +736,7 @@ function estimateContextInner(
 
   // Targeted tiers — always inline content (function extracts)
   for (const group of grouped.targeted) {
-    const { content, fileCount, functionCount } = buildTargetedContent(group, fileAnalyses, fileContents);
+    const { content, fileCount, functionCount } = buildTargetedContent(group, orderedFileAnalyses, fileContents);
     if (fileCount > 0) {
       const contentTokens = Math.ceil(content.length / CHARS_PER_TOKEN);
       tiers.push({
@@ -679,7 +751,7 @@ function estimateContextInner(
 
   // Full-file tiers — CLI mode sends file paths only, API mode inlines content
   for (const group of grouped.fullFile) {
-    const { content, fileCount } = buildFullFileContent(group, fileAnalyses, fileContents);
+    const { content, fileCount } = buildFullFileContent(group, orderedFileAnalyses, fileContents);
     if (fileCount > 0) {
       const contentTokens = useFilePaths
         ? fileCount * TOKENS_PER_FILE_PATH
@@ -725,16 +797,17 @@ function routeContextInner(
 ): ContextBatch[] {
   const grouped = groupRulesByContext(rules);
   const batches: ContextBatch[] = [];
+  const orderedFileAnalyses = [...fileAnalyses].sort((left, right) => compareText(left.filePath, right.filePath));
 
   // Build file analysis lookup by path
   const faByPath = new Map<string, FileAnalysis>();
-  for (const fa of fileAnalyses) {
+  for (const fa of orderedFileAnalyses) {
     faByPath.set(fa.filePath, fa);
   }
 
   // Metadata batches
   for (const group of grouped.metadata) {
-    const { content, fileCount, sourceScopes, sources } = buildMetadataContent(group, fileAnalyses, fileContents);
+    const { content, fileCount, sourceScopes, sources } = buildMetadataContent(group, orderedFileAnalyses, fileContents);
     if (fileCount > 0) {
       batches.push(...splitIntoBatches('metadata', group.rules, content, fileCount, sourceScopes, undefined, undefined, sources));
     }
@@ -742,7 +815,7 @@ function routeContextInner(
 
   // Targeted batches
   for (const group of grouped.targeted) {
-    const { content, fileCount, functionCount, sourceScopes, sources } = buildTargetedContent(group, fileAnalyses, fileContents);
+    const { content, fileCount, functionCount, sourceScopes, sources } = buildTargetedContent(group, orderedFileAnalyses, fileContents);
     if (fileCount > 0) {
       batches.push(...splitIntoBatches('targeted', group.rules, content, fileCount, sourceScopes, functionCount, undefined, sources));
     }
@@ -750,7 +823,7 @@ function routeContextInner(
 
   // Full-file batches
   for (const group of grouped.fullFile) {
-    const { content, fileCount, filePaths, sourceScopes, sources } = buildFullFileContent(group, fileAnalyses, fileContents);
+    const { content, fileCount, filePaths, sourceScopes, sources } = buildFullFileContent(group, orderedFileAnalyses, fileContents);
     if (fileCount > 0) {
       batches.push(...splitIntoBatches('full-file', group.rules, content, fileCount, sourceScopes, undefined, filePaths, sources));
     }
