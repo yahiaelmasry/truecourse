@@ -39,7 +39,7 @@ import {
 } from './prepared-request.js';
 import { planCodeViolationWork } from './code-work-planner.js';
 import { planDatabaseViolationWork } from './database-work-planner.js';
-import { prepareServiceViolationRequest } from './prepared-service-violation-request.js';
+import { planServiceViolationWork } from './service-work-planner.js';
 import type { UsageData } from '../usage.service.js';
 import type {
   LLMProvider,
@@ -549,13 +549,19 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: ServiceViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ServiceViolationsResult> {
-    const request = prepareServiceViolationRequest(context, 'normal');
+    const planned = planServiceViolationWork(context, 'normal', {
+      provider: this.transport ? 'transport:unverified' : 'claude-code',
+      requestedModel: this.modelFlag[1] ?? null,
+    });
+    const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
 
     log.info('[CLI] Service violations call starting...');
     const t0 = Date.now();
     const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
       id: `llm.service.attempt:${randomUUID()}`,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       extraArgs: ['--tools', ''],
       label: request.label,
       timeoutMs: request.timeoutMs,
@@ -785,13 +791,19 @@ export abstract class BaseCLIProvider implements LLMProvider {
       const ctx = contexts.service;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['service', (async () => {
-          const request = prepareServiceViolationRequest(ctx, 'lifecycle');
+          const planned = planServiceViolationWork(ctx, 'lifecycle', {
+            provider: this.transport ? 'transport:unverified' : 'claude-code',
+            requestedModel: this.modelFlag[1] ?? null,
+          });
+          const request = planned.request;
           const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
           idMaps.service = idMap;
           log.info('[CLI] Lifecycle service call starting...');
           const t0 = Date.now();
           const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
             id: `llm.service.attempt:${randomUUID()}`,
+            workId: planned.workId,
+            inputFingerprint: planned.inputFingerprint,
             extraArgs: ['--tools', ''],
             label: request.label,
             timeoutMs: request.timeoutMs,

@@ -5,6 +5,7 @@ import {
   type ServiceViolationContext,
 } from '../../packages/core/src/services/llm/provider.js';
 import { prepareServiceViolationRequest } from '../../packages/core/src/services/llm/prepared-service-violation-request.js';
+import { planServiceViolationWork } from '../../packages/core/src/services/llm/service-work-planner.js';
 
 const RULE_KEY = 'service/llm/architecture-review';
 
@@ -87,7 +88,11 @@ describe('prepared service violation requests', () => {
 
   it('makes the provider execute the exact prepared normal request with a unique attempt identity', async () => {
     const context = serviceContext(true);
-    const expected = prepareServiceViolationRequest(context, 'normal');
+    const planned = planServiceViolationWork(context, 'normal', {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     const transport: LlmTransport = async (request) => {
       captured = request;
@@ -118,8 +123,8 @@ describe('prepared service violation requests', () => {
     });
     expect(captured).toEqual({
       id: expect.stringMatching(/^llm\.service\.attempt:[a-f0-9-]{36}$/),
-      workId: undefined,
-      inputFingerprint: undefined,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: 'analyze.service',
       user: expected.prompt,
       system: expected.system,
@@ -132,7 +137,11 @@ describe('prepared service violation requests', () => {
 
   it('maps an in-flight lifecycle result through the prepared binding snapshot', async () => {
     const context = serviceContext(true);
-    const expected = prepareServiceViolationRequest(context, 'lifecycle');
+    const planned = planServiceViolationWork(context, 'lifecycle', {
+      provider: 'transport:unverified',
+      requestedModel: 'sonnet',
+    });
+    const expected = planned.request;
     let captured: LlmRequest | undefined;
     let started!: () => void;
     let release!: () => void;
@@ -189,8 +198,8 @@ describe('prepared service violation requests', () => {
     });
     expect(captured).toEqual({
       id: expect.stringMatching(/^llm\.service\.attempt:[a-f0-9-]{36}$/),
-      workId: undefined,
-      inputFingerprint: undefined,
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
       stage: 'analyze.service-lifecycle',
       user: expected.prompt,
       system: expected.system,
