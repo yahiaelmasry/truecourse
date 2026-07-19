@@ -19,8 +19,6 @@ import { config } from '../../config/index.js';
 import {
   getPrompt,
   buildFlowTemplateVars,
-  resolveId,
-  resolveIds,
   type FlowEnrichmentContext,
   type PromptIdMap,
 } from './prompts.js';
@@ -76,6 +74,11 @@ import type {
   AnalyzeLlmExecutionOutcome,
   CertifiedAnalyzeLlmWork,
 } from './certified-analyze-llm-run.js';
+import {
+  materializePlannedViolationPayload,
+  type MaterializedPlannedViolationResult,
+  type PlannedViolationResultRequest,
+} from './planned-violation-result.js';
 import type {
   LLMProvider,
   UsageRecord,
@@ -214,6 +217,33 @@ function certifyCodeLifecyclePartition(
       'Code lifecycle result must be an exact partition of the originating batch previous IDs',
     );
   }
+}
+
+type PlannedResultRequestFor<
+  TFamily extends CertifiedAnalyzeLlmWork['family'],
+  TMode extends CertifiedAnalyzeLlmWork['mode'],
+> = Extract<PlannedViolationResultRequest, { family: TFamily; mode: TMode }>;
+type MaterializedResultFor<
+  TFamily extends CertifiedAnalyzeLlmWork['family'],
+  TMode extends CertifiedAnalyzeLlmWork['mode'],
+> = Extract<MaterializedPlannedViolationResult, { family: TFamily; mode: TMode }>['result'];
+
+function materializeProviderResult(input: PlannedResultRequestFor<'code', 'normal'>, result: unknown): MaterializedResultFor<'code', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'code', 'lifecycle'>, result: unknown): MaterializedResultFor<'code', 'lifecycle'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'database', 'normal'>, result: unknown): MaterializedResultFor<'database', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'database', 'lifecycle'>, result: unknown): MaterializedResultFor<'database', 'lifecycle'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'service', 'normal'>, result: unknown): MaterializedResultFor<'service', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'service', 'lifecycle'>, result: unknown): MaterializedResultFor<'service', 'lifecycle'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'module', 'normal'>, result: unknown): MaterializedResultFor<'module', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'module', 'lifecycle'>, result: unknown): MaterializedResultFor<'module', 'lifecycle'>;
+function materializeProviderResult(
+  input: PlannedViolationResultRequest,
+  result: unknown,
+): MaterializedPlannedViolationResult['result'] {
+  return materializePlannedViolationPayload({ ...input, result }, {
+    createId: randomUUID,
+    createdAt: () => new Date().toISOString(),
+  });
 }
 
 export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutionAdapter {
@@ -840,29 +870,11 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     opts?: { onStart?: () => void },
   ): Promise<ServiceViolationsResult> {
     const planned = planServiceViolationWork(context, 'normal', this.execution);
-    const request = planned.request;
-    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
-
     const object = await this.executePlannedServiceViolationWork(planned, opts);
-
-    return {
-      violations: object.violations.map((v) => ({
-        id: randomUUID(),
-        type: v.type,
-        category: 'rule' as const,
-        title: v.title,
-        content: v.content,
-        severity: v.severity,
-        targetServiceId: resolveId(v.targetServiceId, idMap) ?? undefined,
-        fixPrompt: v.fixPrompt ?? undefined,
-        ruleKey: v.ruleKey ?? undefined,
-        createdAt: new Date().toISOString(),
-      })),
-      serviceDescriptions: object.serviceDescriptions.map((d) => ({
-        id: resolveId(d.id, idMap) || d.id,
-        description: d.description,
-      })),
-    };
+    return materializeProviderResult(
+      { family: 'service', mode: 'normal', planned },
+      object,
+    );
   }
 
   async generateDatabaseViolations(
@@ -870,25 +882,11 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsResult> {
     const planned = planDatabaseViolationWork(context, 'normal', this.execution);
-    const request = planned.request;
-    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const object = await this.executePlannedDatabaseViolationWork(planned, opts);
-
-    return {
-      violations: object.violations.map((v) => ({
-        id: randomUUID(),
-        type: v.type,
-        category: 'rule' as const,
-        title: v.title,
-        content: v.content,
-        severity: v.severity,
-        targetDatabaseId: resolveId(v.targetDatabaseId, idMap) ?? undefined,
-        targetTable: v.targetTable ?? undefined,
-        fixPrompt: v.fixPrompt ?? undefined,
-        ruleKey: v.ruleKey ?? undefined,
-        createdAt: new Date().toISOString(),
-      })),
-    };
+    return materializeProviderResult(
+      { family: 'database', mode: 'normal', planned },
+      object,
+    );
   }
 
   async generateDatabaseViolationsWithLifecycle(
@@ -896,20 +894,11 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsLifecycleResult> {
     const planned = planDatabaseViolationWork(context, 'lifecycle', this.execution);
-    const request = planned.request;
-    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const object = await this.executePlannedDatabaseViolationWork(planned, opts);
-
-    return {
-      resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
-      unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
-      newViolations: object.newViolations.map((violation) => ({
-        ...violation,
-        targetDatabaseId: violation.targetDatabaseId?.startsWith('db-')
-          ? idMap.get(violation.targetDatabaseId) ?? null
-          : null,
-      })),
-    };
+    return materializeProviderResult(
+      { family: 'database', mode: 'lifecycle', planned },
+      object,
+    );
   }
 
   async generateModuleViolations(
@@ -917,35 +906,11 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     opts?: { onStart?: () => void },
   ): Promise<ModuleViolationsResult> {
     const planned = planModuleViolationWork(context, 'normal', this.execution);
-    const request = planned.request;
-    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
-    const moduleIdToServiceId = new Map(
-      request.moduleServiceBindings.map(({ moduleRuntimeId, serviceRuntimeId }) =>
-        [moduleRuntimeId, serviceRuntimeId]),
-    );
-
     const object = await this.executePlannedModuleViolationWork(planned, opts);
-
-    return {
-      violations: object.violations.map((v) => {
-        const targetModuleId = resolveId(v.targetModuleId, idMap) ?? undefined;
-        const targetServiceId = targetModuleId ? moduleIdToServiceId.get(targetModuleId) : undefined;
-        return {
-          id: randomUUID(),
-          type: v.type,
-          category: 'rule' as const,
-          title: v.title,
-          content: v.content,
-          severity: v.severity,
-          targetServiceId,
-          targetModuleId,
-          targetMethodId: resolveId(v.targetMethodId, idMap) ?? undefined,
-          fixPrompt: v.fixPrompt ?? undefined,
-          ruleKey: v.ruleKey ?? undefined,
-          createdAt: new Date().toISOString(),
-        };
-      }),
-    };
+    return materializeProviderResult(
+      { family: 'module', mode: 'normal', planned },
+      object,
+    );
   }
 
   async generateAllViolations(contexts: AllViolationsInput): Promise<AllViolationsResult> {
@@ -1013,7 +978,6 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     let serviceDescriptions: ServiceDescription[] = [];
 
     const promises: [string, Promise<unknown>][] = [];
-    const idMaps: Record<string, PromptIdMap> = {};
 
     // Service call
     if (contexts.service) {
@@ -1021,12 +985,13 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['service', (async () => {
           const planned = planServiceViolationWork(ctx, 'lifecycle', this.execution);
-          const request = planned.request;
-          const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
-          idMaps.service = idMap;
-          return this.executePlannedServiceViolationWork(planned, {
+          const object = await this.executePlannedServiceViolationWork(planned, {
             onStart: () => onCallStart?.('service'),
           });
+          return materializeProviderResult(
+            { family: 'service', mode: 'lifecycle', planned },
+            object,
+          );
         })()]);
       } else {
         promises.push(['service-normal', this.generateServiceViolations(ctx, {
@@ -1055,30 +1020,13 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['module', (async () => {
           const planned = planModuleViolationWork(ctx, 'lifecycle', this.execution);
-          const request = planned.request;
-          const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
-          const moduleIdToServiceId = new Map(
-            request.moduleServiceBindings.map(({ moduleRuntimeId, serviceRuntimeId }) =>
-              [moduleRuntimeId, serviceRuntimeId]),
-          );
           const object = await this.executePlannedModuleViolationWork(planned, {
             onStart: () => onCallStart?.('module'),
           });
-          return {
-            resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
-            unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
-            newViolations: object.newViolations.map((i) => {
-              const realModuleId = resolveId(i.targetModuleId, idMap);
-              return {
-                ...i,
-                targetServiceId: (realModuleId ? moduleIdToServiceId.get(realModuleId) : null) ?? null,
-                targetModuleId: realModuleId ?? null,
-                targetMethodId: resolveId(i.targetMethodId, idMap) ?? null,
-                targetModuleName: i.targetModuleName ?? null,
-                targetMethodName: i.targetMethodName ?? null,
-              };
-            }),
-          };
+          return materializeProviderResult(
+            { family: 'module', mode: 'lifecycle', planned },
+            object,
+          );
         })()]);
       } else {
         promises.push(['module-normal', this.generateModuleViolations(ctx, {
@@ -1119,23 +1067,11 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       }
 
       if (key === 'service') {
-        const idMap = idMaps.service;
         const result = outcome.value as { resolvedViolationIds: string[]; unchangedViolationIds: string[]; newViolations: DiffViolationItem[]; serviceDescriptions: ServiceDescription[] };
-        allResolved.push(...resolveIds(result.resolvedViolationIds, idMap));
-        allUnchanged.push(...resolveIds(result.unchangedViolationIds, idMap));
-        allNew.push(...result.newViolations.map((v) => ({
-          ...v,
-          targetServiceId: resolveId(v.targetServiceId, idMap) ?? null,
-          targetModuleId: v.targetModuleId ?? null,
-          targetMethodId: v.targetMethodId ?? null,
-          targetServiceName: v.targetServiceName ?? null,
-          targetModuleName: v.targetModuleName ?? null,
-          targetMethodName: v.targetMethodName ?? null,
-        })));
-        serviceDescriptions = result.serviceDescriptions.map((d) => ({
-          id: resolveId(d.id, idMap) || d.id,
-          description: d.description,
-        }));
+        allResolved.push(...result.resolvedViolationIds);
+        allUnchanged.push(...result.unchangedViolationIds);
+        allNew.push(...result.newViolations);
+        serviceDescriptions = result.serviceDescriptions;
       } else if (key === 'service-normal') {
         const result = outcome.value as ServiceViolationsResult;
         serviceDescriptions = result.serviceDescriptions;
@@ -1211,41 +1147,18 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       // execution receipt can prove the provider/model that answered.
       repositoryRoot: this._repoPath,
     });
-    const request = planned.request;
-    const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const object = await this.executePlannedCodeViolationWork(planned, opts);
-
-    if ('newViolations' in object) {
-      return {
-        violations: object.newViolations.map((v) => ({
-          ruleKey: v.ruleKey,
-          filePath: v.filePath,
-          lineStart: v.lineStart,
-          lineEnd: v.lineEnd,
-          severity: v.severity,
-          title: v.title,
-          content: v.content,
-          fixPrompt: v.fixPrompt ?? null,
-          sourceTier: request.ownership.tier,
-        })),
-        resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
-        unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
-      };
+    const request = planned.request;
+    if (request.resultContractId === 'analyze.code-lifecycle@1') {
+      return materializeProviderResult(
+        { family: 'code', mode: 'lifecycle', planned: { ...planned, request } },
+        object,
+      );
     }
-
-    return {
-      violations: object.violations.map((v) => ({
-        ruleKey: v.ruleKey,
-        filePath: v.filePath,
-        lineStart: v.lineStart,
-        lineEnd: v.lineEnd,
-        severity: v.severity,
-        title: v.title,
-        content: v.content,
-        fixPrompt: v.fixPrompt ?? null,
-        sourceTier: request.ownership.tier,
-      })),
-    };
+    return materializeProviderResult(
+      { family: 'code', mode: 'normal', planned: { ...planned, request } },
+      object,
+    );
   }
 
   async generateAllCodeViolations(batches: CodeViolationContext[]): Promise<CodeViolationsResult> {
