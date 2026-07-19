@@ -10,7 +10,7 @@ import type { RegistryEntry } from '../config/registry.js';
 import type { LLMProvider } from '../services/llm/provider.js';
 import type { LlmTransport } from '@truecourse/shared/llm';
 import type { StepTracker } from '../progress.js';
-import { analyzeCore, type LlmEstimate } from './analyze-core.js';
+import { analyzeCoreAndFinalize, type AnalyzeCoreResult, type LlmEstimate } from './analyze-core.js';
 import { persistFullAnalysis, type PersistFullResult } from './analyze-persist.js';
 import { config } from '../config/index.js';
 import { log } from '../lib/logger.js';
@@ -87,14 +87,21 @@ export async function analyzeInProcess(
       options.selectedModel || config.claudeCodeModel || 'default (chosen by Claude Code)'
     }, maxConcurrency: ${config.claudeCodeMaxConcurrency}`,
   );
-  let core: Awaited<ReturnType<typeof analyzeCore>>;
+  let core!: AnalyzeCoreResult;
+  let result: PersistFullResult;
   try {
-    core = await analyzeCore(project, { ...options, mode: 'full' });
+    result = await analyzeCoreAndFinalize(
+      project,
+      { ...options, mode: 'full' },
+      async (computed) => {
+        core = computed;
+        return persistFullAnalysis(project, computed, startedAt);
+      },
+    );
   } catch (error) {
     if (isLlmSessionLimitError(error)) throw new AnalysisSessionLimitError(error);
     throw error;
   }
-  const result = await persistFullAnalysis(project, core, startedAt);
 
   if (options.source) {
     await trackEvent('analyze', {

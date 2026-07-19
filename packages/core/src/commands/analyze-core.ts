@@ -29,7 +29,7 @@ import { createLLMProvider, type LLMProvider } from '../services/llm/provider.js
 import { getDefaultTransport, type LlmTransport } from '@truecourse/shared/llm';
 import { toUsageRecords } from '../services/usage.service.js';
 import { readLatest } from '../lib/analysis-store.js';
-import { acquireAnalyzeLock, releaseAnalyzeLock } from '../lib/atomic-write.js';
+import { withAnalyzeLifecycleLock } from '../lib/analyze-lifecycle-lock.js';
 import type { Graph, LatestSnapshot, UsageRecord, ViolationRecord } from '../types/snapshot.js';
 import type { StepTracker } from '../progress.js';
 
@@ -165,98 +165,113 @@ export async function analyzeCore(
   project: RegistryEntry,
   options: AnalyzeCoreOptions,
 ): Promise<AnalyzeCoreResult> {
+  return analyzeCoreAndFinalize(project, options, async (core) => core);
+}
+
+/**
+ * Compute and finalize one analysis while retaining the repository lifecycle
+ * lock. Full/diff wrappers use this so persistence cannot race another run.
+ *
+ * @internal
+ */
+export async function analyzeCoreAndFinalize<T>(
+  project: RegistryEntry,
+  options: AnalyzeCoreOptions,
+  finalize: (core: AnalyzeCoreResult) => Promise<T>,
+): Promise<T> {
+  return withAnalyzeLifecycleLock(project.path, async () => {
+    const core = await computeAnalyzeCore(project, options);
+    return finalize(core);
+  });
+}
+
+async function computeAnalyzeCore(
+  project: RegistryEntry,
+  options: AnalyzeCoreOptions,
+): Promise<AnalyzeCoreResult> {
   // Code lives at `codeDir` (the repo, or a clone in EE); storage keys off
   // `project.path` (a path in OSS, an opaque identity in EE).
   const codeDir = options.codeDir ?? project.path;
 
-  // Single lock protects both modes. A diff while an analyze is in-flight (or
-  // vice versa) corrupts LATEST / diff.json invariants, so block both. Keyed by
-  // the STORAGE identity (`project.path`) — not the code dir — so in EE two
-  // analyses of the same repo serialize even though each clones into its own
-  // temp dir (the EE impl is a `pg_advisory_lock`). If acquire throws we never
-  // entered the body below, so the lock is not held and needs no release.
-  await acquireAnalyzeLock(project.path);
+  const { mode, signal } = options;
+  const isDiff = mode === 'diff';
+  const skipGit = !isDiff && !!options.skipGit;
+  const projectConfig = await readProjectConfig(project.path);
 
-  try {
-    const { mode, signal } = options;
-    const isDiff = mode === 'diff';
-    const skipGit = !isDiff && !!options.skipGit;
-    const projectConfig = await readProjectConfig(project.path);
+  const latestBaseline = await readLatest(project.path);
+  if (isDiff && !latestBaseline) {
+    throw new Error('Run a full analysis first before checking a diff.');
+  }
 
-    const latestBaseline = await readLatest(project.path);
-    if (isDiff && !latestBaseline) {
-      throw new Error('Run a full analysis first before checking a diff.');
-    }
-
-    // ------------------------------------------------------------
-    // Branch / commit metadata
-    // ------------------------------------------------------------
-    let branch: string | null = options.branch ?? null;
-    let commitHash: string | null = options.commitHash ?? null;
-    if (isDiff) {
-      // Diff inherits branch from the baseline so the violation pipeline can
-      // compare like-for-like. Commit hash reflects the working tree's HEAD.
-      branch = latestBaseline!.analysis.branch ?? branch;
-      if (commitHash === null) {
-        try {
-          const git = await getGit(codeDir);
-          commitHash = (await git.revparse(['HEAD'])).trim() || null;
-        } catch {
-          commitHash = null;
-        }
-      }
-    } else if (!skipGit && (branch === null || commitHash === null)) {
-      const git = await getGit(codeDir);
-      if (branch === null) branch = (await git.branch()).current || null;
-      if (commitHash === null) commitHash = (await git.revparse(['HEAD'])).trim();
-    }
-
-    const analysisId = randomUUID();
-    const now = new Date().toISOString();
-    const start = Date.now();
-
-    const effectiveCategories = options.enabledCategoriesOverride?.length
-      ? options.enabledCategoriesOverride
-      : projectConfig.enabledCategories ?? undefined;
-    const effectiveLlmRules =
-      projectConfig.enableLlmRules ?? options.enableLlmRulesOverride ?? true;
-
-    // ------------------------------------------------------------
-    // Stash dirty working tree so the entire pipeline (parse + LLM scan +
-    // persist) sees the committed state. Diff mode never stashes — it
-    // analyzes the working tree by design.
-    // ------------------------------------------------------------
-    let didStash = false;
-    let stashGit: Awaited<ReturnType<typeof getGit>> | undefined;
-    if (!isDiff && !skipGit && !options.skipStash) {
+  // ------------------------------------------------------------
+  // Branch / commit metadata
+  // ------------------------------------------------------------
+  let branch: string | null = options.branch ?? null;
+  let commitHash: string | null = options.commitHash ?? null;
+  if (isDiff) {
+    // Diff inherits branch from the baseline so the violation pipeline can
+    // compare like-for-like. Commit hash reflects the working tree's HEAD.
+    branch = latestBaseline!.analysis.branch ?? branch;
+    if (commitHash === null) {
       try {
-        stashGit = await getGit(codeDir);
-        const status = await stashGit.status();
-        if (!status.isClean()) {
-          const gitRoot = (await stashGit.revparse(['--show-toplevel'])).trim();
-          // Skip stashing when the repo path is a subdirectory of a larger
-          // repo (e.g., test fixtures inside the main repo). Stashing there
-          // would touch unrelated parent-repo files.
-          const isSubdirectory = path.resolve(codeDir) !== path.resolve(gitRoot);
-          if (!isSubdirectory) {
-            options.tracker?.detail('parse', 'Stashing pending changes...');
-            options.onProgress?.({ detail: 'Stashing pending changes to analyze committed state...' });
-            const stashResult = await stashGit.stash([
-              'push',
-              '--include-untracked',
-              '-m',
-              'truecourse-analysis-stash',
-            ]);
-            // git stash push prints "No local changes to save" if nothing to stash
-            didStash = !stashResult.includes('No local changes');
-          }
-        }
-      } catch (error) {
-        log.warn(
-          `[Analyzer] Failed to stash changes, analyzing current state: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        const git = await getGit(codeDir);
+        commitHash = (await git.revparse(['HEAD'])).trim() || null;
+      } catch {
+        commitHash = null;
       }
     }
+  } else if (!skipGit && (branch === null || commitHash === null)) {
+    const git = await getGit(codeDir);
+    if (branch === null) branch = (await git.branch()).current || null;
+    if (commitHash === null) commitHash = (await git.revparse(['HEAD'])).trim();
+  }
+
+  const analysisId = randomUUID();
+  const now = new Date().toISOString();
+  const start = Date.now();
+
+  const effectiveCategories = options.enabledCategoriesOverride?.length
+    ? options.enabledCategoriesOverride
+    : projectConfig.enabledCategories ?? undefined;
+  const effectiveLlmRules =
+    projectConfig.enableLlmRules ?? options.enableLlmRulesOverride ?? true;
+
+  // ------------------------------------------------------------
+  // Stash dirty working tree so the entire pipeline (parse + LLM scan +
+  // persist) sees the committed state. Diff mode never stashes — it
+  // analyzes the working tree by design.
+  // ------------------------------------------------------------
+  let didStash = false;
+  let stashGit: Awaited<ReturnType<typeof getGit>> | undefined;
+  if (!isDiff && !skipGit && !options.skipStash) {
+    try {
+      stashGit = await getGit(codeDir);
+      const status = await stashGit.status();
+      if (!status.isClean()) {
+        const gitRoot = (await stashGit.revparse(['--show-toplevel'])).trim();
+        // Skip stashing when the repo path is a subdirectory of a larger
+        // repo (e.g., test fixtures inside the main repo). Stashing there
+        // would touch unrelated parent-repo files.
+        const isSubdirectory = path.resolve(codeDir) !== path.resolve(gitRoot);
+        if (!isSubdirectory) {
+          options.tracker?.detail('parse', 'Stashing pending changes...');
+          options.onProgress?.({ detail: 'Stashing pending changes to analyze committed state...' });
+          const stashResult = await stashGit.stash([
+            'push',
+            '--include-untracked',
+            '-m',
+            'truecourse-analysis-stash',
+          ]);
+          // git stash push prints "No local changes to save" if nothing to stash
+          didStash = !stashResult.includes('No local changes');
+        }
+      }
+    } catch (error) {
+      log.warn(
+        `[Analyzer] Failed to stash changes, analyzing current state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 
   try {
     // ------------------------------------------------------------
@@ -454,21 +469,18 @@ export async function analyzeCore(
       previousAnalysisId,
       analysisResult: result,
     };
-    } finally {
-      if (didStash && stashGit) {
-        options.tracker?.detail('parse', 'Restoring pending changes...');
-        options.onProgress?.({ detail: 'Restoring pending changes...' });
-        try {
-          await stashGit.stash(['pop']);
-        } catch (error) {
-          log.error(
-            `[Analyzer] Failed to restore stashed changes. Run "git stash pop" manually. ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
+  } finally {
+    if (didStash && stashGit) {
+      options.tracker?.detail('parse', 'Restoring pending changes...');
+      options.onProgress?.({ detail: 'Restoring pending changes...' });
+      try {
+        await stashGit.stash(['pop']);
+      } catch (error) {
+        log.error(
+          `[Analyzer] Failed to restore stashed changes. Run "git stash pop" manually. ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
-  } finally {
-    await releaseAnalyzeLock(project.path);
   }
 }
 
@@ -490,4 +502,3 @@ function enforceLocationInvariant(violations: ViolationRecord[]): void {
     v.lineEnd = null;
   }
 }
-

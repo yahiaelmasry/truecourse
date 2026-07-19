@@ -8,7 +8,7 @@
 
 import type { RegistryEntry } from '../config/registry.js';
 import type { StepTracker } from '../progress.js';
-import { analyzeCore, type LlmEstimate } from './analyze-core.js';
+import { analyzeCoreAndFinalize, type AnalyzeCoreResult, type LlmEstimate } from './analyze-core.js';
 import { persistDiffAnalysis, type PersistDiffResult } from './analyze-persist.js';
 import {
   bucketDuration,
@@ -46,8 +46,15 @@ export async function diffInProcess(
   options: DiffInProcessOptions = {},
 ): Promise<DiffInProcessResult> {
   const startedAt = Date.now();
-  const core = await analyzeCore(project, { ...options, mode: 'diff' });
-  const result = await persistDiffAnalysis(project, core);
+  let core!: AnalyzeCoreResult;
+  const result = await analyzeCoreAndFinalize(
+    project,
+    { ...options, mode: 'diff' },
+    async (computed) => {
+      core = computed;
+      return persistDiffAnalysis(project, computed);
+    },
+  );
 
   if (options.source) {
     await trackEvent('analyze', {

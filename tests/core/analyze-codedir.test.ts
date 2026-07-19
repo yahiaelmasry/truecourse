@@ -27,7 +27,9 @@ vi.mock('../../apps/dashboard/server/src/socket/handlers', async (importOriginal
 });
 
 import { analyzeInProcess } from '../../packages/core/src/commands/analyze-in-process';
+import { analyzeCoreAndFinalize } from '../../packages/core/src/commands/analyze-core';
 import { readLatest, clearLatestCache } from '../../packages/core/src/lib/analysis-store';
+import { acquireAnalyzeLock, releaseAnalyzeLock } from '../../packages/core/src/lib/atomic-write';
 import type { RegistryEntry } from '../../packages/core/src/config/registry';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -94,5 +96,35 @@ describe('analyzeInProcess with codeDir — code ≠ storage key (the EE flow)',
     // The code dir got no store written to it.
     expect(await readLatest(codeDir)).toBeNull();
     expect(fs.existsSync(path.join(codeDir, '.truecourse', 'LATEST.json'))).toBe(false);
+  }, 30_000);
+
+  it('keeps the storage-key lock held while the finalizer is pending', async () => {
+    let enterFinalizer!: () => void;
+    let allowFinalizer!: () => void;
+    const finalizerEntered = new Promise<void>((resolve) => { enterFinalizer = resolve; });
+    const finalizerAllowed = new Promise<void>((resolve) => { allowFinalizer = resolve; });
+    const lifecycle = analyzeCoreAndFinalize(
+      project,
+      {
+        codeDir,
+        mode: 'full',
+        enableLlmRulesOverride: false,
+        skipStash: true,
+        branch: 'main',
+        commitHash: 'deadbeef',
+      },
+      async (core) => {
+        enterFinalizer();
+        await finalizerAllowed;
+        return core.analysisId;
+      },
+    );
+
+    await finalizerEntered;
+    await expect(acquireAnalyzeLock(keyDir)).rejects.toThrow(/already running/i);
+    allowFinalizer();
+    await expect(lifecycle).resolves.toEqual(expect.any(String));
+    await expect(acquireAnalyzeLock(keyDir)).resolves.toBeUndefined();
+    await releaseAnalyzeLock(keyDir);
   }, 30_000);
 });

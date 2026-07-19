@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { simpleGit } from 'simple-git';
-import { analyzeCore } from '@truecourse/core/commands/analyze-core';
+import { analyzeCoreAndFinalize } from '@truecourse/core/commands/analyze-core';
 import { persistDiffAnalysis } from '@truecourse/core/commands/analyze-persist';
 import { log } from '@truecourse/core/lib/logger';
 import type { ViolationRecord } from '@truecourse/core/types/snapshot';
@@ -91,19 +91,21 @@ export async function runGateAnalyze(
     // a missing baseline yields null → the gate leaves the Code Quality Check neutral.
     let codeQualityAdded: ViolationRecord[] | null = null;
     try {
-      const cq = await analyzeCore(
+      await analyzeCoreAndFinalize(
         { slug: req.repoFullName, name: req.repoFullName, path: req.repoFullName },
         { codeDir: tmp, mode: 'full', enableLlmRulesOverride: req.enableLlmAnalysis ?? false },
+        async (cq) => {
+          codeQualityAdded = cq.latestBaseline ? cq.pipelineResult.added : null;
+          // Persist the PR head's Code Quality DIFF (new/resolved vs the baseline) under
+          // a PR-scoped key, so the dashboard's PR view can show new/resolved — the
+          // analyze-equivalent of OSS `?view=diff`. `writeDiff` only; the repo's baseline
+          // LATEST is never touched. Skipped when there's no baseline (nothing to diff).
+          if (cq.latestBaseline) {
+            const prKey = `${req.repoFullName}::pr/${req.prNumber}`;
+            await persistDiffAnalysis({ slug: prKey, name: req.repoFullName, path: prKey }, cq);
+          }
+        },
       );
-      codeQualityAdded = cq.latestBaseline ? cq.pipelineResult.added : null;
-      // Persist the PR head's Code Quality DIFF (new/resolved vs the baseline) under
-      // a PR-scoped key, so the dashboard's PR view can show new/resolved — the
-      // analyze-equivalent of OSS `?view=diff`. `writeDiff` only; the repo's baseline
-      // LATEST is never touched. Skipped when there's no baseline (nothing to diff).
-      if (cq.latestBaseline) {
-        const prKey = `${req.repoFullName}::pr/${req.prNumber}`;
-        await persistDiffAnalysis({ slug: prKey, name: req.repoFullName, path: prKey }, cq);
-      }
     } catch (err) {
       log.warn(
         `[github-app] code quality analyze failed for ${req.repoFullName} PR#${req.prNumber}: ${(err as Error).message}`,
