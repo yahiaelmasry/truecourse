@@ -1,9 +1,10 @@
+import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  ensureLastAnalyzed,
   getRegistryStore,
   validateLastAnalyzedTimestamp,
   type EnsureLastAnalyzedResult,
+  type RegistryStore,
 } from '../config/registry.js';
 import type {
   AnalysisSnapshot,
@@ -14,11 +15,9 @@ import type {
 import {
   activeCompletedBaselineId,
   buildAnalysisFilename,
-  certifyCompletedAnalysisLineage,
-  ensureHistoryEntry,
-  readLatest,
-  reconcileDiffWithLatest,
+  getAnalysisStore,
   validateHistoryEntryForPersistence,
+  type AnalysisStore,
   type EnsureHistoryEntryResult,
   type ReconcileDiffResult,
 } from './analysis-store.js';
@@ -38,6 +37,10 @@ export interface CompletedAnalysisProjectionOptions {
   faultInjector?: (
     point: CompletedAnalysisProjectionFaultPoint,
   ) => void | Promise<void>;
+  /** Internal pinning seam used by the finalization coordinator. */
+  analysisStore?: AnalysisStore;
+  /** Internal pinning seam used by the finalization coordinator. */
+  registryStore?: RegistryStore;
 }
 
 export interface CompletedAnalysisProjectionResult {
@@ -49,6 +52,15 @@ export interface CompletedAnalysisProjectionResult {
 }
 
 const severities: ViolationSeverity[] = ['info', 'low', 'medium', 'high', 'critical'];
+
+function sameRepositoryKey(left: string, right: string): boolean {
+  if (left === right) return true;
+  try {
+    return fs.realpathSync.native(left) === fs.realpathSync.native(right);
+  } catch {
+    return false;
+  }
+}
 
 function nonnegativeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -168,7 +180,7 @@ export function validateCompletedAnalysisProjectionIntent(
 
 function validateActiveHistoryCounts(
   intent: CompletedAnalysisProjectionIntent,
-  latest: NonNullable<Awaited<ReturnType<typeof readLatest>>>,
+  latest: NonNullable<Awaited<ReturnType<AnalysisStore['readLatest']>>>,
 ): void {
   const bySeverity = Object.fromEntries(
     severities.map((severity) => [severity, 0]),
@@ -202,22 +214,40 @@ export async function projectCompletedAnalysis(
   if (repoKey.length === 0) throw new Error('Completed-analysis projection requires a repository key');
   validateCompletedAnalysisProjectionIntent(intent);
 
-  const lineage = await certifyCompletedAnalysisLineage(repoKey, intent.promotedSnapshot);
-  const latest = await readLatest(repoKey);
+  const analysisStore = options.analysisStore ?? getAnalysisStore();
+  const registry = options.registryStore ?? getRegistryStore();
+  const assertStores = (): void => {
+    if (getAnalysisStore() !== analysisStore || getRegistryStore() !== registry) {
+      throw new Error('Completed-analysis projection storage changed during recovery');
+    }
+  };
+  assertStores();
+
+  const lineage = await analysisStore.certifyCompletedAnalysisLineage(
+    repoKey,
+    intent.promotedSnapshot,
+  );
+  assertStores();
+  const latest = await analysisStore.readLatest(repoKey);
+  assertStores();
   const activeAnalysisId = activeCompletedBaselineId(latest);
   if (activeAnalysisId !== lineage.activeAnalysisId) {
     throw new Error('Active completed baseline changed during projection preflight');
   }
   if (lineage.generations === 0) validateActiveHistoryCounts(intent, latest!);
 
-  const registry = getRegistryStore();
   if (!registry.ensureLastAnalyzed) {
     throw new Error('Active registry store does not support monotonic projection');
   }
-  const project = await registry.getProjectByPath(repoKey);
+  let project = await registry.getProjectByPath(repoKey);
+  assertStores();
+  if (!project) {
+    project = await registry.getProjectBySlug(intent.projectSlug);
+    assertStores();
+  }
   if (
     !project
-    || project.path !== repoKey
+    || !sameRepositoryKey(project.path, repoKey)
     || (intent.projectSlug !== project.slug && intent.projectSlug !== project.path)
   ) {
     throw new Error('Projection project does not match the repository key');
@@ -226,11 +256,19 @@ export async function projectCompletedAnalysis(
     validateLastAnalyzedTimestamp(project.lastAnalyzed, 'Stored lastAnalyzed');
   }
 
-  const history = await ensureHistoryEntry(repoKey, intent.historyEntry);
+  const history = await analysisStore.ensureHistoryEntry(repoKey, intent.historyEntry);
+  assertStores();
   await options.faultInjector?.('after-history');
-  const diff = await reconcileDiffWithLatest(repoKey);
+  assertStores();
+  const diff = await analysisStore.reconcileDiffWithLatest(repoKey);
+  assertStores();
   await options.faultInjector?.('after-diff');
-  const registryResult = await ensureLastAnalyzed(project.slug, latest!.analysis.createdAt);
+  assertStores();
+  const registryResult = await registry.ensureLastAnalyzed(
+    project.slug,
+    latest!.analysis.createdAt,
+  );
+  assertStores();
   await options.faultInjector?.('after-registry');
 
   return {

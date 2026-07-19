@@ -16,10 +16,14 @@ import {
   validateCompletedAnalysisPromotion,
   type CompletedAnalysisPromotion,
 } from './completed-analysis-promotion.js';
-import { buildAnalysisFilename } from './analysis-store.js';
+import { buildAnalysisFilename, getAnalysisStore } from './analysis-store.js';
+import { getRegistryStore } from '../config/registry.js';
 import type { HistoryEntry } from '../types/snapshot.js';
 import {
+  installPreparedAnalyzeRunFinalizationCompleter,
+  installPreparedAnalyzeRunFinalizationCertifier,
   installPreparedAnalyzeRunFinalizationReader,
+  type PreparedAnalyzeRunCompletion,
   type PreparedAnalyzeRunFinalization,
 } from './analyze-run-finalization-recovery.js';
 
@@ -79,6 +83,16 @@ const analyzeRunPlanActivationReceipts = new WeakMap<
   Map<string, AnalyzeRunPlanActivation>
 >();
 
+const preparedAnalyzeRunCompletions = new WeakMap<object, {
+  storage: AnalyzeRunStorage;
+  repoKey: string;
+  runId: string;
+  revision: number;
+  analysisStore: ReturnType<typeof getAnalysisStore>;
+  registryStore: ReturnType<typeof getRegistryStore>;
+  claimed: boolean;
+}>();
+
 export interface BlockAnalyzeRunCommand {
   kind: 'block';
   runId: string;
@@ -129,7 +143,7 @@ export interface AnalyzeRunView {
   revision: number;
   runId: string;
   candidateAnalysisId: string;
-  state: 'running' | 'blocked' | 'failed' | 'finalizing';
+  state: 'running' | 'blocked' | 'failed' | 'finalizing' | 'completed';
   startedAt: string;
   updatedAt: string;
   source: AnalyzeRunSource;
@@ -161,7 +175,7 @@ export interface AnalyzeRunView {
   };
   resume: {
     available: false;
-    reason: 'successful-results-not-checkpointed';
+    reason: 'successful-results-not-checkpointed' | 'run-completed';
   };
 }
 
@@ -195,6 +209,11 @@ export interface StoredAnalyzeRun {
     | {
         state: 'finalizing';
         finalizingAt: string;
+      }
+    | {
+        state: 'completed';
+        finalizingAt: string;
+        completedAt: string;
       };
   startedAt: string;
   updatedAt: string;
@@ -398,6 +417,114 @@ installPreparedAnalyzeRunFinalizationReader(async (repoKey, runId) => {
       promotedSnapshot: current.finalizationIntent.promotion.snapshot,
     },
   })) as PreparedAnalyzeRunFinalization;
+});
+
+installPreparedAnalyzeRunFinalizationCertifier(async (repoKey, runId) => {
+  const storage = activeStorage;
+  const repositoryKey = activationScopeKey(repoKey, storage);
+  const current = await storage.read(repositoryKey, validateRunId(runId));
+  assertAnalyzeRunStorage(storage);
+  if (!current) return null;
+  if (current.status.state === 'completed') {
+    return { state: 'completed', repositoryKey, completed: toView(current) };
+  }
+  if (!current.finalizationIntent || current.status.state !== 'finalizing') return null;
+  const prepared = JSON.parse(JSON.stringify({
+    preparedAt: current.finalizationIntent.preparedAt,
+    promotion: current.finalizationIntent.promotion,
+    projection: {
+      ...current.finalizationIntent.projection,
+      promotedSnapshot: current.finalizationIntent.promotion.snapshot,
+    },
+  })) as PreparedAnalyzeRunFinalization;
+  const completion = Object.freeze({}) as PreparedAnalyzeRunCompletion;
+  preparedAnalyzeRunCompletions.set(completion, {
+    storage,
+    repoKey: repositoryKey,
+    runId: current.runId,
+    revision: current.revision,
+    analysisStore: getAnalysisStore(),
+    registryStore: getRegistryStore(),
+    claimed: false,
+  });
+  return { state: 'prepared', repositoryKey, prepared, completion };
+});
+
+installPreparedAnalyzeRunFinalizationCompleter(async (repoKey, command) => {
+  const runId = validateRunId(command.runId);
+  const completedAt = validateTimestamp(command.completedAt, 'completedAt');
+  const certification = preparedAnalyzeRunCompletions.get(command.completion);
+  if (
+    !certification
+    || certification.claimed
+    || certification.storage !== activeStorage
+    || certification.repoKey !== activationScopeKey(repoKey, certification.storage)
+    || certification.runId !== runId
+    || certification.analysisStore !== getAnalysisStore()
+    || certification.registryStore !== getRegistryStore()
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} prepared-finalization storage changed or certification is invalid`,
+    );
+  }
+  const storage = certification.storage;
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (
+    certification.analysisStore !== getAnalysisStore()
+    || certification.registryStore !== getRegistryStore()
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} persistence storage changed before journal completion`,
+    );
+  }
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+  if (current.status.state === 'completed') {
+    if (current.status.completedAt !== completedAt) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} was completed with a different completion time`,
+      );
+    }
+    return toView(current);
+  }
+  if (
+    current.status.state !== 'finalizing'
+    || current.plan.state !== 'sealed'
+    || current.finalizationIntent === null
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot complete analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+  if (current.revision !== certification.revision) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} changed after its prepared finalization was certified`,
+    );
+  }
+  if (Date.parse(completedAt) < Date.parse(current.finalizationIntent.preparedAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} completion cannot precede prepared finalization`,
+    );
+  }
+  const next: StoredAnalyzeRun = {
+    ...current,
+    revision: current.revision + 1,
+    updatedAt: completedAt,
+    status: {
+      state: 'completed',
+      finalizingAt: current.status.finalizingAt,
+      completedAt,
+    },
+  };
+  certification.claimed = true;
+  try {
+    await storage.compareAndSwap(repoKey, runId, current.revision, next);
+    assertAnalyzeRunStorage(storage);
+    return toView(next);
+  } catch (error) {
+    certification.claimed = false;
+    throw error;
+  }
 });
 
 /**
@@ -662,7 +789,7 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
           failedAt: run.status.failedAt,
       }
       : null,
-    finalization: run.status.state === 'finalizing'
+    finalization: run.status.state === 'finalizing' || run.status.state === 'completed'
       ? {
           finalizingAt: run.status.finalizingAt,
           persistence: run.finalizationIntent === null ? 'unprepared' : 'prepared',
@@ -677,7 +804,9 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
         : null,
     resume: {
       available: false,
-      reason: 'successful-results-not-checkpointed',
+      reason: run.status.state === 'completed'
+        ? 'run-completed'
+        : 'successful-results-not-checkpointed',
     },
   };
 }
@@ -1171,7 +1300,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     typeof value.runId !== 'string' ||
     typeof value.candidateAnalysisId !== 'string' ||
     !isRecord(value.status) ||
-    !['running', 'blocked', 'failed', 'finalizing'].includes(String(value.status.state)) ||
+    !['running', 'blocked', 'failed', 'finalizing', 'completed'].includes(String(value.status.state)) ||
     typeof value.startedAt !== 'string' ||
     typeof value.updatedAt !== 'string' ||
     !['cli', 'dashboard', 'hosted'].includes(String(value.source)) ||
@@ -1217,6 +1346,8 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
       ? status.failedAt
       : status.state === 'finalizing'
         ? status.finalizingAt
+        : status.state === 'completed'
+          ? status.completedAt
         : null;
   const terminalTimestampIsImpossible = terminalAt !== null && (
     Date.parse(terminalAt) < Date.parse(value.startedAt) ||
@@ -1282,6 +1413,15 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
             : finalizationIntent.preparedAt === value.updatedAt
               && Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt)) &&
           plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
+        ) || (
+          status.state === 'completed' &&
+          revision === 5 &&
+          finalizationIntent !== null &&
+          status.completedAt === value.updatedAt &&
+          Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
+          Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt) &&
+          Date.parse(status.completedAt) >= Date.parse(finalizationIntent.preparedAt) &&
+          plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
         )
       )
     );
@@ -1291,9 +1431,10 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   /*
     Schema v2 retains revision 2 for durable execution admission. Terminal execution states and
     unprepared finalization use revision 3; preparing finalization advances to revision 4. A
-    finalization failure advances to revision 4 when unprepared or revision 5 when prepared. The
-    admission tombstone prevents a consumed plan from issuing another receipt. Future work-result
-    or completion commands must migrate or extend the durable schema with these invariants.
+    finalization failure advances to revision 4 when unprepared or revision 5 when prepared, while
+    certified completion advances a prepared run to revision 5. The admission tombstone prevents
+    a consumed plan from issuing another receipt. Future work-result commands must migrate or
+    extend the durable schema with these invariants.
   */
 
   return {
@@ -1376,6 +1517,13 @@ function parseStoredStatus(value: Record<string, unknown>, file: string): Stored
     return {
       state: 'finalizing',
       finalizingAt: validateTimestamp(value.finalizingAt, 'finalizingAt'),
+    };
+  }
+  if (value.state === 'completed') {
+    return {
+      state: 'completed',
+      finalizingAt: validateTimestamp(value.finalizingAt, 'finalizingAt'),
+      completedAt: validateTimestamp(value.completedAt, 'completedAt'),
     };
   }
   if (
