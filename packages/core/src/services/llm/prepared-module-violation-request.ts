@@ -31,8 +31,8 @@ export interface PreparedModuleServiceBinding {
   readonly serviceRuntimeId: string;
 }
 
-type ModuleViolationOutput = ReturnType<typeof ModuleViolationOutputSchema.parse>;
-type ModuleLifecycleViolationOutput = ReturnType<typeof DiffViolationOutputSchema.parse>;
+export type ModuleViolationOutput = ReturnType<typeof ModuleViolationOutputSchema.parse>;
+export type ModuleLifecycleViolationOutput = ReturnType<typeof DiffViolationOutputSchema.parse>;
 
 interface PreparedModuleRequestMetadata {
   readonly system: '';
