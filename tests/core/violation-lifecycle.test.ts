@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { ViolationStatusSchema } from '../../packages/shared/src/types/violations';
+import {
+  computeViolationLifecycle,
+  type ActiveViolation,
+} from '../../packages/core/src/services/violation-lifecycle.service';
+import type { DiffViolationItem } from '../../packages/core/src/services/llm/provider';
 
 describe('ViolationStatusSchema', () => {
   it('accepts valid statuses', () => {
@@ -12,6 +17,89 @@ describe('ViolationStatusSchema', () => {
     expect(() => ViolationStatusSchema.parse('active')).toThrow();
     expect(() => ViolationStatusSchema.parse('')).toThrow();
     expect(() => ViolationStatusSchema.parse(null)).toThrow();
+  });
+});
+
+describe('computeViolationLifecycle replacement evidence', () => {
+  it('records the exact prior ID as resolved when a scoped new finding replaces its title', () => {
+    const previous = {
+      id: 'prior-finding',
+      type: 'service',
+      category: 'rule',
+      subcategory: null,
+      title: 'Circular dependency',
+      content: 'old evidence',
+      severity: 'high',
+      status: 'new',
+      targetServiceId: 'old-service',
+      targetDatabaseId: null,
+      targetModuleId: null,
+      targetMethodId: null,
+      targetTable: null,
+      relatedServiceId: null,
+      relatedModuleId: null,
+      fixPrompt: null,
+      ruleKey: 'architecture/circular-dependency',
+      firstSeenAnalysisId: 'analysis-1',
+      firstSeenAt: '2026-01-01T00:00:00.000Z',
+      previousViolationId: null,
+      resolvedAt: null,
+      filePath: null,
+      lineStart: null,
+      lineEnd: null,
+      columnStart: null,
+      columnEnd: null,
+      snippet: null,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      targetServiceName: 'Orders',
+      targetModuleName: null,
+      targetMethodName: null,
+      targetDatabaseName: null,
+    } satisfies ActiveViolation;
+    const replacement = {
+      type: 'service',
+      title: '  circular dependency  ',
+      content: 'new evidence',
+      severity: 'high',
+      ruleKey: 'architecture/circular-dependency',
+      targetServiceName: 'Orders',
+    } as DiffViolationItem;
+
+    const result = computeViolationLifecycle({
+      analysisId: 'analysis-2',
+      now: '2026-01-02T00:00:00.000Z',
+      newViolations: [replacement],
+      resolvedViolationIds: [],
+      previousActiveViolations: [previous],
+      serviceNameToId: new Map([['Orders', 'new-service']]),
+    });
+
+    expect(result.unchanged).toEqual([]);
+    expect(result.resolvedRefs).toEqual([
+      { id: previous.id, resolvedAt: '2026-01-02T00:00:00.000Z' },
+    ]);
+    expect(result.resolved).toHaveLength(1);
+    expect(result.resolved[0]).toMatchObject({
+      status: 'resolved',
+      previousViolationId: previous.id,
+      targetServiceId: 'new-service',
+    });
+    expect(result.added).toHaveLength(1);
+    expect(result.counts).toEqual({ newCount: 1, unchangedCount: 0, resolvedCount: 1 });
+
+    const explicitAndReplaced = computeViolationLifecycle({
+      analysisId: 'analysis-2',
+      now: '2026-01-02T00:00:00.000Z',
+      newViolations: [replacement],
+      resolvedViolationIds: [previous.id],
+      previousActiveViolations: [previous],
+      serviceNameToId: new Map([['Orders', 'new-service']]),
+    });
+    expect(explicitAndReplaced.resolved).toHaveLength(1);
+    expect(explicitAndReplaced.resolvedRefs).toEqual([
+      { id: previous.id, resolvedAt: '2026-01-02T00:00:00.000Z' },
+    ]);
+    expect(explicitAndReplaced.counts.resolvedCount).toBe(1);
   });
 });
 
@@ -44,12 +132,11 @@ describe('violation lifecycle logic (unit)', () => {
     const result: { id?: string; title: string; status: 'new' | 'unchanged' | 'resolved'; previousId?: string }[] = [];
 
     for (const prev of previousActive) {
-      if (resolvedSet.has(prev.id)) {
+      if (resolvedSet.has(prev.id) || newTitles.has(prev.title.toLowerCase().trim())) {
         result.push({ title: prev.title, status: 'resolved', previousId: prev.id });
-      } else if (!newTitles.has(prev.title.toLowerCase().trim())) {
+      } else {
         result.push({ title: prev.title, status: 'unchanged', previousId: prev.id });
       }
-      // If title matches a new violation, skip (replaced by new one)
     }
 
     for (const v of newViolations) {
@@ -161,8 +248,9 @@ describe('violation lifecycle logic (unit)', () => {
       [{ title: 'Circular dependency', type: 'service', content: 'Updated description', severity: 'high' }],
     );
 
-    expect(result).toHaveLength(2);
-    // v2 unchanged, new "Circular dependency" replaces v1
+    expect(result).toHaveLength(3);
+    // v2 unchanged, while the exact prior v1 is resolved before replacement.
+    expect(result.find((v) => v.status === 'resolved')?.previousId).toBe('v1');
     expect(result.find((v) => v.status === 'unchanged')?.title).toBe('Missing index');
     expect(result.find((v) => v.status === 'new')?.title).toBe('Circular dependency');
     // v1 should NOT appear as unchanged
@@ -182,6 +270,7 @@ describe('violation lifecycle logic (unit)', () => {
 
     // Should be treated as a replacement, not a duplicate
     expect(result.filter((v) => v.status === 'unchanged')).toHaveLength(0);
+    expect(result.find((v) => v.status === 'resolved')?.previousId).toBe('v1');
     expect(result.find((v) => v.status === 'new')?.title).toBe('circular dependency');
   });
 });
