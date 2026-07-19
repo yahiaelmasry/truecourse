@@ -26,8 +26,8 @@ export interface PreparedDatabaseOwnership {
   }[];
 }
 
-type DatabaseViolationOutput = ReturnType<typeof DatabaseViolationOutputSchema.parse>;
-type DatabaseLifecycleViolationOutput = ReturnType<typeof DatabaseLifecycleViolationOutputSchema.parse>;
+export type DatabaseViolationOutput = ReturnType<typeof DatabaseViolationOutputSchema.parse>;
+export type DatabaseLifecycleViolationOutput = ReturnType<typeof DatabaseLifecycleViolationOutputSchema.parse>;
 
 interface PreparedDatabaseRequestMetadata {
   readonly system: '';
