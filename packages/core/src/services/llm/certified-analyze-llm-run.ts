@@ -2,8 +2,10 @@ import { CODE_DOMAINS, type RuleDomain } from '@truecourse/shared';
 import { isLlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   admitAnalyzeRunPlanExecution,
+  type AnalyzeRunExecutionCompletion,
   type AnalyzeRunPlanActivation,
 } from '../../lib/analyze-run-journal.js';
+import { certifyAnalyzeRunExecutionCompletion } from '../../lib/analyze-run-execution-completion.js';
 import { log } from '../../lib/logger.js';
 import type {
   CodeViolationContext,
@@ -106,10 +108,15 @@ export interface CertifiedAnalyzeLlmRun {
   execute(
     activation: AnalyzeRunPlanActivation,
     observer?: AnalyzeLlmWorkProgressObserver,
-  ): Promise<readonly {
+  ): Promise<CertifiedAnalyzeLlmExecution>;
+}
+
+export interface CertifiedAnalyzeLlmExecution {
+  readonly results: readonly {
     readonly work: CertifiedAnalyzeLlmWork;
     readonly result: unknown;
-  }[]>;
+  }[];
+  readonly completion: AnalyzeRunExecutionCompletion;
 }
 
 export interface AnalyzeLlmPlanInput {
@@ -287,7 +294,11 @@ export function certifyAnalyzeLlmRun(
         );
       }
 
-      return admission.execution;
+      const completed = await admission.execution;
+      return Object.freeze({
+        results: completed.result,
+        completion: certifyAnalyzeRunExecutionCompletion(completed.certification),
+      });
     },
   });
 

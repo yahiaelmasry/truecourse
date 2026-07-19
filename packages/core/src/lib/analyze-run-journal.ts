@@ -2,6 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { atomicWriteJson } from './atomic-write.js';
+import {
+  inspectAnalyzeRunExecutionCompletion,
+  issueAnalyzeRunExecutionCertification,
+  type AnalyzeRunExecutionCertification,
+  type AnalyzeRunExecutionCompletion,
+} from './analyze-run-execution-completion.js';
+
+export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
 const SCHEMA_VERSION = 1 as const;
 const RUNS_DIR = path.join('.truecourse', 'analyses', 'runs');
@@ -71,6 +79,12 @@ export interface FailAnalyzeRunCommand {
     code: string;
     message: string;
   };
+}
+
+export interface BeginFinalizeAnalyzeRunCommand {
+  /** Every sealed work item has returned a successfully correlated result in this attempt. */
+  runId: string;
+  finalizingAt: string;
 }
 
 export type AnalyzeRunCommand =
@@ -341,7 +355,10 @@ export async function dispatchAnalyzeRun(
   command: AnalyzeRunCommand,
 ): Promise<AnalyzeRunView> {
   const storage = activeStorage;
-  if (!isRecord(command) || !['begin', 'seal-plan', 'block', 'fail'].includes(String(command.kind))) {
+  if (
+    !isRecord(command) ||
+    !['begin', 'seal-plan', 'block', 'fail'].includes(String(command.kind))
+  ) {
     throw new InvalidAnalyzeRunTransitionError(
       `Invalid analyze-run command kind: ${String(isRecord(command) ? command.kind : undefined)}`,
     );
@@ -350,12 +367,11 @@ export async function dispatchAnalyzeRun(
     return sealPlan(repoKey, command, storage);
   }
   if (command.kind === 'block') {
-    return blockRun(repoKey, command);
+    return blockRun(repoKey, command, storage);
   }
   if (command.kind === 'fail') {
-    return failRun(repoKey, command);
+    return failRun(repoKey, command, storage);
   }
-
   const source = validateSource(command.source);
   if (source === 'hosted' && storage instanceof FileAnalyzeRunStorage) {
     throw new InvalidAnalyzeRunTransitionError(
@@ -456,9 +472,16 @@ export async function sealAnalyzeRunPlan(
 
 export type AnalyzeRunPlanAdmission<T> =
   | { readonly admitted: false }
-  | { readonly admitted: true; readonly execution: Promise<T> };
+  | {
+      readonly admitted: true;
+      readonly execution: Promise<Readonly<{
+        result: T;
+        certification: AnalyzeRunExecutionCertification;
+      }>>;
+    };
 
 /**
+ * @internal
  * Validate durable state and synchronously admit provider work in the same
  * continuation. A rejected ownership/profile check leaves the receipt intact.
  * The caller must also hold the repository lifecycle lock required by the
@@ -514,9 +537,19 @@ export async function admitAnalyzeRunPlanExecution<T>(
     );
     assertAnalyzeRunStorage(storage);
     validate();
-    const execution = admit();
+    const admittedExecution = admit();
     analyzeRunPlanActivations.delete(receipt);
     analyzeRunPlanActivationReceipts.get(storage)?.delete(activation.cacheKey);
+    const execution = admittedExecution.then((result) => {
+      const certification = issueAnalyzeRunExecutionCertification({
+        storage,
+        scopeKey: activation.scopeKey,
+        runId: activation.runId,
+        revision: admitted.revision,
+        workKey: activation.workKey,
+      });
+      return Object.freeze({ result, certification });
+    });
     return { admitted: true, execution };
   } catch (error) {
     const current = await storage.read(activation.repoKey, activation.runId);
@@ -575,9 +608,13 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
       }
       : null,
     finalization: run.status.state === 'finalizing'
-      ? { finalizingAt: run.status.finalizingAt }
+      ? {
+          finalizingAt: run.status.finalizingAt,
+        }
       : run.status.state === 'failed' && run.status.finalizingAt !== null
-        ? { finalizingAt: run.status.finalizingAt }
+        ? {
+            finalizingAt: run.status.finalizingAt,
+          }
         : null,
     resume: {
       available: false,
@@ -586,14 +623,101 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
   };
 }
 
+export async function beginFinalizeAnalyzeRun(
+  repoKey: string,
+  command: BeginFinalizeAnalyzeRunCommand,
+  completion: AnalyzeRunExecutionCompletion,
+): Promise<AnalyzeRunView> {
+  if (
+    (typeof completion !== 'object' && typeof completion !== 'function') ||
+    completion === null
+  ) {
+    throw new InvalidAnalyzeRunTransitionError('Invalid analyze execution completion receipt');
+  }
+  const certified = inspectAnalyzeRunExecutionCompletion(completion);
+  if (!certified) {
+    throw new InvalidAnalyzeRunTransitionError('Invalid analyze execution completion receipt');
+  }
+  const storage = activeStorage;
+  const runId = validateRunId(command.runId);
+  const scopeMatches = (
+    certified.storage === storage &&
+    certified.scopeKey === activationScopeKey(repoKey, storage) &&
+    certified.runId === runId
+  );
+  if (!scopeMatches) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze execution completion does not belong to run ${runId}`,
+    );
+  }
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+  const finalizingAt = validateTimestamp(command.finalizingAt, 'finalizingAt');
+  if (
+    current.status.state === 'finalizing' &&
+    current.plan.state === 'sealed' &&
+    current.revision === certified.revision + 1 &&
+    current.status.finalizingAt === finalizingAt &&
+    certified.workKey === activationWorkKey(current.plan.work) &&
+    current.plan.work.every((item) => item.state === 'succeeded-uncheckpointed')
+  ) {
+    certified.claimed = true;
+    return toView(current);
+  }
+  if (current.status.state !== 'running' || current.plan.state !== 'sealed') {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot finalize analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+  if (
+    certified.claimed ||
+    certified.revision !== current.revision ||
+    certified.workKey !== activationWorkKey(current.plan.work)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze execution completion does not certify run ${runId}'s current sealed plan`,
+    );
+  }
+  if (Date.parse(finalizingAt) < Date.parse(current.plan.sealedAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} finalization cannot precede its sealed plan`,
+    );
+  }
+  const next: StoredAnalyzeRun = {
+    ...current,
+    revision: current.revision + 1,
+    updatedAt: finalizingAt,
+    status: { state: 'finalizing', finalizingAt },
+    plan: {
+      ...current.plan,
+      work: current.plan.work.map((item) => ({
+        ...item,
+        state: 'succeeded-uncheckpointed',
+      })),
+    },
+  };
+  certified.claimed = true;
+  try {
+    await storage.compareAndSwap(repoKey, runId, current.revision, next);
+    assertAnalyzeRunStorage(storage);
+    return toView(next);
+  } catch (error) {
+    certified.claimed = false;
+    throw error;
+  }
+}
+
 async function failRun(
   repoKey: string,
   command: FailAnalyzeRunCommand,
+  storage: AnalyzeRunStorage,
 ): Promise<AnalyzeRunView> {
   const runId = validateRunId(command.runId);
-  const current = await activeStorage.read(repoKey, runId);
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
   if (!current) throw new AnalyzeRunNotFoundError(runId);
-  if (current.status.state !== 'running') {
+  if (current.status.state !== 'running' && current.status.state !== 'finalizing') {
     throw new InvalidAnalyzeRunTransitionError(
       `Cannot fail analyze run ${runId} from ${current.status.state}`,
     );
@@ -605,7 +729,11 @@ async function failRun(
   const failedAt = validateTimestamp(command.failedAt, 'failedAt');
   if (
     Date.parse(failedAt) < Date.parse(current.startedAt) ||
-    (current.plan.state === 'sealed' && Date.parse(failedAt) < Date.parse(current.plan.sealedAt))
+    (current.plan.state === 'sealed' && Date.parse(failedAt) < Date.parse(current.plan.sealedAt)) ||
+    (
+      current.status.state === 'finalizing' &&
+      Date.parse(failedAt) < Date.parse(current.status.finalizingAt)
+    )
   ) {
     throw new InvalidAnalyzeRunTransitionError(
       `Analyze run ${runId} failure cannot precede its start or sealed plan`,
@@ -620,19 +748,24 @@ async function failRun(
       code: validateErrorCode(command.error.code),
       message: validatePublicErrorMessage(command.error.message),
       failedAt,
-      finalizingAt: null,
+      finalizingAt: current.status.state === 'finalizing'
+        ? current.status.finalizingAt
+        : null,
     },
   };
-  await activeStorage.compareAndSwap(repoKey, runId, current.revision, next);
+  await storage.compareAndSwap(repoKey, runId, current.revision, next);
+  assertAnalyzeRunStorage(storage);
   return toView(next);
 }
 
 async function blockRun(
   repoKey: string,
   command: BlockAnalyzeRunCommand,
+  storage: AnalyzeRunStorage,
 ): Promise<AnalyzeRunView> {
   const runId = validateRunId(command.runId);
-  const current = await activeStorage.read(repoKey, runId);
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
   if (!current) throw new AnalyzeRunNotFoundError(runId);
   if (current.status.state !== 'running' || current.plan.state !== 'sealed') {
     throw new InvalidAnalyzeRunTransitionError(
@@ -660,7 +793,8 @@ async function blockRun(
       blockedAt,
     },
   };
-  await activeStorage.compareAndSwap(repoKey, runId, current.revision, next);
+  await storage.compareAndSwap(repoKey, runId, current.revision, next);
+  assertAnalyzeRunStorage(storage);
   return toView(next);
 }
 
@@ -961,9 +1095,9 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
-    Schema v1 uses revision 2 for running/sealed execution admission and reserves revision 3 for
-    finalization, with revision 4 reserved for a finalization failure. These read-only reservations
-    keep this reader compatible with the next lifecycle writer. Future work-result/completion
+    Schema v1 uses revision 2 for running/sealed execution admission and revision 3 for its terminal
+    transitions or finalization. A finalization failure advances to revision 4. The admission
+    tombstone prevents a consumed plan from issuing another receipt. Future work-result/completion
     commands must migrate or extend the durable schema together with these invariants.
   */
 

@@ -358,7 +358,7 @@ describe('certified analyze LLM run', () => {
     const executionResults = await certified.execute(activation);
 
     expect(adapter.calls).toHaveLength(5);
-    expect(executionResults.map(({ result }) => result)).toEqual([
+    expect(executionResults.results.map(({ result }) => result)).toEqual([
       { ok: true },
       { ok: true },
       { ok: true },
@@ -518,7 +518,10 @@ describe('certified analyze LLM run', () => {
     });
     expect(adapter.calls).toEqual([]);
     const activation = await activate(certified, 'forged-activation');
-    await expect(certified.execute(activation)).resolves.toHaveLength(1);
+    await expect(certified.execute(activation)).resolves.toMatchObject({
+      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      completion: expect.any(Object),
+    });
     expect(adapter.calls).toHaveLength(1);
   });
 
@@ -607,7 +610,10 @@ describe('certified analyze LLM run', () => {
       code: 'plan-not-activated',
     });
     expect(adapter.calls).toEqual([]);
-    await expect(first.execute(activation)).resolves.toHaveLength(1);
+    await expect(first.execute(activation)).resolves.toMatchObject({
+      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      completion: expect.any(Object),
+    });
     expect(firstAdapter.calls).toHaveLength(1);
   });
 
@@ -639,7 +645,10 @@ describe('certified analyze LLM run', () => {
       repositoryRoot: '/repo',
       code: [{ domain: 'bugs', context: codeContext }],
     }, rightfulAdapter);
-    await expect(rightful.execute(foreignActivation)).resolves.toHaveLength(1);
+    await expect(rightful.execute(foreignActivation)).resolves.toMatchObject({
+      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      completion: expect.any(Object),
+    });
     expect(rightfulAdapter.calls).toHaveLength(1);
   });
 
@@ -764,7 +773,10 @@ describe('certified analyze LLM run', () => {
     });
     expect(calls).toEqual([]);
     execution = { provider: 'claude-code', requestedModel: 'opus[1m]' };
-    await expect(certified.execute(activation)).resolves.toHaveLength(1);
+    await expect(certified.execute(activation)).resolves.toMatchObject({
+      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      completion: expect.any(Object),
+    });
     expect(calls).toHaveLength(1);
   });
 

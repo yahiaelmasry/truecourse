@@ -4,19 +4,91 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   type AnalyzeRunStorage,
+  type AnalyzeRunExecutionCompletion,
   type StoredAnalyzeRun,
   AnalyzeRunAlreadyExistsError,
   AnalyzeRunJournalCorruptError,
   AnalyzeRunRevisionConflictError,
   InvalidAnalyzeRunTransitionError,
+  beginFinalizeAnalyzeRun,
   dispatchAnalyzeRun,
   readAnalyzeRun,
   resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
   setAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
+import {
+  certifyAnalyzeLlmRun,
+  type AnalyzeLlmExecutionAdapter,
+  type AnalyzeLlmExecutionOutcome,
+  type CertifiedAnalyzeLlmExecution,
+  type CertifiedAnalyzeLlmWork,
+} from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
+import type { CodeViolationContext } from '../../packages/core/src/services/llm/provider.js';
 
 let repoPath: string;
+
+const certifiedCodeContext: CodeViolationContext = {
+  files: [{ path: 'context', content: '1: export const journalFixture = true;' }],
+  sourceScopes: [{ path: '/repo/src/journal.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] }],
+  sources: [{
+    path: '/repo/src/journal.ts',
+    selection: {
+      kind: 'targeted',
+      functions: [{ name: 'journalFixture', startLine: 1, endLine: 1 }],
+    },
+  }],
+  llmRules: [{
+    key: 'bugs/llm/journal-fixture',
+    name: 'Journal fixture',
+    severity: 'medium',
+    prompt: 'Return the fixture result.',
+  }],
+  tier: 'targeted',
+};
+
+async function certifySuccessfulExecution(
+  repository: string,
+  runId: string,
+  sealedAt = '2026-07-19T01:30:01.000Z',
+): Promise<CertifiedAnalyzeLlmExecution> {
+  let providerCalls = 0;
+  const adapter: AnalyzeLlmExecutionAdapter = {
+    execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+    async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
+      providerCalls += 1;
+      return {
+        family: work.family,
+        domain: work.domain,
+        mode: work.mode,
+        workId: work.workId,
+        inputFingerprint: work.inputFingerprint,
+        resultContractId: work.planned.request.resultContractId,
+        result: { violations: [] },
+      };
+    },
+  };
+  const certified = certifyAnalyzeLlmRun({
+    runId,
+    journalKey: repository,
+    repositoryRoot: '/repo',
+    code: [{ domain: 'bugs', context: certifiedCodeContext }],
+  }, adapter);
+  const activation = await sealAnalyzeRunPlan(repository, {
+    kind: 'seal-plan',
+    runId,
+    sealedAt,
+    work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
+      workId,
+      inputFingerprint,
+    })),
+  });
+  const execution = await certified.execute(activation);
+  if (providerCalls !== 1) {
+    throw new Error(`Expected one certified provider call, got ${providerCalls}`);
+  }
+  return execution;
+}
 
 beforeEach(() => {
   repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-analyze-run-journal-'));
@@ -37,6 +109,7 @@ describe('analyze run journal', () => {
       readAnalyzeRun: expect.any(Function),
       setAnalyzeRunStorage: expect.any(Function),
     }));
+    expect(exported).not.toHaveProperty('certifyAnalyzeRunExecutionCompletion');
   });
 
   it('delegates lifecycle commands through an installed hosted storage adapter', async () => {
@@ -74,12 +147,12 @@ describe('analyze run journal', () => {
       commitHash: null,
       completedBaselineId: 'hosted-completed-baseline',
     });
-    const sealed = await dispatchAnalyzeRun(repoKey, {
-      kind: 'seal-plan',
-      runId: 'hosted-run',
-      sealedAt: '2026-07-19T00:30:01.000Z',
-      work: [{ workId: 'analyze:v1:hosted', inputFingerprint: `sha256:${'0'.repeat(64)}` }],
-    });
+    const execution = await certifySuccessfulExecution(
+      repoKey,
+      'hosted-run',
+      '2026-07-19T00:30:01.000Z',
+    );
+    const sealed = await readAnalyzeRun(repoKey, 'latest-attempt');
 
     expect(sealed).toMatchObject({
       runId: 'hosted-run',
@@ -87,7 +160,11 @@ describe('analyze run journal', () => {
       plan: 'sealed',
       counts: { total: 1, pending: 1 },
     });
-    await expect(readAnalyzeRun(repoKey, 'latest-attempt')).resolves.toEqual(sealed);
+    const finalizing = await beginFinalizeAnalyzeRun(repoKey, {
+      runId: 'hosted-run',
+      finalizingAt: '2026-07-19T00:30:02.000Z',
+    }, execution.completion);
+    await expect(readAnalyzeRun(repoKey, 'latest-attempt')).resolves.toEqual(finalizing);
   });
 
   it('does not cross storage adapters when the active adapter changes during plan sealing', async () => {
@@ -239,6 +316,192 @@ describe('analyze run journal', () => {
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(sealed);
   });
 
+  it('durably records certified finalizing work without changing the completed baseline', async () => {
+    const truecourseDir = path.join(repoPath, '.truecourse');
+    const latestPath = path.join(truecourseDir, 'LATEST.json');
+    fs.mkdirSync(truecourseDir, { recursive: true });
+    fs.writeFileSync(latestPath, '{"completed":"baseline-sentinel"}\n');
+    const latestBefore = fs.readFileSync(latestPath, 'utf8');
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'successful-run',
+      candidateAnalysisId: 'candidate-analysis',
+      startedAt: '2026-07-19T01:30:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'abc456',
+      completedBaselineId: 'previous-completed-analysis',
+    });
+    const execution = await certifySuccessfulExecution(repoPath, 'successful-run');
+
+    const finalizing = await beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'successful-run',
+      finalizingAt: '2026-07-19T01:30:02.000Z',
+    }, execution.completion);
+
+    expect(finalizing).toMatchObject({
+      revision: 2,
+      state: 'finalizing',
+      candidateAnalysisId: 'candidate-analysis',
+      completedBaselineId: 'previous-completed-analysis',
+      counts: { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 },
+      finalization: {
+        finalizingAt: '2026-07-19T01:30:02.000Z',
+      },
+      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+    });
+    const journalPath = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'successful-run.json',
+    );
+    expect(JSON.parse(fs.readFileSync(journalPath, 'utf8'))).toMatchObject({
+      plan: {
+        work: [
+          { state: 'succeeded-uncheckpointed' },
+        ],
+      },
+    });
+    await expect(beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'successful-run',
+      finalizingAt: '2026-07-19T01:30:02.000Z',
+    }, execution.completion)).resolves.toEqual(finalizing);
+    expect(fs.readFileSync(latestPath, 'utf8')).toBe(latestBefore);
+
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(finalizing);
+  });
+
+  it('requires a completion receipt bound to the exact run and sealed plan', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'exact-finalize-run',
+      candidateAnalysisId: 'exact-finalize-analysis',
+      startedAt: '2026-07-19T01:40:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'def789',
+      completedBaselineId: null,
+    });
+    const execution = await certifySuccessfulExecution(
+      repoPath,
+      'exact-finalize-run',
+      '2026-07-19T01:40:01.000Z',
+    );
+
+    await expect(beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'exact-finalize-run',
+      finalizingAt: '2026-07-19T01:40:02.000Z',
+    }, {} as AnalyzeRunExecutionCompletion)).rejects.toBeInstanceOf(
+      InvalidAnalyzeRunTransitionError,
+    );
+    await expect(beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'another-run',
+      finalizingAt: '2026-07-19T01:40:02.000Z',
+    }, execution.completion)).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+    await expect(beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'exact-finalize-run',
+      finalizingAt: '2026-07-19T01:39:59.000Z',
+    }, execution.completion)).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      revision: 1,
+      state: 'running',
+      counts: { pending: 1, succeeded: 0 },
+    });
+    await expect(beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'exact-finalize-run',
+      finalizingAt: '2026-07-19T01:40:02.000Z',
+    }, execution.completion)).resolves.toMatchObject({ revision: 2, state: 'finalizing' });
+  });
+
+  it('records a finalization failure without forgetting successful uncheckpointed calls', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'finalization-failure-run',
+      candidateAnalysisId: 'finalization-failure-analysis',
+      startedAt: '2026-07-19T01:55:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: '765cba',
+      completedBaselineId: 'safe-baseline',
+    });
+    const execution = await certifySuccessfulExecution(
+      repoPath,
+      'finalization-failure-run',
+      '2026-07-19T01:55:01.000Z',
+    );
+    await beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'finalization-failure-run',
+      finalizingAt: '2026-07-19T01:55:02.000Z',
+    }, execution.completion);
+
+    const failed = await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'finalization-failure-run',
+      failedAt: '2026-07-19T01:55:03.000Z',
+      error: { code: 'ANALYSIS_PERSIST_FAILED', message: 'Could not persist the candidate.' },
+    });
+
+    expect(failed).toMatchObject({
+      revision: 3,
+      state: 'failed',
+      completedBaselineId: 'safe-baseline',
+      counts: { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 },
+      failure: {
+        code: 'ANALYSIS_PERSIST_FAILED',
+        failedAt: '2026-07-19T01:55:03.000Z',
+      },
+      finalization: { finalizingAt: '2026-07-19T01:55:02.000Z' },
+      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+    });
+  });
+
+  it('does not lose a competing finalization or execution failure', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'finalization-race-run',
+      candidateAnalysisId: 'finalization-race-analysis',
+      startedAt: '2026-07-19T01:58:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: '765fed',
+      completedBaselineId: null,
+    });
+    const execution = await certifySuccessfulExecution(
+      repoPath,
+      'finalization-race-run',
+      '2026-07-19T01:58:01.000Z',
+    );
+
+    const outcomes = await Promise.allSettled([
+      beginFinalizeAnalyzeRun(repoPath, {
+        runId: 'finalization-race-run',
+        finalizingAt: '2026-07-19T01:58:02.000Z',
+      }, execution.completion),
+      dispatchAnalyzeRun(repoPath, {
+        kind: 'fail',
+        runId: 'finalization-race-run',
+        failedAt: '2026-07-19T01:58:02.000Z',
+        error: { code: 'ANALYZE_FAILED', message: 'Competing execution failure.' },
+      }),
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+    expect(outcomes.filter((outcome) =>
+      outcome.status === 'rejected' && outcome.reason instanceof AnalyzeRunRevisionConflictError,
+    )).toHaveLength(1);
+    const latest = await readAnalyzeRun(repoPath, 'latest-attempt');
+    expect(latest).toMatchObject({ revision: 2 });
+    expect(latest?.counts).toEqual(
+      latest?.state === 'finalizing'
+        ? { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 }
+        : { total: 1, pending: 1, running: 0, succeeded: 0, failed: 0 },
+    );
+  });
+
   it('blocks a sealed run with the raw reset hint and keeps unfinished work pending', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
@@ -332,6 +595,54 @@ describe('analyze run journal', () => {
     });
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(failed);
+  });
+
+  it('reads schema-v1 failure records written before finalization metadata existed', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'legacy-failed-run',
+      candidateAnalysisId: 'legacy-failed-analysis',
+      startedAt: '2026-07-19T02:35:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'legacy123',
+      completedBaselineId: null,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'legacy-failed-run',
+      failedAt: '2026-07-19T02:35:01.000Z',
+      error: { code: 'ANALYZE_FAILED', message: 'Legacy ordinary failure.' },
+    });
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'legacy-failed-run.json',
+    );
+    const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+      status: Record<string, unknown>;
+    };
+    delete legacy.status.finalizingAt;
+    fs.writeFileSync(file, JSON.stringify(legacy));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      runId: 'legacy-failed-run',
+      state: 'failed',
+      finalization: null,
+    });
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'run-after-legacy-failure',
+      candidateAnalysisId: 'analysis-after-legacy-failure',
+      startedAt: '2026-07-19T02:35:02.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'legacy456',
+      completedBaselineId: null,
+    })).resolves.toMatchObject({ runId: 'run-after-legacy-failure', state: 'running' });
   });
 
   it('keeps certified pending counts visible when a planned run fails', async () => {
@@ -580,6 +891,82 @@ describe('analyze run journal', () => {
     fs.writeFileSync(file, JSON.stringify(stored));
     resetAnalyzeRunStorage();
 
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+  });
+
+  it('rejects impossible finalizing lifecycle records from durable storage', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'impossible-finalizing-run',
+      candidateAnalysisId: 'impossible-finalizing-analysis',
+      startedAt: '2026-07-19T03:40:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'aaa999',
+      completedBaselineId: 'older-baseline',
+    });
+    const execution = await certifySuccessfulExecution(
+      repoPath,
+      'impossible-finalizing-run',
+      '2026-07-19T03:40:01.000Z',
+    );
+    await beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'impossible-finalizing-run',
+      finalizingAt: '2026-07-19T03:40:02.000Z',
+    }, execution.completion);
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'impossible-finalizing-run.json',
+    );
+    const finalizing = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    const successfulPlan = finalizing.plan as {
+      state: string;
+      sealedAt: string;
+      work: Array<Record<string, unknown>>;
+    };
+    fs.writeFileSync(file, JSON.stringify({
+      ...finalizing,
+      plan: {
+        ...successfulPlan,
+        work: successfulPlan.work.map((item) => ({ ...item, state: 'pending' })),
+      },
+    }));
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+
+    fs.writeFileSync(file, JSON.stringify({
+      ...finalizing,
+      status: {
+        ...(finalizing.status as Record<string, unknown>),
+        finalizingAt: '2026-07-19T03:39:59.000Z',
+      },
+    }));
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+
+    fs.writeFileSync(file, JSON.stringify({
+      ...finalizing,
+      revision: 3,
+    }));
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+
+    fs.writeFileSync(file, JSON.stringify({
+      ...finalizing,
+      plan: { state: 'unsealed' },
+    }));
+    resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
       AnalyzeRunJournalCorruptError,
     );
