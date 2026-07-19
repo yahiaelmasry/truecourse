@@ -7,6 +7,7 @@ import {
 } from '@truecourse/shared/llm';
 import type { FlowEnrichmentContext } from './prompts.js';
 import type { UsageData } from '../usage.service.js';
+import type { AnalyzeLlmExecutionAdapter } from './certified-analyze-llm-run.js';
 
 // ---------------------------------------------------------------------------
 // Focused violation context types (one per LLM call)
@@ -323,6 +324,8 @@ export interface LLMProvider {
   flushUsage(): UsageData[];
 }
 
+export type CertifiedAnalyzeLlmProvider = LLMProvider & AnalyzeLlmExecutionAdapter;
+
 // ---------------------------------------------------------------------------
 // Factory — Claude Code CLI is the only supported provider.
 // ---------------------------------------------------------------------------
@@ -339,6 +342,9 @@ export interface LLMProvider {
  * `selectedModel` is the model chosen in the analyze picker. Omit it to leave
  * model selection to Claude Code, as callers did before the picker existed.
  */
-export function createLLMProvider(transport?: LlmTransport, selectedModel?: string): LLMProvider {
+export function createLLMProvider(
+  transport?: LlmTransport,
+  selectedModel?: string,
+): CertifiedAnalyzeLlmProvider {
   return new ClaudeCodeProvider(transport ?? getDefaultTransport(), selectedModel);
 }

@@ -72,6 +72,11 @@ import {
 } from './module-work-planner.js';
 import type { UsageData } from '../usage.service.js';
 import type {
+  AnalyzeLlmExecutionAdapter,
+  AnalyzeLlmExecutionOutcome,
+  CertifiedAnalyzeLlmWork,
+} from './certified-analyze-llm-run.js';
+import type {
   LLMProvider,
   UsageRecord,
   ServiceViolationContext,
@@ -211,7 +216,8 @@ function certifyCodeLifecyclePartition(
   }
 }
 
-export abstract class BaseCLIProvider implements LLMProvider {
+export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutionAdapter {
+  abstract get providerId(): string;
   abstract get binaryName(): string;
   abstract get baseArgs(): string[];
   abstract get modelFlag(): string[];
@@ -265,10 +271,44 @@ export abstract class BaseCLIProvider implements LLMProvider {
     return records;
   }
 
+  get execution(): AnalyzeLlmExecutionAdapter['execution'] {
+    return Object.freeze({
+      provider: this.transport ? 'transport:unverified' : this.providerId,
+      requestedModel: this.modelFlag[1] ?? null,
+    });
+  }
+
+  async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
+    let result: unknown;
+    switch (work.family) {
+      case 'code':
+        result = await this.executePlannedCodeViolationWork(work.planned);
+        break;
+      case 'database':
+        result = await this.executePlannedDatabaseViolationWork(work.planned);
+        break;
+      case 'service':
+        result = await this.executePlannedServiceViolationWork(work.planned);
+        break;
+      case 'module':
+        result = await this.executePlannedModuleViolationWork(work.planned);
+        break;
+    }
+    return {
+      family: work.family,
+      domain: work.domain,
+      mode: work.mode,
+      workId: work.workId,
+      inputFingerprint: work.inputFingerprint,
+      resultContractId: work.planned.request.resultContractId,
+      result,
+    };
+  }
+
   private collectUsage(callType: string, cliUsage: CLIUsage | undefined, durationMs: number): void {
     if (!cliUsage) return;
     this._usageRecords.push({
-      provider: 'claude-code',
+      provider: this.providerId,
       callType,
       inputTokens: cliUsage.inputTokens,
       outputTokens: cliUsage.outputTokens,
@@ -799,10 +839,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: ServiceViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ServiceViolationsResult> {
-    const planned = planServiceViolationWork(context, 'normal', {
-      provider: this.transport ? 'transport:unverified' : 'claude-code',
-      requestedModel: this.modelFlag[1] ?? null,
-    });
+    const planned = planServiceViolationWork(context, 'normal', this.execution);
     const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
 
@@ -832,10 +869,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsResult> {
-    const planned = planDatabaseViolationWork(context, 'normal', {
-      provider: this.transport ? 'transport:unverified' : 'claude-code',
-      requestedModel: this.modelFlag[1] ?? null,
-    });
+    const planned = planDatabaseViolationWork(context, 'normal', this.execution);
     const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const object = await this.executePlannedDatabaseViolationWork(planned, opts);
@@ -861,10 +895,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsLifecycleResult> {
-    const planned = planDatabaseViolationWork(context, 'lifecycle', {
-      provider: this.transport ? 'transport:unverified' : 'claude-code',
-      requestedModel: this.modelFlag[1] ?? null,
-    });
+    const planned = planDatabaseViolationWork(context, 'lifecycle', this.execution);
     const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const object = await this.executePlannedDatabaseViolationWork(planned, opts);
@@ -885,10 +916,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: ModuleViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ModuleViolationsResult> {
-    const planned = planModuleViolationWork(context, 'normal', {
-      provider: this.transport ? 'transport:unverified' : 'claude-code',
-      requestedModel: this.modelFlag[1] ?? null,
-    });
+    const planned = planModuleViolationWork(context, 'normal', this.execution);
     const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
     const moduleIdToServiceId = new Map(
@@ -992,10 +1020,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
       const ctx = contexts.service;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['service', (async () => {
-          const planned = planServiceViolationWork(ctx, 'lifecycle', {
-            provider: this.transport ? 'transport:unverified' : 'claude-code',
-            requestedModel: this.modelFlag[1] ?? null,
-          });
+          const planned = planServiceViolationWork(ctx, 'lifecycle', this.execution);
           const request = planned.request;
           const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
           idMaps.service = idMap;
@@ -1029,10 +1054,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
       const ctx = contexts.module;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['module', (async () => {
-          const planned = planModuleViolationWork(ctx, 'lifecycle', {
-            provider: this.transport ? 'transport:unverified' : 'claude-code',
-            requestedModel: this.modelFlag[1] ?? null,
-          });
+          const planned = planModuleViolationWork(ctx, 'lifecycle', this.execution);
           const request = planned.request;
           const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
           const moduleIdToServiceId = new Map(
@@ -1183,11 +1205,10 @@ export abstract class BaseCLIProvider implements LLMProvider {
     opts?: { onStart?: () => void },
   ): Promise<CodeViolationsResult> {
     const planned = planCodeViolationWork(context, {
+      ...this.execution,
       // An injected transport does not currently expose its served provider.
       // Keep that uncertainty explicit so future reuse fails closed until an
       // execution receipt can prove the provider/model that answered.
-      provider: this.transport ? 'transport:unverified' : 'claude-code',
-      requestedModel: this.modelFlag[1] ?? null,
       repositoryRoot: this._repoPath,
     });
     const request = planned.request;
@@ -1300,6 +1321,10 @@ export class ClaudeCodeProvider extends BaseCLIProvider {
   constructor(transport?: LlmTransport, selectedModel?: string) {
     super(transport);
     this.selectedModel = selectedModel;
+  }
+
+  get providerId(): string {
+    return 'claude-code';
   }
 
   get binaryName(): string {
