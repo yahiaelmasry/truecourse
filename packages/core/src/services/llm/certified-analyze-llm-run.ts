@@ -70,7 +70,18 @@ export interface AnalyzeLlmPlanManifest {
 
 export interface AnalyzeLlmExecutionAdapter {
   readonly execution: Readonly<LlmWorkExecutionIntent>;
-  execute(work: CertifiedAnalyzeLlmWork): Promise<unknown>;
+  execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome>;
+}
+
+/** Raw parsed provider output echoed with the certified work identity that produced it. */
+export interface AnalyzeLlmExecutionOutcome {
+  readonly family: AnalyzeLlmWorkFamily;
+  readonly domain: RuleDomain;
+  readonly mode: AnalyzeLlmWorkMode;
+  readonly workId: string;
+  readonly inputFingerprint: string;
+  readonly resultContractId: string;
+  readonly result: unknown;
 }
 
 export interface CertifiedAnalyzeLlmRun {
@@ -103,7 +114,8 @@ export type AnalyzeLlmPlanErrorCode =
   | 'duplicate-work-id'
   | 'read-snapshot-unavailable'
   | 'plan-not-activated'
-  | 'already-executed';
+  | 'already-executed'
+  | 'result-not-certified';
 
 export class AnalyzeLlmPlanError extends Error {
   constructor(
@@ -264,7 +276,7 @@ export function certifyAnalyzeLlmRun(
   }[]> {
     const settled = await Promise.allSettled(certifiedWork.map(async (item) => ({
       work: item,
-      result: await adapter.execute(item),
+      result: certifyExecutionOutcome(item, await adapter.execute(item)).result,
     })));
     const rejected = settled.find(
       (result): result is PromiseRejectedResult =>
@@ -279,6 +291,32 @@ export function certifyAnalyzeLlmRun(
         result: unknown;
       }>).value);
   }
+}
+
+function certifyExecutionOutcome(
+  work: CertifiedAnalyzeLlmWork,
+  outcome: AnalyzeLlmExecutionOutcome,
+): AnalyzeLlmExecutionOutcome {
+  const matches = (
+    outcome !== null &&
+    typeof outcome === 'object' &&
+    outcome.family === work.family &&
+    outcome.domain === work.domain &&
+    outcome.mode === work.mode &&
+    outcome.workId === work.workId &&
+    outcome.inputFingerprint === work.inputFingerprint &&
+    outcome.resultContractId === work.planned.request.resultContractId &&
+    Object.prototype.hasOwnProperty.call(outcome, 'result')
+  );
+  if (!matches) {
+    throw new AnalyzeLlmPlanError(
+      'result-not-certified',
+      `Analyze ${work.family} result does not match its certified work identity`,
+      work.family,
+      work.domain,
+    );
+  }
+  return outcome;
 }
 
 function certify<T extends CertifiedAnalyzeLlmWork>(

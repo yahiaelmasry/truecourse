@@ -8,6 +8,7 @@ import {
   certifyAnalyzeLlmRun,
   type AnalyzeLlmPlanInput,
   type AnalyzeLlmExecutionAdapter,
+  type AnalyzeLlmExecutionOutcome,
   type CertifiedAnalyzeLlmWork,
 } from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
 import {
@@ -134,10 +135,25 @@ class RecordingAdapter implements AnalyzeLlmExecutionAdapter {
   });
   readonly calls: CertifiedAnalyzeLlmWork[] = [];
 
-  async execute(work: CertifiedAnalyzeLlmWork): Promise<unknown> {
+  async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
     this.calls.push(work);
-    return { ok: true };
+    return outcomeFor(work, { ok: true });
   }
+}
+
+function outcomeFor(
+  work: CertifiedAnalyzeLlmWork,
+  result: unknown,
+): AnalyzeLlmExecutionOutcome {
+  return {
+    family: work.family,
+    domain: work.domain,
+    mode: work.mode,
+    workId: work.workId,
+    inputFingerprint: work.inputFingerprint,
+    resultContractId: work.planned.request.resultContractId,
+    result,
+  };
 }
 
 const journalRepository = mkdtempSync(path.join(tmpdir(), 'truecourse-certified-run-'));
@@ -339,9 +355,16 @@ describe('certified analyze LLM run', () => {
 
     const activation = await activate(certified, 'complete-plan');
     expect(adapter.calls).toEqual([]);
-    await certified.execute(activation);
+    const executionResults = await certified.execute(activation);
 
     expect(adapter.calls).toHaveLength(5);
+    expect(executionResults.map(({ result }) => result)).toEqual([
+      { ok: true },
+      { ok: true },
+      { ok: true },
+      { ok: true },
+      { ok: true },
+    ]);
     expect(adapter.calls.map(({ workId, inputFingerprint }) => ({ workId, inputFingerprint })))
       .toEqual(certified.manifest.work.map(({ workId, inputFingerprint }) => ({
         workId,
@@ -415,6 +438,70 @@ describe('certified analyze LLM run', () => {
       { family: 'service', mode: 'lifecycle', stage: 'analyze.service-lifecycle', resultContractId: 'analyze.service-lifecycle@1' },
       { family: 'module', mode: 'normal', stage: 'analyze.module', resultContractId: 'analyze.module@1' },
     ]));
+  });
+
+  it.each([
+    ['family', 'database'],
+    ['domain', 'security'],
+    ['mode', 'lifecycle'],
+    ['workId', 'forged-work-id'],
+    ['inputFingerprint', 'sha256:forged'],
+    ['resultContractId', 'analyze.database@1'],
+  ] as const)('rejects an adapter result with a mismatched %s', async (field, forgedValue) => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work) {
+        return {
+          ...outcomeFor(work, { violations: [] }),
+          [field]: forgedValue,
+        };
+      },
+    };
+    const runId = `mismatched-result-${field}`;
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, runId);
+
+    await expect(certified.execute(activation)).rejects.toMatchObject({
+      code: 'result-not-certified',
+      family: 'code',
+      domain: 'bugs',
+    });
+  });
+
+  it.each([
+    ['null', null],
+    ['primitive', 'not-an-outcome'],
+    ['missing result', 'identity-only'],
+  ] as const)('rejects a malformed %s adapter outcome', async (_case, malformed) => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work) {
+        if (malformed === 'identity-only') {
+          const { result: _result, ...identity } = outcomeFor(work, { violations: [] });
+          return identity as AnalyzeLlmExecutionOutcome;
+        }
+        return malformed as unknown as AnalyzeLlmExecutionOutcome;
+      },
+    };
+    const runId = `malformed-result-${_case.replace(' ', '-')}`;
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, runId);
+
+    await expect(certified.execute(activation)).rejects.toMatchObject({
+      code: 'result-not-certified',
+      family: 'code',
+      domain: 'bugs',
+    });
   });
 
   it('rejects a forged activation receipt without spending provider calls', async () => {
@@ -635,7 +722,7 @@ describe('certified analyze LLM run', () => {
         provider: 'transport:unverified',
         requestedModel: 'opus[1m]',
       }),
-      async execute() {},
+      async execute(work) { return outcomeFor(work, { ok: true }); },
     };
 
     expect(() => certifyAnalyzeLlmRun({
@@ -661,7 +748,7 @@ describe('certified analyze LLM run', () => {
     const calls: CertifiedAnalyzeLlmWork[] = [];
     const adapter: AnalyzeLlmExecutionAdapter = {
       get execution() { return execution; },
-      async execute(work) { calls.push(work); },
+      async execute(work) { calls.push(work); return outcomeFor(work, { ok: true }); },
     };
     const certified = certifyAnalyzeLlmRun({
       runId: 'provider-drift',
@@ -747,7 +834,7 @@ describe('certified analyze LLM run', () => {
         if (work.family === 'code') {
           await codeGate;
           codeDrained = true;
-          return { ok: true };
+          return outcomeFor(work, { ok: true });
         }
         throw providerFailure;
       },
