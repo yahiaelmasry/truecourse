@@ -87,7 +87,16 @@ export function buildAnalysisFilename(analysisId: string, createdAt: string): st
     .replace(/[:.]/g, '-')
     .replace(/-\d{3}Z$/, 'Z');
   const shortId = analysisId.replace(/-/g, '').slice(0, 8);
-  return `${iso}_${shortId}.json`;
+  const filename = `${iso}_${shortId}.json`;
+  if (
+    analysisId.length === 0
+    || filename.includes('\0')
+    || path.basename(filename) !== filename
+    || path.win32.basename(filename) !== filename
+  ) {
+    throw new Error('Analysis identity does not produce a safe filename');
+  }
+  return filename;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +313,10 @@ class FileAnalysisStore implements AnalysisStore {
     const currentBaselineId = current?.analysis.id ?? null;
     if (!isDeepStrictEqual(current, promotion.expectedBaseline)) {
       return { state: 'conflict', currentBaselineId };
+    }
+    if (current) {
+      activeCompletedBaselineId(current);
+      this.removePromotionMarker(repoPath, current.head);
     }
 
     const marker: StoredCompletedAnalysisPromotion = {

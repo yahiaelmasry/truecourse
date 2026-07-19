@@ -609,6 +609,67 @@ describe('completed-baseline promotion', () => {
     expect(await readLatest(repoPath)).toEqual(promotion.latest);
   });
 
+  it('keeps a committed ancestor visible after a later promotion', async () => {
+    const first = makeSnapshot();
+    const firstFilename = buildAnalysisFilename(first.id, first.createdAt);
+    const firstPromotion = {
+      expectedBaseline: null,
+      snapshot: first,
+      latest: makeLatest(first, firstFilename),
+    };
+    await expect(promoteCompletedAnalysisBaseline(repoPath, firstPromotion, {
+      faultInjector: (point) => {
+        if (point === 'after-commit') throw new Error('injected first post-commit stop');
+      },
+    })).rejects.toThrow('injected first post-commit stop');
+
+    const second = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: first.id },
+    };
+    const secondFilename = buildAnalysisFilename(second.id, second.createdAt);
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: firstPromotion.latest,
+      snapshot: second,
+      latest: makeLatest(second, secondFilename),
+    })).resolves.toEqual({ state: 'promoted', filename: secondFilename });
+
+    expect(await listAnalyses(repoPath)).toEqual([firstFilename, secondFilename]);
+    await expect(promoteCompletedAnalysisBaseline(repoPath, firstPromotion)).resolves.toEqual({
+      state: 'conflict',
+      currentBaselineId: second.id,
+    });
+    expect(await listAnalyses(repoPath)).toEqual([firstFilename, secondFilename]);
+  });
+
+  it('rejects an unsafe committed-baseline head before marker cleanup', async () => {
+    const unsafeId = '/../../s';
+    const createdAt = '2026-04-17T14:23:45.123Z';
+    const unsafeHead = '2026-04-17T14-23-45Z_/../../s.json';
+    const unsafeBaseline = makeLatest({ ...makeSnapshot(), id: unsafeId, createdAt }, unsafeHead);
+    await writeLatest(repoPath, unsafeBaseline);
+
+    const sentinel = analysisFilePath(repoPath, 's.json');
+    fs.mkdirSync(path.dirname(sentinel), { recursive: true });
+    fs.writeFileSync(sentinel, 'must remain', 'utf-8');
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: unsafeId },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: unsafeBaseline,
+      snapshot: candidate,
+      latest: makeLatest(candidate, candidateFilename),
+    })).rejects.toThrow('Analysis identity does not produce a safe filename');
+
+    expect(fs.readFileSync(sentinel, 'utf-8')).toBe('must remain');
+    expect(await readLatest(repoPath)).toEqual(unsafeBaseline);
+  });
+
   it('fails closed when the candidate LATEST does not identify its snapshot', async () => {
     const candidate = makeSnapshot();
     const latest = makeLatest(candidate, 'wrong-head.json');
