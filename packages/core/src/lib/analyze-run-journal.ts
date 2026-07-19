@@ -8,10 +8,25 @@ import {
   type AnalyzeRunExecutionCertification,
   type AnalyzeRunExecutionCompletion,
 } from './analyze-run-execution-completion.js';
+import {
+  validateCompletedAnalysisProjectionIntent,
+  type CompletedAnalysisProjectionIntent,
+} from './completed-analysis-projection.js';
+import {
+  validateCompletedAnalysisPromotion,
+  type CompletedAnalysisPromotion,
+} from './completed-analysis-promotion.js';
+import { buildAnalysisFilename } from './analysis-store.js';
+import type { HistoryEntry } from '../types/snapshot.js';
+import {
+  installPreparedAnalyzeRunFinalizationReader,
+  type PreparedAnalyzeRunFinalization,
+} from './analyze-run-finalization-recovery.js';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 1 as const;
+const SCHEMA_VERSION = 2 as const;
+const LEGACY_SCHEMA_VERSION = 1 as const;
 const RUNS_DIR = path.join('.truecourse', 'analyses', 'runs');
 const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
 
@@ -87,6 +102,22 @@ export interface BeginFinalizeAnalyzeRunCommand {
   finalizingAt: string;
 }
 
+export interface PrepareAnalyzeRunFinalizationCommand {
+  runId: string;
+  preparedAt: string;
+  promotion: CompletedAnalysisPromotion;
+  projection: CompletedAnalysisProjectionIntent;
+}
+
+interface StoredAnalyzeRunFinalizationIntent {
+  preparedAt: string;
+  promotion: CompletedAnalysisPromotion;
+  projection: {
+    projectSlug: string;
+    historyEntry: HistoryEntry;
+  };
+}
+
 export type AnalyzeRunCommand =
   | BeginAnalyzeRunCommand
   | SealAnalyzeRunPlanCommand
@@ -125,6 +156,8 @@ export interface AnalyzeRunView {
   };
   finalization: null | {
     finalizingAt: string;
+    persistence: 'unprepared' | 'prepared';
+    preparedAt: string | null;
   };
   resume: {
     available: false;
@@ -169,6 +202,7 @@ export interface StoredAnalyzeRun {
   branch: string | null;
   commitHash: string | null;
   completedBaselineId: string | null;
+  finalizationIntent: StoredAnalyzeRunFinalizationIntent | null;
   plan:
     | { state: 'unsealed' }
     | { state: 'sealed'; sealedAt: string; work: StoredAnalyzeRunWork[] };
@@ -178,6 +212,11 @@ export type NewStoredAnalyzeRun = Omit<StoredAnalyzeRun, 'attemptSequence'>;
 
 interface LatestAttemptPointer {
   schemaVersion: typeof SCHEMA_VERSION;
+  runId: string;
+}
+
+interface ParsedLatestAttemptPointer {
+  schemaVersion: typeof LEGACY_SCHEMA_VERSION | typeof SCHEMA_VERSION;
   runId: string;
 }
 
@@ -277,7 +316,7 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
     const canonicalPath = canonicalRepoPath(repoPath);
     return this.serialize(canonicalPath, async () => {
       const file = pointerPath(canonicalPath);
-      let pointer: LatestAttemptPointer | null = null;
+      let pointer: ParsedLatestAttemptPointer | null = null;
       if (fs.existsSync(file)) {
         pointer = parseLatestPointer(readJson(file), file);
         if (!(await this.read(canonicalPath, pointer.runId))) {
@@ -291,7 +330,7 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
       if (runs.length === 0) return null;
       const latest = latestStoredRun(runs);
 
-      if (pointer?.runId !== latest.runId) {
+      if (pointer?.runId !== latest.runId || pointer.schemaVersion !== SCHEMA_VERSION) {
         writeLatestPointer(canonicalPath, latest.runId);
       }
       return latest;
@@ -346,6 +385,21 @@ export function resetAnalyzeRunStorage(): void {
   activeStorage = new FileAnalyzeRunStorage();
 }
 
+installPreparedAnalyzeRunFinalizationReader(async (repoKey, runId) => {
+  const storage = activeStorage;
+  const current = await storage.read(repoKey, validateRunId(runId));
+  assertAnalyzeRunStorage(storage);
+  if (!current?.finalizationIntent) return null;
+  return JSON.parse(JSON.stringify({
+    preparedAt: current.finalizationIntent.preparedAt,
+    promotion: current.finalizationIntent.promotion,
+    projection: {
+      ...current.finalizationIntent.projection,
+      promotedSnapshot: current.finalizationIntent.promotion.snapshot,
+    },
+  })) as PreparedAnalyzeRunFinalization;
+});
+
 /**
  * Apply one run-lifecycle command. Callers using the default file adapter must hold the
  * repository-wide analyze lock for the complete begin/plan/execute/finalize lifecycle.
@@ -390,6 +444,7 @@ export async function dispatchAnalyzeRun(
     branch: validateNullableString(command.branch, 'branch'),
     commitHash: validateNullableString(command.commitHash, 'commitHash'),
     completedBaselineId: validateNullableString(command.completedBaselineId, 'completedBaselineId'),
+    finalizationIntent: null,
     plan: { state: 'unsealed' },
   };
   const stored = await storage.createLatest(repoKey, run);
@@ -610,10 +665,14 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
     finalization: run.status.state === 'finalizing'
       ? {
           finalizingAt: run.status.finalizingAt,
+          persistence: run.finalizationIntent === null ? 'unprepared' : 'prepared',
+          preparedAt: run.finalizationIntent?.preparedAt ?? null,
         }
       : run.status.state === 'failed' && run.status.finalizingAt !== null
         ? {
             finalizingAt: run.status.finalizingAt,
+            persistence: run.finalizationIntent === null ? 'unprepared' : 'prepared',
+            preparedAt: run.finalizationIntent?.preparedAt ?? null,
           }
         : null,
     resume: {
@@ -689,6 +748,7 @@ export async function beginFinalizeAnalyzeRun(
     revision: current.revision + 1,
     updatedAt: finalizingAt,
     status: { state: 'finalizing', finalizingAt },
+    finalizationIntent: null,
     plan: {
       ...current.plan,
       work: current.plan.work.map((item) => ({
@@ -706,6 +766,93 @@ export async function beginFinalizeAnalyzeRun(
     certified.claimed = false;
     throw error;
   }
+}
+
+/**
+ * Durably bind the exact recovery input before completed-baseline promotion.
+ * This command changes only the attempted-run journal.
+ */
+export async function prepareAnalyzeRunFinalization(
+  repoKey: string,
+  command: PrepareAnalyzeRunFinalizationCommand,
+): Promise<AnalyzeRunView> {
+  const storage = activeStorage;
+  const runId = validateRunId(command.runId);
+  const preparedAt = validateTimestamp(command.preparedAt, 'preparedAt');
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+  if (current.status.state !== 'finalizing' || current.plan.state !== 'sealed') {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot prepare finalization for analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+
+  let persisted: unknown;
+  try {
+    persisted = JSON.parse(JSON.stringify(command));
+  } catch {
+    throw new InvalidAnalyzeRunTransitionError('Analyze finalization intent must be exactly JSON-round-trippable');
+  }
+  if (!isDeepStrictEqual(persisted, command)) {
+    throw new InvalidAnalyzeRunTransitionError('Analyze finalization intent must be exactly JSON-round-trippable');
+  }
+
+  const detachedCommand = persisted as PrepareAnalyzeRunFinalizationCommand;
+  const filename = buildAnalysisFilename(
+    detachedCommand.promotion.snapshot.id,
+    detachedCommand.promotion.snapshot.createdAt,
+  );
+  validateCompletedAnalysisPromotion(detachedCommand.promotion, filename);
+  validateCompletedAnalysisProjectionIntent(detachedCommand.projection);
+  const expectedBaselineId = detachedCommand.promotion.expectedBaseline?.analysis.id ?? null;
+  if (
+    detachedCommand.promotion.snapshot.id !== current.candidateAnalysisId
+    || expectedBaselineId !== current.completedBaselineId
+    || detachedCommand.promotion.snapshot.branch !== current.branch
+    || detachedCommand.promotion.snapshot.commitHash !== current.commitHash
+    || !isDeepStrictEqual(
+      detachedCommand.projection.promotedSnapshot,
+      detachedCommand.promotion.snapshot,
+    )
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze finalization intent does not match run ${runId}`,
+    );
+  }
+  if (Date.parse(preparedAt) < Date.parse(current.status.finalizingAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} finalization preparation cannot precede finalizing`,
+    );
+  }
+
+  const storedIntent: StoredAnalyzeRunFinalizationIntent = {
+    preparedAt,
+    promotion: detachedCommand.promotion,
+    projection: {
+      projectSlug: detachedCommand.projection.projectSlug,
+      historyEntry: detachedCommand.projection.historyEntry,
+    },
+  };
+  if (current.finalizationIntent !== null) {
+    if (!isDeepStrictEqual(current.finalizationIntent, storedIntent)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} already has a different prepared finalization intent`,
+      );
+    }
+    return toView(current);
+  }
+
+  const next: StoredAnalyzeRun = {
+    ...current,
+    schemaVersion: SCHEMA_VERSION,
+    revision: current.revision + 1,
+    updatedAt: preparedAt,
+    finalizationIntent: storedIntent,
+  };
+  await storage.compareAndSwap(repoKey, runId, current.revision, next);
+  assertAnalyzeRunStorage(storage);
+  return toView(next);
 }
 
 async function failRun(
@@ -733,10 +880,13 @@ async function failRun(
     (
       current.status.state === 'finalizing' &&
       Date.parse(failedAt) < Date.parse(current.status.finalizingAt)
+    ) || (
+      current.finalizationIntent !== null &&
+      Date.parse(failedAt) < Date.parse(current.finalizationIntent.preparedAt)
     )
   ) {
     throw new InvalidAnalyzeRunTransitionError(
-      `Analyze run ${runId} failure cannot precede its start or sealed plan`,
+      `Analyze run ${runId} failure cannot precede its start, sealed plan, or prepared finalization`,
     );
   }
   const next: StoredAnalyzeRun = {
@@ -978,12 +1128,19 @@ function readJson(file: string): unknown {
   }
 }
 
-function parseLatestPointer(value: unknown, file: string): LatestAttemptPointer {
+function parseLatestPointer(value: unknown, file: string): ParsedLatestAttemptPointer {
   try {
-    if (!isRecord(value) || value.schemaVersion !== SCHEMA_VERSION || typeof value.runId !== 'string') {
+    if (
+      !isRecord(value)
+      || (value.schemaVersion !== LEGACY_SCHEMA_VERSION && value.schemaVersion !== SCHEMA_VERSION)
+      || typeof value.runId !== 'string'
+    ) {
       throw new AnalyzeRunJournalCorruptError(`Invalid latest analyze-run pointer: ${file}`);
     }
-    return { schemaVersion: SCHEMA_VERSION, runId: validateRunId(value.runId) };
+    return {
+      schemaVersion: value.schemaVersion as ParsedLatestAttemptPointer['schemaVersion'],
+      runId: validateRunId(value.runId),
+    };
   } catch (error) {
     throw asCorruption(error, `Invalid latest analyze-run pointer: ${file}`);
   }
@@ -1006,7 +1163,7 @@ function parseStoredRun(value: unknown, file: string, expectedRunId?: string): S
 function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun {
   if (
     !isRecord(value) ||
-    value.schemaVersion !== SCHEMA_VERSION ||
+    (value.schemaVersion !== LEGACY_SCHEMA_VERSION && value.schemaVersion !== SCHEMA_VERSION) ||
     !Number.isSafeInteger(value.attemptSequence) ||
     (value.attemptSequence as number) < 1 ||
     !Number.isInteger(value.revision) ||
@@ -1030,6 +1187,30 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const revision = value.revision as number;
   const status = parseStoredStatus(value.status, file);
   const plan = parseStoredPlan(value.plan, file);
+  if (value.schemaVersion === SCHEMA_VERSION && !Object.hasOwn(value, 'finalizationIntent')) {
+    throw new AnalyzeRunJournalCorruptError(`Schema-v2 run is missing finalization intent state: ${file}`);
+  }
+  const finalizationIntent = value.schemaVersion === LEGACY_SCHEMA_VERSION
+    ? (() => {
+        if (value.finalizationIntent !== undefined && value.finalizationIntent !== null) {
+          throw new AnalyzeRunJournalCorruptError(`Schema-v1 run contains v2 finalization intent: ${file}`);
+        }
+        return null;
+      })()
+    : parseStoredFinalizationIntent(value.finalizationIntent, file);
+  if (finalizationIntent !== null) {
+    const expectedBaselineId = finalizationIntent.promotion.expectedBaseline?.analysis.id ?? null;
+    if (
+      finalizationIntent.promotion.snapshot.id !== value.candidateAnalysisId
+      || expectedBaselineId !== value.completedBaselineId
+      || finalizationIntent.promotion.snapshot.branch !== value.branch
+      || finalizationIntent.promotion.snapshot.commitHash !== value.commitHash
+    ) {
+      throw new AnalyzeRunJournalCorruptError(
+        `Prepared finalization intent does not match its analyze run: ${file}`,
+      );
+    }
+  }
   const terminalAt = status.state === 'blocked'
     ? status.blockedAt
     : status.state === 'failed'
@@ -1043,6 +1224,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   );
   const lifecycleIsReachable = plan.state === 'unsealed'
     ? (
+      finalizationIntent === null && (
       (status.state === 'running' && revision === 0 && value.updatedAt === value.startedAt) ||
       (
         status.state === 'failed' &&
@@ -1050,17 +1232,20 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         revision === 1 &&
         status.failedAt === value.updatedAt
       )
+      )
     )
     : (
       Date.parse(plan.sealedAt) >= Date.parse(value.startedAt) && (
         (
           status.state === 'running' &&
+          finalizationIntent === null &&
           [1, 2].includes(revision) &&
           value.updatedAt === plan.sealedAt &&
           plan.work.every((work) => work.state === 'pending')
         ) ||
         (
           status.state === 'blocked' &&
+          finalizationIntent === null &&
           [2, 3].includes(revision) &&
           status.blockedAt === value.updatedAt &&
           plan.work.every((work) => work.state === 'pending')
@@ -1069,15 +1254,21 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
           status.state === 'failed' &&
           (
             (
+              finalizationIntent === null &&
               [2, 3].includes(revision) &&
               status.finalizingAt === null &&
               plan.work.every((work) => work.state === 'pending')
             ) ||
             (
-              revision === 4 &&
+              revision === (finalizationIntent === null ? 4 : 5) &&
               status.finalizingAt !== null &&
               Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
               Date.parse(status.failedAt) >= Date.parse(status.finalizingAt) &&
+              (finalizationIntent === null
+                || (
+                  Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt)
+                  && Date.parse(status.failedAt) >= Date.parse(finalizationIntent.preparedAt)
+                )) &&
               plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
             )
           ) &&
@@ -1085,8 +1276,11 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         ) ||
         (
           status.state === 'finalizing' &&
-          revision === 3 &&
-          status.finalizingAt === value.updatedAt &&
+          revision === (finalizationIntent === null ? 3 : 4) &&
+          (finalizationIntent === null
+            ? status.finalizingAt === value.updatedAt
+            : finalizationIntent.preparedAt === value.updatedAt
+              && Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt)) &&
           plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
         )
       )
@@ -1095,10 +1289,11 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
-    Schema v1 uses revision 2 for running/sealed execution admission and revision 3 for its terminal
-    transitions or finalization. A finalization failure advances to revision 4. The admission
-    tombstone prevents a consumed plan from issuing another receipt. Future work-result/completion
-    commands must migrate or extend the durable schema together with these invariants.
+    Schema v2 retains revision 2 for durable execution admission. Terminal execution states and
+    unprepared finalization use revision 3; preparing finalization advances to revision 4. A
+    finalization failure advances to revision 4 when unprepared or revision 5 when prepared. The
+    admission tombstone prevents a consumed plan from issuing another receipt. Future work-result
+    or completion commands must migrate or extend the durable schema with these invariants.
   */
 
   return {
@@ -1114,7 +1309,45 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     branch: value.branch,
     commitHash: value.commitHash,
     completedBaselineId: value.completedBaselineId,
+    finalizationIntent,
     plan,
+  };
+}
+
+function parseStoredFinalizationIntent(
+  value: unknown,
+  file: string,
+): StoredAnalyzeRunFinalizationIntent | null {
+  if (value === null) return null;
+  if (
+    !isRecord(value)
+    || typeof value.preparedAt !== 'string'
+    || !isRecord(value.promotion)
+    || !isRecord(value.projection)
+    || typeof value.projection.projectSlug !== 'string'
+    || !isRecord(value.projection.historyEntry)
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid prepared finalization intent: ${file}`);
+  }
+  const preparedAt = validateTimestamp(value.preparedAt, 'preparedAt');
+  const promotion = value.promotion as unknown as CompletedAnalysisPromotion;
+  const projection = {
+    projectSlug: value.projection.projectSlug,
+    promotedSnapshot: promotion.snapshot,
+    historyEntry: value.projection.historyEntry as unknown as HistoryEntry,
+  };
+  validateCompletedAnalysisPromotion(
+    promotion,
+    buildAnalysisFilename(promotion.snapshot.id, promotion.snapshot.createdAt),
+  );
+  validateCompletedAnalysisProjectionIntent(projection);
+  return {
+    preparedAt,
+    promotion,
+    projection: {
+      projectSlug: projection.projectSlug,
+      historyEntry: projection.historyEntry,
+    },
   };
 }
 

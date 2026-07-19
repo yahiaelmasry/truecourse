@@ -104,7 +104,9 @@ function summarizeUsage(usage: readonly UsageRecord[]): HistoryEntry['usage'] {
   };
 }
 
-function validateProjectionIntent(intent: CompletedAnalysisProjectionIntent): void {
+export function validateCompletedAnalysisProjectionIntent(
+  intent: CompletedAnalysisProjectionIntent,
+): void {
   let persisted: unknown;
   try {
     persisted = JSON.parse(JSON.stringify(intent));
@@ -198,7 +200,7 @@ export async function projectCompletedAnalysis(
   options: CompletedAnalysisProjectionOptions = {},
 ): Promise<CompletedAnalysisProjectionResult> {
   if (repoKey.length === 0) throw new Error('Completed-analysis projection requires a repository key');
-  validateProjectionIntent(intent);
+  validateCompletedAnalysisProjectionIntent(intent);
 
   const lineage = await certifyCompletedAnalysisLineage(repoKey, intent.promotedSnapshot);
   const latest = await readLatest(repoKey);
