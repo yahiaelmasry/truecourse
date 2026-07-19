@@ -9,6 +9,8 @@ import type {
   LatestSnapshot,
   HistoryEntry,
   DiffSnapshot,
+  ViolationRecord,
+  ViolationWithNames,
 } from '@truecourse/core/types/snapshot';
 import { buildAnalysisFilename } from '@truecourse/core/lib/analysis-store';
 
@@ -37,10 +39,81 @@ const snap = (id: string, createdAt: string): AnalysisSnapshot =>
     architecture: 'monolith',
     status: 'completed',
     metadata: null,
-    graph: { services: [], modules: [], methods: [] },
+    graph: {
+      services: [],
+      serviceDependencies: [],
+      layers: [],
+      modules: [],
+      methods: [],
+      moduleDeps: [],
+      methodDeps: [],
+      databases: [],
+      databaseConnections: [],
+      flows: [],
+    },
     violations: { added: [], resolved: [], previousAnalysisId: null },
     usage: [],
   }) as unknown as AnalysisSnapshot;
+
+const latestFor = (snapshot: AnalysisSnapshot): LatestSnapshot => ({
+  head: buildAnalysisFilename(snapshot.id, snapshot.createdAt),
+  analysis: {
+    id: snapshot.id,
+    createdAt: snapshot.createdAt,
+    branch: snapshot.branch,
+    commitHash: snapshot.commitHash,
+    architecture: snapshot.architecture,
+    metadata: snapshot.metadata,
+    status: 'completed',
+  },
+  graph: snapshot.graph,
+  violations: [],
+});
+
+const violation = (
+  id: string,
+  status: ViolationRecord['status'],
+  createdAt: string,
+  overrides: Partial<ViolationRecord> = {},
+): ViolationRecord => ({
+  id,
+  type: 'code',
+  category: 'rule',
+  subcategory: null,
+  title: `Finding ${id}`,
+  content: 'finding content',
+  severity: 'high',
+  status,
+  targetServiceId: null,
+  targetDatabaseId: null,
+  targetModuleId: null,
+  targetMethodId: null,
+  targetTable: null,
+  relatedServiceId: null,
+  relatedModuleId: null,
+  fixPrompt: null,
+  ruleKey: 'test/rule',
+  firstSeenAnalysisId: 'first-analysis',
+  firstSeenAt: '2025-12-31T00:00:00.000Z',
+  previousViolationId: null,
+  resolvedAt: null,
+  filePath: 'src/example.ts',
+  lineStart: 1,
+  lineEnd: 1,
+  columnStart: 1,
+  columnEnd: 5,
+  snippet: 'value',
+  createdAt,
+  ...overrides,
+});
+
+const withNames = (row: ViolationRecord): ViolationWithNames => ({
+  ...row,
+  targetServiceName: null,
+  targetModuleName: null,
+  targetMethodName: null,
+  targetDatabaseName: null,
+});
 
 describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () => {
   it('writeAnalysis → readAnalysis / listAnalyses / findAnalysisFilename round-trip', async () => {
@@ -85,6 +158,141 @@ describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () 
     expect((await store.readDiff(REPO) as { id: string }).id).toBe('d1');
     await store.deleteDiff(REPO);
     expect(await store.readDiff(REPO)).toBeNull();
+  });
+
+  it('promotes the completed baseline transactionally and rejects a stale expectation', async () => {
+    const store = new PgAnalysisStore(db);
+    const previous = snap('a1', '2026-01-01T00:00:00.000Z');
+    await store.writeAnalysis(REPO, previous);
+    const previousLatest = latestFor(previous);
+    const carriedPrevious = withNames(violation('carry-old', 'new', previous.createdAt));
+    const resolvedPrevious = withNames(violation('resolve-old', 'new', previous.createdAt, {
+      title: 'Resolved finding',
+    }));
+    previousLatest.violations = [carriedPrevious, resolvedPrevious];
+    await store.writeLatest(REPO, previousLatest);
+
+    const candidate = {
+      ...snap('a2', '2026-01-02T00:00:00.000Z'),
+    };
+    const added = violation('added-new', 'new', candidate.createdAt, {
+      firstSeenAnalysisId: candidate.id,
+      firstSeenAt: candidate.createdAt,
+      title: 'New finding',
+    });
+    candidate.violations = {
+      added: [added],
+      resolved: [{ id: resolvedPrevious.id, resolvedAt: candidate.createdAt }],
+      previousAnalysisId: previous.id,
+    };
+    const candidateLatest = latestFor(candidate);
+    candidateLatest.violations = [
+      withNames(added),
+      withNames(violation('carry-new', 'unchanged', candidate.createdAt, {
+        firstSeenAnalysisId: carriedPrevious.firstSeenAnalysisId,
+        firstSeenAt: carriedPrevious.firstSeenAt,
+        previousViolationId: carriedPrevious.id,
+      })),
+    ];
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: candidateLatest,
+    })).resolves.toEqual({
+      state: 'promoted',
+      filename: buildAnalysisFilename(candidate.id, candidate.createdAt),
+    });
+
+    const staleBaselineSnapshot = snap('stale-baseline', '2025-12-30T00:00:00.000Z');
+    const staleBaseline = latestFor(staleBaselineSnapshot);
+    const stale = {
+      ...snap('a3', '2026-01-03T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: staleBaselineSnapshot.id },
+    };
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: staleBaseline,
+      snapshot: stale,
+      latest: latestFor(stale),
+    })).resolves.toEqual({ state: 'conflict', currentBaselineId: candidate.id });
+    expect((await store.readLatest(REPO))?.analysis.id).toBe(candidate.id);
+    expect(await store.readAnalysis(REPO, buildAnalysisFilename(stale.id, stale.createdAt))).toBeNull();
+  });
+
+  it('rolls back a pre-commit fault and recognizes a retry after a post-commit fault', async () => {
+    const store = new PgAnalysisStore(db);
+    const previous = snap('a1', '2026-01-01T00:00:00.000Z');
+    await store.writeAnalysis(REPO, previous);
+    const previousLatest = latestFor(previous);
+    await store.writeLatest(REPO, previousLatest);
+
+    const candidate = {
+      ...snap('a2', '2026-01-02T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const promotion = {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: latestFor(candidate),
+    };
+    const filename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-prepare') throw new Error('injected transaction rollback');
+      },
+    })).rejects.toThrow('injected transaction rollback');
+    expect((await store.readLatest(REPO))?.analysis.id).toBe(previous.id);
+    expect(await store.readAnalysis(REPO, filename)).toBeNull();
+
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-commit') throw new Error('injected ambiguous commit');
+      },
+    })).rejects.toThrow('injected ambiguous commit');
+    expect((await store.readLatest(REPO))?.analysis.id).toBe(candidate.id);
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, promotion)).resolves.toEqual({
+      state: 'already-promoted',
+      filename,
+    });
+  });
+
+  it('atomically admits only one of two promotions from the same completed baseline', async () => {
+    const firstStore = new PgAnalysisStore(db);
+    const secondStore = new PgAnalysisStore(db);
+    const previous = snap('a1', '2026-01-01T00:00:00.000Z');
+    await firstStore.writeAnalysis(REPO, previous);
+    const previousLatest = latestFor(previous);
+    await firstStore.writeLatest(REPO, previousLatest);
+
+    const first = {
+      ...snap('a2', '2026-01-02T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const second = {
+      ...snap('a3', '2026-01-03T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const results = await Promise.all([
+      firstStore.promoteCompletedAnalysisBaseline(REPO, {
+        expectedBaseline: previousLatest,
+        snapshot: first,
+        latest: latestFor(first),
+      }),
+      secondStore.promoteCompletedAnalysisBaseline(REPO, {
+        expectedBaseline: previousLatest,
+        snapshot: second,
+        latest: latestFor(second),
+      }),
+    ]);
+
+    expect(results.map((result) => result.state).sort()).toEqual(['conflict', 'promoted']);
+    const currentId = (await firstStore.readLatest(REPO))?.analysis.id;
+    expect([first.id, second.id]).toContain(currentId);
+    const losing = currentId === first.id ? second : first;
+    expect(await firstStore.readAnalysis(
+      REPO,
+      buildAnalysisFilename(losing.id, losing.createdAt),
+    )).toBeNull();
   });
 
   it('appendHistory accumulates; removeFromHistory drops by analysis id', async () => {

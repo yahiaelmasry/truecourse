@@ -13,6 +13,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { atomicWriteJson } from './atomic-write.js';
+import { fingerprint } from './canonical-json.js';
+import {
+  validateCompletedAnalysisPromotion,
+  type AnalysisPromotionOptions,
+  type CompletedAnalysisPromotion,
+  type CompletedAnalysisPromotionResult,
+} from './completed-analysis-promotion.js';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
@@ -32,6 +39,7 @@ import type {
 
 const TRUECOURSE_DIR = '.truecourse';
 const ANALYSES_DIR = 'analyses';
+const PROMOTIONS_DIR = '.promotions';
 const LATEST_FILE = 'LATEST.json';
 const HISTORY_FILE = 'history.json';
 const DIFF_FILE = 'diff.json';
@@ -42,6 +50,14 @@ function storeDir(repoPath: string): string {
 
 function analysesDir(repoPath: string): string {
   return path.join(storeDir(repoPath), ANALYSES_DIR);
+}
+
+function promotionsDir(repoPath: string): string {
+  return path.join(analysesDir(repoPath), PROMOTIONS_DIR);
+}
+
+function promotionMarkerPath(repoPath: string, filename: string): string {
+  return path.join(promotionsDir(repoPath), filename);
 }
 
 export function analysisFilePath(repoPath: string, filename: string): string {
@@ -111,12 +127,26 @@ export function validateHistoryEntryForPersistence(entry: HistoryEntry): void {
   }
 }
 
+interface StoredCompletedAnalysisPromotion {
+  schemaVersion: 1;
+  filename: string;
+  analysisId: string;
+  expectedBaselineId: string | null;
+  expectedBaselineFingerprint: string | null;
+  promotionFingerprint: string;
+}
+
 /** Pluggable analysis store. File-backed by default; EE injects Postgres/Blob. */
 export interface AnalysisStore {
   readLatest(repoPath: string): Promise<LatestSnapshot | null>;
   writeLatest(repoPath: string, latest: LatestSnapshot): Promise<void>;
   deleteLatest(repoPath: string): Promise<void>;
   writeAnalysis(repoPath: string, snapshot: AnalysisSnapshot): Promise<WrittenAnalysis>;
+  promoteCompletedAnalysisBaseline(
+    repoPath: string,
+    promotion: CompletedAnalysisPromotion,
+    options?: AnalysisPromotionOptions,
+  ): Promise<CompletedAnalysisPromotionResult>;
   readAnalysis(repoPath: string, filename: string): Promise<AnalysisSnapshot | null>;
   listAnalyses(repoPath: string): Promise<string[]>;
   findAnalysisFilename(repoPath: string, analysisId: string): Promise<string | null>;
@@ -145,6 +175,37 @@ export interface AnalysisStore {
 const latestCache = new Map<string, { mtime: number; data: LatestSnapshot }>();
 
 class FileAnalysisStore implements AnalysisStore {
+  private readLatestUncached(repoPath: string): LatestSnapshot | null {
+    const file = latestPath(repoPath);
+    if (!fs.existsSync(file)) return null;
+    const data = JSON.parse(fs.readFileSync(file, 'utf-8')) as LatestSnapshot;
+    patchViolations(data.violations);
+    return data;
+  }
+
+  private readStoredPromotion(
+    repoPath: string,
+    filename: string,
+  ): StoredCompletedAnalysisPromotion | null {
+    const file = promotionMarkerPath(repoPath, filename);
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf-8')) as StoredCompletedAnalysisPromotion;
+  }
+
+  private readAnalysisUnpatched(repoPath: string, filename: string): AnalysisSnapshot | null {
+    const file = analysisFilePath(repoPath, filename);
+    if (!fs.existsSync(file)) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf-8')) as AnalysisSnapshot;
+  }
+
+  private removePromotionMarker(repoPath: string, filename: string): void {
+    try {
+      fs.unlinkSync(promotionMarkerPath(repoPath, filename));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  }
+
   async readLatest(repoPath: string): Promise<LatestSnapshot | null> {
     const file = latestPath(repoPath);
     let mtime: number;
@@ -185,6 +246,84 @@ class FileAnalysisStore implements AnalysisStore {
     return { filename, snapshot };
   }
 
+  /**
+   * Commit a completed baseline under the repository analyze lock.
+   *
+   * The durable marker makes the prepared snapshot invisible to canonical
+   * enumeration before LATEST is replaced. LATEST is the sole commit point.
+   * After it changes, recovery only moves forward and removes the marker.
+   */
+  async promoteCompletedAnalysisBaseline(
+    repoPath: string,
+    promotion: CompletedAnalysisPromotion,
+    options: AnalysisPromotionOptions = {},
+  ): Promise<CompletedAnalysisPromotionResult> {
+    const filename = buildAnalysisFilename(promotion.snapshot.id, promotion.snapshot.createdAt);
+    validateCompletedAnalysisPromotion(promotion, filename);
+    const current = this.readLatestUncached(repoPath);
+
+    if (current?.analysis.id === promotion.snapshot.id) {
+      const storedSnapshot = this.readAnalysisUnpatched(repoPath, filename);
+      if (!storedSnapshot || !isDeepStrictEqual(storedSnapshot, promotion.snapshot)) {
+        throw new Error('Committed analysis snapshot does not match the promotion candidate');
+      }
+      if (!isDeepStrictEqual(current, promotion.latest)) {
+        throw new Error('Committed LATEST does not match the promotion candidate');
+      }
+      this.removePromotionMarker(repoPath, filename);
+      return { state: 'already-promoted', filename };
+    }
+
+    const currentBaselineId = current?.analysis.id ?? null;
+    if (!isDeepStrictEqual(current, promotion.expectedBaseline)) {
+      return { state: 'conflict', currentBaselineId };
+    }
+
+    const marker: StoredCompletedAnalysisPromotion = {
+      schemaVersion: 1,
+      filename,
+      analysisId: promotion.snapshot.id,
+      expectedBaselineId: promotion.expectedBaseline?.analysis.id ?? null,
+      expectedBaselineFingerprint: promotion.expectedBaseline
+        ? fingerprint(promotion.expectedBaseline)
+        : null,
+      promotionFingerprint: fingerprint(promotion),
+    };
+    const existingMarker = this.readStoredPromotion(repoPath, filename);
+    if (existingMarker && !isDeepStrictEqual(existingMarker, marker)) {
+      throw new Error('Prepared promotion marker does not match the promotion candidate');
+    }
+    if (!existingMarker) {
+      atomicWriteJson(promotionMarkerPath(repoPath, filename), marker);
+      await options.faultInjector?.('after-marker');
+    }
+
+    const existingSnapshot = this.readAnalysisUnpatched(repoPath, filename);
+    if (existingSnapshot && !isDeepStrictEqual(existingSnapshot, promotion.snapshot)) {
+      throw new Error('Prepared analysis snapshot does not match the promotion candidate');
+    }
+    if (!existingSnapshot) atomicWriteJson(analysisFilePath(repoPath, filename), promotion.snapshot);
+
+    await options.faultInjector?.('after-prepare');
+
+    // Recheck immediately before the commit point. The lifecycle lock prevents
+    // cooperating writers from racing; this also fails closed for stray ones.
+    const beforeCommit = this.readLatestUncached(repoPath);
+    const beforeCommitId = beforeCommit?.analysis.id ?? null;
+    if (!isDeepStrictEqual(beforeCommit, promotion.expectedBaseline)) {
+      if (beforeCommitId === promotion.snapshot.id && isDeepStrictEqual(beforeCommit, promotion.latest)) {
+        this.removePromotionMarker(repoPath, filename);
+        return { state: 'already-promoted', filename };
+      }
+      return { state: 'conflict', currentBaselineId: beforeCommitId };
+    }
+
+    await this.writeLatest(repoPath, promotion.latest);
+    await options.faultInjector?.('after-commit');
+    this.removePromotionMarker(repoPath, filename);
+    return { state: 'promoted', filename };
+  }
+
   async readAnalysis(repoPath: string, filename: string): Promise<AnalysisSnapshot | null> {
     const file = analysisFilePath(repoPath, filename);
     if (!fs.existsSync(file)) return null;
@@ -196,9 +335,14 @@ class FileAnalysisStore implements AnalysisStore {
   async listAnalyses(repoPath: string): Promise<string[]> {
     const dir = analysesDir(repoPath);
     if (!fs.existsSync(dir)) return [];
+    const committedHead = this.readLatestUncached(repoPath)?.head ?? null;
+    const prepared = fs.existsSync(promotionsDir(repoPath))
+      ? new Set(fs.readdirSync(promotionsDir(repoPath)).filter((name) => name.endsWith('.json')))
+      : new Set<string>();
     return fs
       .readdirSync(dir)
       .filter((name) => name.endsWith('.json'))
+      .filter((name) => !prepared.has(name) || name === committedHead)
       .sort();
   }
 
@@ -308,6 +452,12 @@ export const deleteLatest = (repoPath: string): Promise<void> =>
   active.deleteLatest(repoPath);
 export const writeAnalysis = (repoPath: string, snapshot: AnalysisSnapshot): Promise<WrittenAnalysis> =>
   active.writeAnalysis(repoPath, snapshot);
+export const promoteCompletedAnalysisBaseline = (
+  repoPath: string,
+  promotion: CompletedAnalysisPromotion,
+  options?: AnalysisPromotionOptions,
+): Promise<CompletedAnalysisPromotionResult> =>
+  active.promoteCompletedAnalysisBaseline(repoPath, promotion, options);
 export const readAnalysis = (repoPath: string, filename: string): Promise<AnalysisSnapshot | null> =>
   active.readAnalysis(repoPath, filename);
 export const listAnalyses = (repoPath: string): Promise<string[]> =>

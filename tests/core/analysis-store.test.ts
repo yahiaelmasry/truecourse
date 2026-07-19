@@ -16,6 +16,7 @@ import {
   historyPath,
   latestPath,
   listAnalyses,
+  promoteCompletedAnalysisBaseline,
   readAnalysis,
   readDiff,
   readHistory,
@@ -36,6 +37,8 @@ import type {
   DiffSnapshot,
   HistoryEntry,
   LatestSnapshot,
+  ViolationRecord,
+  ViolationWithNames,
 } from '../../packages/core/src/types/snapshot';
 
 let repoPath: string;
@@ -98,6 +101,55 @@ function makeLatest(snapshot: AnalysisSnapshot, head: string): LatestSnapshot {
     },
     graph: snapshot.graph,
     violations: [],
+  };
+}
+
+function makeViolation(
+  id: string,
+  status: ViolationRecord['status'],
+  createdAt: string,
+  overrides: Partial<ViolationRecord> = {},
+): ViolationRecord {
+  return {
+    id,
+    type: 'code',
+    category: 'rule',
+    subcategory: null,
+    title: `Finding ${id}`,
+    content: 'finding content',
+    severity: 'high',
+    status,
+    targetServiceId: null,
+    targetDatabaseId: null,
+    targetModuleId: null,
+    targetMethodId: null,
+    targetTable: null,
+    relatedServiceId: null,
+    relatedModuleId: null,
+    fixPrompt: null,
+    ruleKey: 'test/rule',
+    firstSeenAnalysisId: 'first-analysis',
+    firstSeenAt: '2026-04-16T00:00:00.000Z',
+    previousViolationId: null,
+    resolvedAt: null,
+    filePath: 'src/example.ts',
+    lineStart: 1,
+    lineEnd: 1,
+    columnStart: 1,
+    columnEnd: 5,
+    snippet: 'value',
+    createdAt,
+    ...overrides,
+  };
+}
+
+function withNames(violation: ViolationRecord): ViolationWithNames {
+  return {
+    ...violation,
+    targetServiceName: null,
+    targetModuleName: null,
+    targetMethodName: null,
+    targetDatabaseName: null,
   };
 }
 
@@ -249,6 +301,325 @@ describe('LATEST round-trip', () => {
     await readLatest(repoPath);                     // populate cache
     fs.unlinkSync(latestPath(repoPath));       // sneak a delete past the store
     expect(await readLatest(repoPath)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// completed-baseline promotion
+// ---------------------------------------------------------------------------
+
+describe('completed-baseline promotion', () => {
+  it('promotes a prepared snapshot only when the expected baseline still matches', async () => {
+    const previous = makeSnapshot();
+    const { filename: previousFilename } = await writeAnalysis(repoPath, previous);
+    const previousLatest = makeLatest(previous, previousFilename);
+    await writeLatest(repoPath, previousLatest);
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    const candidateLatest = makeLatest(candidate, candidateFilename);
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: candidateLatest,
+    })).resolves.toEqual({ state: 'promoted', filename: candidateFilename });
+
+    expect(await readLatest(repoPath)).toEqual(candidateLatest);
+    expect(await readAnalysis(repoPath, candidateFilename)).toEqual(candidate);
+    expect(await listAnalyses(repoPath)).toEqual([previousFilename, candidateFilename]);
+  });
+
+  it('rejects a stale expected baseline without exposing or committing the candidate', async () => {
+    const current = makeSnapshot();
+    const { filename: currentFilename } = await writeAnalysis(repoPath, current);
+    const currentLatest = makeLatest(current, currentFilename);
+    await writeLatest(repoPath, currentLatest);
+
+    const staleBaselineId = randomUUID();
+    const staleSnapshot = { ...makeSnapshot(), id: staleBaselineId };
+    const staleLatest = makeLatest(
+      staleSnapshot,
+      buildAnalysisFilename(staleSnapshot.id, staleSnapshot.createdAt),
+    );
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: staleBaselineId },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: staleLatest,
+      snapshot: candidate,
+      latest: makeLatest(candidate, candidateFilename),
+    })).resolves.toEqual({ state: 'conflict', currentBaselineId: current.id });
+
+    expect(await readLatest(repoPath)).toEqual(currentLatest);
+    expect(await readAnalysis(repoPath, candidateFilename)).toBeNull();
+    expect(await listAnalyses(repoPath)).toEqual([currentFilename]);
+  });
+
+  it('rejects a same-ID baseline whose completed content changed after planning', async () => {
+    const previous = makeSnapshot();
+    const { filename: previousFilename } = await writeAnalysis(repoPath, previous);
+    const expectedBaseline = makeLatest(previous, previousFilename);
+    const changedBaseline = {
+      ...expectedBaseline,
+      analysis: { ...expectedBaseline.analysis, metadata: { enrichedAfterPlanning: true } },
+    };
+    await writeLatest(repoPath, changedBaseline);
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline,
+      snapshot: candidate,
+      latest: makeLatest(candidate, candidateFilename),
+    })).resolves.toEqual({ state: 'conflict', currentBaselineId: previous.id });
+
+    expect(await readLatest(repoPath)).toEqual(changedBaseline);
+    expect(await readAnalysis(repoPath, candidateFilename)).toBeNull();
+  });
+
+  it('rejects a materialized LATEST that drops an unresolved baseline finding', async () => {
+    const previous = makeSnapshot();
+    const { filename: previousFilename } = await writeAnalysis(repoPath, previous);
+    const previousLatest = makeLatest(previous, previousFilename);
+    const carriedPrevious = withNames(makeViolation(
+      'carry-old',
+      'new',
+      previous.createdAt,
+    ));
+    const resolvedPrevious = withNames(makeViolation(
+      'resolve-old',
+      'new',
+      previous.createdAt,
+      { title: 'Resolved finding' },
+    ));
+    previousLatest.violations = [carriedPrevious, resolvedPrevious];
+    await writeLatest(repoPath, previousLatest);
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+    };
+    const added = makeViolation('added-new', 'new', candidate.createdAt, {
+      firstSeenAnalysisId: candidate.id,
+      firstSeenAt: candidate.createdAt,
+      title: carriedPrevious.title,
+    });
+    candidate.violations = {
+      added: [added],
+      resolved: [{ id: resolvedPrevious.id, resolvedAt: candidate.createdAt }],
+      previousAnalysisId: previous.id,
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    const incompleteLatest = makeLatest(candidate, candidateFilename);
+    incompleteLatest.violations = [withNames(added)];
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: incompleteLatest,
+    })).rejects.toThrow('Candidate LATEST omits an unresolved baseline violation');
+
+    expect(await readLatest(repoPath)).toEqual(previousLatest);
+    expect(await readAnalysis(repoPath, candidateFilename)).toBeNull();
+
+    const selfChained = withNames(makeViolation(
+      carriedPrevious.id,
+      'unchanged',
+      candidate.createdAt,
+      {
+        firstSeenAnalysisId: carriedPrevious.firstSeenAnalysisId,
+        firstSeenAt: carriedPrevious.firstSeenAt,
+        previousViolationId: carriedPrevious.id,
+      },
+    ));
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: { ...incompleteLatest, violations: [withNames(added), selfChained] },
+    })).rejects.toThrow('Candidate LATEST reuses a baseline violation ID');
+
+    const carried = withNames(makeViolation('carry-new', 'unchanged', candidate.createdAt, {
+      firstSeenAnalysisId: carriedPrevious.firstSeenAnalysisId,
+      firstSeenAt: carriedPrevious.firstSeenAt,
+      previousViolationId: carriedPrevious.id,
+    }));
+    const completeLatest = { ...incompleteLatest, violations: [withNames(added), carried] };
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: completeLatest,
+    })).resolves.toEqual({ state: 'promoted', filename: candidateFilename });
+    expect(await readLatest(repoPath)).toEqual(completeLatest);
+  });
+
+  it('keeps a prepared candidate invisible when execution stops before the commit point', async () => {
+    const previous = makeSnapshot();
+    const { filename: previousFilename } = await writeAnalysis(repoPath, previous);
+    const previousLatest = makeLatest(previous, previousFilename);
+    await writeLatest(repoPath, previousLatest);
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    const promotion = {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: makeLatest(candidate, candidateFilename),
+    };
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-prepare') throw new Error('injected pre-commit stop');
+      },
+    })).rejects.toThrow('injected pre-commit stop');
+
+    expect(await readLatest(repoPath)).toEqual(previousLatest);
+    expect(await readAnalysis(repoPath, candidateFilename)).toEqual(candidate);
+    expect(await listAnalyses(repoPath)).toEqual([previousFilename]);
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, promotion)).resolves.toEqual({
+      state: 'promoted',
+      filename: candidateFilename,
+    });
+    expect(await readLatest(repoPath)).toEqual(promotion.latest);
+    expect(await listAnalyses(repoPath)).toEqual([previousFilename, candidateFilename]);
+  });
+
+  it('recovers when execution stops after binding the marker but before writing the snapshot', async () => {
+    const candidate = { ...makeSnapshot(), metadata: { values: [] } };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    const promotion = {
+      expectedBaseline: null,
+      snapshot: candidate,
+      latest: makeLatest(candidate, candidateFilename),
+    };
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-marker') throw new Error('injected marker-only stop');
+      },
+    })).rejects.toThrow('injected marker-only stop');
+
+    expect(await readLatest(repoPath)).toBeNull();
+    expect(await readAnalysis(repoPath, candidateFilename)).toBeNull();
+    expect(await listAnalyses(repoPath)).toEqual([]);
+
+    const nonJsonSnapshot = { ...candidate, metadata: { values: [undefined] } };
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      ...promotion,
+      snapshot: nonJsonSnapshot,
+      latest: makeLatest(nonJsonSnapshot, candidateFilename),
+    })).rejects.toThrow('Completed-baseline promotion must be exactly JSON-round-trippable');
+
+    const changedSnapshot = { ...candidate, metadata: { values: [null] } };
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      ...promotion,
+      snapshot: changedSnapshot,
+      latest: makeLatest(changedSnapshot, candidateFilename),
+    })).rejects.toThrow('Prepared promotion marker does not match the promotion candidate');
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, promotion)).resolves.toEqual({
+      state: 'promoted',
+      filename: candidateFilename,
+    });
+    expect(await readLatest(repoPath)).toEqual(promotion.latest);
+  });
+
+  it('promotes a legacy baseline after applying the same violation defaults used by public reads', async () => {
+    const previous = makeSnapshot();
+    const { filename: previousFilename } = await writeAnalysis(repoPath, previous);
+    const previousLatest = makeLatest(previous, previousFilename);
+    const legacy = withNames(makeViolation('legacy-old', 'new', previous.createdAt));
+    delete (legacy as Partial<ViolationRecord>).category;
+    delete (legacy as Partial<ViolationRecord>).subcategory;
+    previousLatest.violations = [legacy];
+    await writeLatest(repoPath, previousLatest);
+    const normalizedBaseline = await readLatest(repoPath);
+    expect(normalizedBaseline?.violations[0]).toMatchObject({ category: 'rule', subcategory: null });
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    const latest = makeLatest(candidate, candidateFilename);
+    latest.violations = [withNames(makeViolation('legacy-new', 'unchanged', candidate.createdAt, {
+      firstSeenAnalysisId: normalizedBaseline!.violations[0].firstSeenAnalysisId,
+      firstSeenAt: normalizedBaseline!.violations[0].firstSeenAt,
+      previousViolationId: legacy.id,
+    }))];
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: normalizedBaseline,
+      snapshot: candidate,
+      latest,
+    })).resolves.toEqual({ state: 'promoted', filename: candidateFilename });
+  });
+
+  it('recognizes an exact retry after the commit point without rolling the candidate back', async () => {
+    const previous = makeSnapshot();
+    const { filename: previousFilename } = await writeAnalysis(repoPath, previous);
+    const previousLatest = makeLatest(previous, previousFilename);
+    await writeLatest(repoPath, previousLatest);
+
+    const candidate = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const candidateFilename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+    const promotion = {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: makeLatest(candidate, candidateFilename),
+    };
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-commit') throw new Error('injected post-commit stop');
+      },
+    })).rejects.toThrow('injected post-commit stop');
+
+    expect(await readLatest(repoPath)).toEqual(promotion.latest);
+    expect(await listAnalyses(repoPath)).toEqual([previousFilename, candidateFilename]);
+
+    const observedPoints: string[] = [];
+    await expect(promoteCompletedAnalysisBaseline(repoPath, promotion, {
+      faultInjector: (point) => { observedPoints.push(point); },
+    })).resolves.toEqual({ state: 'already-promoted', filename: candidateFilename });
+    expect(observedPoints).toEqual([]);
+    expect(await readLatest(repoPath)).toEqual(promotion.latest);
+  });
+
+  it('fails closed when the candidate LATEST does not identify its snapshot', async () => {
+    const candidate = makeSnapshot();
+    const latest = makeLatest(candidate, 'wrong-head.json');
+
+    await expect(promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: null,
+      snapshot: candidate,
+      latest,
+    })).rejects.toThrow('Candidate LATEST head does not match its analysis filename');
+
+    expect(await readLatest(repoPath)).toBeNull();
+    expect(await listAnalyses(repoPath)).toEqual([]);
   });
 });
 

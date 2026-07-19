@@ -7,8 +7,8 @@
  * `@truecourse/core/lib/analysis-store`.
  */
 
-import { and, asc, desc, eq } from 'drizzle-orm';
 import { isDeepStrictEqual } from 'node:util';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { analyses, analysisCurrent, analysisHistory, type EeDb } from '@truecourse/ee-db';
 import {
   buildAnalysisFilename,
@@ -17,6 +17,12 @@ import {
   type WrittenAnalysis,
   validateHistoryEntryForPersistence,
 } from '@truecourse/core/lib/analysis-store';
+import {
+  validateCompletedAnalysisPromotion,
+  type AnalysisPromotionOptions,
+  type CompletedAnalysisPromotion,
+  type CompletedAnalysisPromotionResult,
+} from '@truecourse/core/lib/completed-analysis-promotion';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
@@ -90,6 +96,110 @@ export class PgAnalysisStore implements AnalysisStore {
         set: { analysisId: snapshot.id, snapshot, createdAt: snapshot.createdAt },
       });
     return { filename, snapshot };
+  }
+
+  /**
+   * Transactional equivalent of the file store's completed-baseline commit.
+   * Callers must hold the repository lifecycle lock. Snapshot preparation and
+   * the LATEST replacement commit together, so no hidden marker is needed.
+   */
+  async promoteCompletedAnalysisBaseline(
+    repoKey: string,
+    promotion: CompletedAnalysisPromotion,
+    options: AnalysisPromotionOptions = {},
+  ): Promise<CompletedAnalysisPromotionResult> {
+    const filename = buildAnalysisFilename(promotion.snapshot.id, promotion.snapshot.createdAt);
+    validateCompletedAnalysisPromotion(promotion, filename);
+    const result = await this.db.transaction(async (tx): Promise<CompletedAnalysisPromotionResult> => {
+      const [currentRow] = await tx
+        .select({ body: analysisCurrent.body })
+        .from(analysisCurrent)
+        .where(and(eq(analysisCurrent.repoKey, repoKey), eq(analysisCurrent.kind, 'latest')))
+        .limit(1);
+      const current = currentRow ? currentRow.body as LatestSnapshot : null;
+
+      if (current?.analysis.id === promotion.snapshot.id) {
+        const [snapshotRow] = await tx
+          .select({ snapshot: analyses.snapshot })
+          .from(analyses)
+          .where(and(eq(analyses.repoKey, repoKey), eq(analyses.filename, filename)))
+          .limit(1);
+        if (!snapshotRow || !isDeepStrictEqual(snapshotRow.snapshot, promotion.snapshot)) {
+          throw new Error('Committed analysis snapshot does not match the promotion candidate');
+        }
+        if (!isDeepStrictEqual(current, promotion.latest)) {
+          throw new Error('Committed LATEST does not match the promotion candidate');
+        }
+        return { state: 'already-promoted', filename };
+      }
+
+      const currentBaselineId = current?.analysis.id ?? null;
+      if (!isDeepStrictEqual(current, promotion.expectedBaseline)) {
+        return { state: 'conflict', currentBaselineId };
+      }
+
+      const now = new Date().toISOString();
+      const swapped = promotion.expectedBaseline === null
+        ? await tx
+            .insert(analysisCurrent)
+            .values({ repoKey, kind: 'latest', body: promotion.latest, updatedAt: now })
+            .onConflictDoNothing()
+            .returning({ body: analysisCurrent.body })
+        : await tx
+            .update(analysisCurrent)
+            .set({ body: promotion.latest, updatedAt: now })
+            .where(and(
+              eq(analysisCurrent.repoKey, repoKey),
+              eq(analysisCurrent.kind, 'latest'),
+              sql`${analysisCurrent.body} = ${JSON.stringify(promotion.expectedBaseline)}::jsonb`,
+            ))
+            .returning({ body: analysisCurrent.body });
+
+      if (swapped.length === 0) {
+        const [observedRow] = await tx
+          .select({ body: analysisCurrent.body })
+          .from(analysisCurrent)
+          .where(and(eq(analysisCurrent.repoKey, repoKey), eq(analysisCurrent.kind, 'latest')))
+          .limit(1);
+        const observed = observedRow ? observedRow.body as LatestSnapshot : null;
+        if (observed?.analysis.id === promotion.snapshot.id && isDeepStrictEqual(observed, promotion.latest)) {
+          const [snapshotRow] = await tx
+            .select({ snapshot: analyses.snapshot })
+            .from(analyses)
+            .where(and(eq(analyses.repoKey, repoKey), eq(analyses.filename, filename)))
+            .limit(1);
+          if (!snapshotRow || !isDeepStrictEqual(snapshotRow.snapshot, promotion.snapshot)) {
+            throw new Error('Committed analysis snapshot does not match the promotion candidate');
+          }
+          return { state: 'already-promoted', filename };
+        }
+        return { state: 'conflict', currentBaselineId: observed?.analysis.id ?? null };
+      }
+
+      const [existingSnapshot] = await tx
+        .select({ snapshot: analyses.snapshot })
+        .from(analyses)
+        .where(and(eq(analyses.repoKey, repoKey), eq(analyses.filename, filename)))
+        .limit(1);
+      if (existingSnapshot && !isDeepStrictEqual(existingSnapshot.snapshot, promotion.snapshot)) {
+        throw new Error('Prepared analysis snapshot does not match the promotion candidate');
+      }
+      if (!existingSnapshot) {
+        await tx.insert(analyses).values({
+          repoKey,
+          filename,
+          analysisId: promotion.snapshot.id,
+          snapshot: promotion.snapshot,
+          createdAt: promotion.snapshot.createdAt,
+        });
+      }
+
+      await options.faultInjector?.('after-prepare');
+      return { state: 'promoted', filename };
+    });
+
+    if (result.state === 'promoted') await options.faultInjector?.('after-commit');
+    return result;
   }
 
   async readAnalysis(repoKey: string, filename: string): Promise<AnalysisSnapshot | null> {

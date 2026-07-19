@@ -84,6 +84,10 @@
       "types": "./dist/lib/analysis-store.d.ts",
       "import": "./dist/lib/analysis-store.js"
     },
+    "./lib/completed-analysis-promotion": {
+      "types": "./dist/lib/completed-analysis-promotion.d.ts",
+      "import": "./dist/lib/completed-analysis-promotion.js"
+    },
     "./lib/analyze-run-journal": {
       "types": "./dist/lib/analyze-run-journal.d.ts",
       "import": "./dist/lib/analyze-run-journal.js"

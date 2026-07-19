@@ -23,10 +23,10 @@ import {
   writeDiff,
   writeLatest,
 } from '../lib/analysis-store.js';
+import { makeViolationDenormalizer } from '../lib/completed-analysis-promotion.js';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
-  Graph,
   HistoryEntry,
   LatestSnapshot,
   ViolationRecord,
@@ -139,7 +139,7 @@ function buildLatestSnapshot(
   unchanged: ViolationRecord[],
   added: ViolationRecord[],
 ): LatestSnapshot {
-  const denormalize = makeDenormalizer(snapshot.graph);
+  const denormalize = makeViolationDenormalizer(snapshot.graph);
   return {
     head: filename,
     analysis: {
@@ -225,7 +225,7 @@ function buildDiffSnapshot(
   baseline: LatestSnapshot,
 ): DiffSnapshot {
   const { graph, changedFiles, pipelineResult } = core;
-  const denormalize = makeDenormalizer(graph);
+  const denormalize = makeViolationDenormalizer(graph);
 
   const newViolations = pipelineResult.added.map(denormalize);
 
@@ -296,19 +296,4 @@ function buildDiffSnapshot(
     },
     usage: core.usage,
   };
-}
-
-/** Denormalize a violation row against a graph — shared by full and diff. */
-function makeDenormalizer(graph: Graph): (v: ViolationRecord) => ViolationWithNames {
-  const serviceById = new Map(graph.services.map((s) => [s.id, s.name]));
-  const moduleById = new Map(graph.modules.map((m) => [m.id, m.name]));
-  const methodById = new Map(graph.methods.map((m) => [m.id, m.name]));
-  const databaseById = new Map(graph.databases.map((d) => [d.id, d.name]));
-  return (v) => ({
-    ...v,
-    targetServiceName: v.targetServiceId ? serviceById.get(v.targetServiceId) ?? null : null,
-    targetModuleName: v.targetModuleId ? moduleById.get(v.targetModuleId) ?? null : null,
-    targetMethodName: v.targetMethodId ? methodById.get(v.targetMethodId) ?? null : null,
-    targetDatabaseName: v.targetDatabaseId ? databaseById.get(v.targetDatabaseId) ?? null : null,
-  });
 }
