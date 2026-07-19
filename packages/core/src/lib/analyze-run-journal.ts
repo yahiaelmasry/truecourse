@@ -37,17 +37,28 @@ export interface BlockAnalyzeRunCommand {
   resetHint: string;
 }
 
+export interface FailAnalyzeRunCommand {
+  kind: 'fail';
+  runId: string;
+  failedAt: string;
+  error: {
+    code: string;
+    message: string;
+  };
+}
+
 export type AnalyzeRunCommand =
   | BeginAnalyzeRunCommand
   | SealAnalyzeRunPlanCommand
-  | BlockAnalyzeRunCommand;
+  | BlockAnalyzeRunCommand
+  | FailAnalyzeRunCommand;
 
 export interface AnalyzeRunView {
   schemaVersion: typeof SCHEMA_VERSION;
   revision: number;
   runId: string;
   candidateAnalysisId: string;
-  state: 'running' | 'blocked';
+  state: 'running' | 'blocked' | 'failed';
   startedAt: string;
   updatedAt: string;
   source: AnalyzeRunSource;
@@ -66,6 +77,11 @@ export interface AnalyzeRunView {
     reason: 'provider-session-limit';
     resetHint: string;
     blockedAt: string;
+  };
+  failure: null | {
+    code: string;
+    message: string;
+    failedAt: string;
   };
   resume: {
     available: false;
@@ -92,6 +108,12 @@ export interface StoredAnalyzeRun {
         reason: 'provider-session-limit';
         resetHint: string;
         blockedAt: string;
+      }
+    | {
+        state: 'failed';
+        code: string;
+        message: string;
+        failedAt: string;
       };
   startedAt: string;
   updatedAt: string;
@@ -284,7 +306,7 @@ export async function dispatchAnalyzeRun(
   repoKey: string,
   command: AnalyzeRunCommand,
 ): Promise<AnalyzeRunView> {
-  if (!isRecord(command) || !['begin', 'seal-plan', 'block'].includes(String(command.kind))) {
+  if (!isRecord(command) || !['begin', 'seal-plan', 'block', 'fail'].includes(String(command.kind))) {
     throw new InvalidAnalyzeRunTransitionError(
       `Invalid analyze-run command kind: ${String(isRecord(command) ? command.kind : undefined)}`,
     );
@@ -294,6 +316,9 @@ export async function dispatchAnalyzeRun(
   }
   if (command.kind === 'block') {
     return blockRun(repoKey, command);
+  }
+  if (command.kind === 'fail') {
+    return failRun(repoKey, command);
   }
 
   const source = validateSource(command.source);
@@ -361,11 +386,58 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
           blockedAt: run.status.blockedAt,
         }
       : null,
+    failure: run.status.state === 'failed'
+      ? {
+          code: run.status.code,
+          message: run.status.message,
+          failedAt: run.status.failedAt,
+        }
+      : null,
     resume: {
       available: false,
       reason: 'successful-results-not-checkpointed',
     },
   };
+}
+
+async function failRun(
+  repoKey: string,
+  command: FailAnalyzeRunCommand,
+): Promise<AnalyzeRunView> {
+  const runId = validateRunId(command.runId);
+  const current = await activeStorage.read(repoKey, runId);
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+  if (current.status.state !== 'running') {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot fail analyze run ${runId} from ${current.status.state}`,
+    );
+  }
+  if (!isRecord(command.error)) {
+    throw new InvalidAnalyzeRunTransitionError(`Analyze run ${runId} has an invalid public error`);
+  }
+
+  const failedAt = validateTimestamp(command.failedAt, 'failedAt');
+  if (
+    Date.parse(failedAt) < Date.parse(current.startedAt) ||
+    (current.plan.state === 'sealed' && Date.parse(failedAt) < Date.parse(current.plan.sealedAt))
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} failure cannot precede its start or sealed plan`,
+    );
+  }
+  const next: StoredAnalyzeRun = {
+    ...current,
+    revision: current.revision + 1,
+    updatedAt: failedAt,
+    status: {
+      state: 'failed',
+      code: validateErrorCode(command.error.code),
+      message: validatePublicErrorMessage(command.error.message),
+      failedAt,
+    },
+  };
+  await activeStorage.compareAndSwap(repoKey, runId, current.revision, next);
+  return toView(next);
 }
 
 async function blockRun(
@@ -382,6 +454,14 @@ async function blockRun(
   }
 
   const blockedAt = validateTimestamp(command.blockedAt, 'blockedAt');
+  if (
+    Date.parse(blockedAt) < Date.parse(current.startedAt) ||
+    Date.parse(blockedAt) < Date.parse(current.plan.sealedAt)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} block cannot precede its start or sealed plan`,
+    );
+  }
   const next: StoredAnalyzeRun = {
     ...current,
     revision: current.revision + 1,
@@ -434,13 +514,19 @@ async function sealPlan(
     );
   }
 
+  const sealedAt = validateTimestamp(command.sealedAt, 'sealedAt');
+  if (Date.parse(sealedAt) < Date.parse(current.startedAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} plan cannot be sealed before the run starts`,
+    );
+  }
   const next: StoredAnalyzeRun = {
     ...current,
     revision: current.revision + 1,
-    updatedAt: validateTimestamp(command.sealedAt, 'sealedAt'),
+    updatedAt: sealedAt,
     plan: {
       state: 'sealed',
-      sealedAt: validateTimestamp(command.sealedAt, 'sealedAt'),
+      sealedAt,
       work,
     },
   };
@@ -514,6 +600,21 @@ function validateFingerprint(value: unknown): string {
   return value;
 }
 
+function validateErrorCode(value: unknown): string {
+  if (typeof value !== 'string' || !/^[A-Z][A-Z0-9_.-]{0,127}$/.test(value)) {
+    throw new Error(`Invalid public analyze-run error code: ${String(value)}`);
+  }
+  return value;
+}
+
+function validatePublicErrorMessage(value: unknown): string {
+  const message = requireNonEmpty(value, 'public error message');
+  if (message.length > 4096 || message.includes('\0')) {
+    throw new Error('Public analyze-run error message is unsafe or too long');
+  }
+  return message;
+}
+
 function readJson(file: string): unknown {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
@@ -560,7 +661,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     typeof value.runId !== 'string' ||
     typeof value.candidateAnalysisId !== 'string' ||
     !isRecord(value.status) ||
-    !['running', 'blocked'].includes(String(value.status.state)) ||
+    !['running', 'blocked', 'failed'].includes(String(value.status.state)) ||
     typeof value.startedAt !== 'string' ||
     typeof value.updatedAt !== 'string' ||
     !['cli', 'dashboard', 'hosted'].includes(String(value.source)) ||
@@ -576,13 +677,35 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const revision = value.revision as number;
   const status = parseStoredStatus(value.status, file);
   const plan = parseStoredPlan(value.plan, file);
-  if (
-    (plan.state === 'unsealed' && (revision !== 0 || status.state !== 'running')) ||
-    (plan.state === 'sealed' && revision < 1) ||
-    (status.state === 'blocked' && (revision < 2 || status.blockedAt !== value.updatedAt))
-  ) {
+  const terminalAt = status.state === 'blocked'
+    ? status.blockedAt
+    : status.state === 'failed'
+      ? status.failedAt
+      : null;
+  const terminalTimestampIsImpossible = terminalAt !== null && (
+    Date.parse(terminalAt) < Date.parse(value.startedAt) ||
+    (plan.state === 'sealed' && Date.parse(terminalAt) < Date.parse(plan.sealedAt))
+  );
+  const lifecycleIsReachable = plan.state === 'unsealed'
+    ? (
+      (status.state === 'running' && revision === 0 && value.updatedAt === value.startedAt) ||
+      (status.state === 'failed' && revision === 1 && status.failedAt === value.updatedAt)
+    )
+    : (
+      Date.parse(plan.sealedAt) >= Date.parse(value.startedAt) && (
+        (status.state === 'running' && revision === 1 && value.updatedAt === plan.sealedAt) ||
+        (status.state === 'blocked' && revision === 2 && status.blockedAt === value.updatedAt) ||
+        (status.state === 'failed' && revision === 2 && status.failedAt === value.updatedAt)
+      )
+    );
+  if (!lifecycleIsReachable || terminalTimestampIsImpossible) {
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
+  /*
+    The exact revision matrix above intentionally describes only schema v1's current commands:
+    begin, seal-plan, block, and fail. Future work-result/finalization commands must migrate or
+    extend the durable schema together with these invariants.
+  */
 
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -610,6 +733,14 @@ function asCorruption(error: unknown, context: string): AnalyzeRunJournalCorrupt
 
 function parseStoredStatus(value: Record<string, unknown>, file: string): StoredAnalyzeRun['status'] {
   if (value.state === 'running') return { state: 'running' };
+  if (value.state === 'failed') {
+    return {
+      state: 'failed',
+      code: validateErrorCode(value.code),
+      message: validatePublicErrorMessage(value.message),
+      failedAt: validateTimestamp(value.failedAt, 'failedAt'),
+    };
+  }
   if (
     value.state !== 'blocked' ||
     value.reason !== 'provider-session-limit' ||

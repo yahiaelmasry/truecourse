@@ -122,6 +122,7 @@ describe('analyze run journal', () => {
       plan: 'unsealed',
       counts: null,
       blocked: null,
+      failure: null,
       resume: {
         available: false,
         reason: 'successful-results-not-checkpointed',
@@ -226,6 +227,236 @@ describe('analyze run journal', () => {
 
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(blocked);
+  });
+
+  it('durably records an ordinary failure before the LLM plan is sealed', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'failed-before-plan-run',
+      candidateAnalysisId: 'failed-before-plan-analysis',
+      startedAt: '2026-07-19T02:30:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'abc789',
+      completedBaselineId: 'completed-analysis-3',
+    });
+
+    const failed = await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'failed-before-plan-run',
+      failedAt: '2026-07-19T02:30:01.000Z',
+      error: {
+        code: 'ANALYZE_FAILED',
+        message: 'Project-aware C# analysis requires a restored solution.',
+      },
+    } as never);
+
+    expect(failed).toMatchObject({
+      revision: 1,
+      state: 'failed',
+      plan: 'unsealed',
+      counts: null,
+      failure: {
+        code: 'ANALYZE_FAILED',
+        message: 'Project-aware C# analysis requires a restored solution.',
+        failedAt: '2026-07-19T02:30:01.000Z',
+      },
+      resume: {
+        available: false,
+        reason: 'successful-results-not-checkpointed',
+      },
+    });
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(failed);
+  });
+
+  it('keeps certified pending counts visible when a planned run fails', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'failed-after-plan-run',
+      candidateAnalysisId: 'failed-after-plan-analysis',
+      startedAt: '2026-07-19T02:45:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'def789',
+      completedBaselineId: null,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'failed-after-plan-run',
+      sealedAt: '2026-07-19T02:45:01.000Z',
+      work: [{ workId: 'analyze:v1:code', inputFingerprint: `sha256:${'5'.repeat(64)}` }],
+    });
+
+    const failed = await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'failed-after-plan-run',
+      failedAt: '2026-07-19T02:45:02.000Z',
+      error: { code: 'ANALYZE_FAILED', message: 'LLM work failed before completion.' },
+    });
+
+    expect(failed).toMatchObject({
+      revision: 2,
+      state: 'failed',
+      plan: 'sealed',
+      counts: { total: 1, pending: 1, succeeded: 0, failed: 0 },
+      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+    });
+  });
+
+  it('rejects failure timestamps that precede the run or its sealed plan', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'backdated-failure-run',
+      candidateAnalysisId: 'backdated-failure-analysis',
+      startedAt: '2026-07-19T03:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'ghi789',
+      completedBaselineId: null,
+    });
+
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'backdated-failure-run',
+      failedAt: '2026-07-19T02:59:59.000Z',
+      error: { code: 'ANALYZE_FAILED', message: 'Backdated failure.' },
+    })).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+  });
+
+  it('rejects a plan timestamp that precedes the run', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'backdated-plan-run',
+      candidateAnalysisId: 'backdated-plan-analysis',
+      startedAt: '2026-07-19T03:05:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'pqr789',
+      completedBaselineId: null,
+    });
+
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'backdated-plan-run',
+      sealedAt: '2026-07-19T03:04:59.000Z',
+      work: [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'7'.repeat(64)}` }],
+    })).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+  });
+
+  it('rejects impossible running-state revisions and timestamps from durable storage', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'impossible-running-history-run',
+      candidateAnalysisId: 'impossible-running-history-analysis',
+      startedAt: '2026-07-19T03:10:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'stu789',
+      completedBaselineId: null,
+    });
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'impossible-running-history-run.json',
+    );
+    const begun = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    fs.writeFileSync(file, JSON.stringify({ ...begun, updatedAt: '2026-07-19T03:10:01.000Z' }));
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+
+    fs.writeFileSync(file, JSON.stringify(begun));
+    resetAnalyzeRunStorage();
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'impossible-running-history-run',
+      sealedAt: '2026-07-19T03:10:01.000Z',
+      work: [{ workId: 'analyze:v1:database', inputFingerprint: `sha256:${'8'.repeat(64)}` }],
+    });
+    const sealed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    fs.writeFileSync(file, JSON.stringify({ ...sealed, revision: 2 }));
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+  });
+
+  it('rejects an impossible unsealed failure revision from durable storage', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'impossible-failure-revision-run',
+      candidateAnalysisId: 'impossible-failure-revision-analysis',
+      startedAt: '2026-07-19T03:15:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'jkl789',
+      completedBaselineId: null,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'impossible-failure-revision-run',
+      failedAt: '2026-07-19T03:15:01.000Z',
+      error: { code: 'ANALYZE_FAILED', message: 'Ordinary failure.' },
+    });
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'impossible-failure-revision-run.json',
+    );
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    stored.revision = 2;
+    fs.writeFileSync(file, JSON.stringify(stored));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+  });
+
+  it('rejects an impossible sealed failure revision from durable storage', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'impossible-sealed-failure-revision-run',
+      candidateAnalysisId: 'impossible-sealed-failure-revision-analysis',
+      startedAt: '2026-07-19T03:30:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'mno789',
+      completedBaselineId: null,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'impossible-sealed-failure-revision-run',
+      sealedAt: '2026-07-19T03:30:01.000Z',
+      work: [{ workId: 'analyze:v1:module', inputFingerprint: `sha256:${'6'.repeat(64)}` }],
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'impossible-sealed-failure-revision-run',
+      failedAt: '2026-07-19T03:30:02.000Z',
+      error: { code: 'ANALYZE_FAILED', message: 'Ordinary failure.' },
+    });
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'impossible-sealed-failure-revision-run.json',
+    );
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    stored.revision = 3;
+    fs.writeFileSync(file, JSON.stringify(stored));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
   });
 
   it('rejects one of two competing transitions instead of losing an update', async () => {
