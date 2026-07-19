@@ -160,6 +160,50 @@ describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () 
     expect(await store.readDiff(REPO)).toBeNull();
   });
 
+  it('reconciles only diffs stale against the active completed baseline', async () => {
+    const store = new PgAnalysisStore(db);
+    const first = snap('a1', '2026-01-01T00:00:00.000Z');
+    await store.writeLatest(REPO, latestFor(first));
+    await store.writeDiff(REPO, { id: 'old', baseAnalysisId: 'older' } as unknown as DiffSnapshot);
+
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('removed-stale');
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('absent');
+
+    const second = snap('a2', '2026-01-02T00:00:00.000Z');
+    await store.writeLatest(REPO, latestFor(second));
+    const current = { id: 'current', baseAnalysisId: second.id } as unknown as DiffSnapshot;
+    await store.writeDiff(REPO, current);
+    // A delayed repair for the first promotion must preserve the newer diff.
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('current');
+    expect(await store.readDiff(REPO)).toEqual(current);
+
+    await store.writeDiff(REPO, {
+      id: 'old-repair',
+      baseAnalysisId: first.id,
+    } as unknown as DiffSnapshot);
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('removed-stale');
+    expect(await store.readDiff(REPO)).toBeNull();
+  });
+
+  it('preserves a diff when no completed baseline exists', async () => {
+    const store = new PgAnalysisStore(db);
+    const diff = { id: 'orphan', baseAnalysisId: 'missing' } as unknown as DiffSnapshot;
+    await store.writeDiff(REPO, diff);
+
+    await expect(store.reconcileDiffWithLatest(REPO)).rejects.toThrow(
+      'Cannot reconcile diff without an active completed baseline',
+    );
+    expect(await store.readDiff(REPO)).toEqual(diff);
+
+    const corrupt = latestFor(snap('corrupt', '2026-01-01T00:00:00.000Z'));
+    corrupt.head = 'wrong-head.json';
+    await store.writeLatest(REPO, corrupt);
+    await expect(store.reconcileDiffWithLatest(REPO)).rejects.toThrow(
+      'Cannot reconcile diff without an active completed baseline',
+    );
+    expect(await store.readDiff(REPO)).toEqual(diff);
+  });
+
   it('promotes the completed baseline transactionally and rejects a stale expectation', async () => {
     const store = new PgAnalysisStore(db);
     const previous = snap('a1', '2026-01-01T00:00:00.000Z');

@@ -11,9 +11,11 @@ import { isDeepStrictEqual } from 'node:util';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { analyses, analysisCurrent, analysisHistory, type EeDb } from '@truecourse/ee-db';
 import {
+  activeCompletedBaselineId,
   buildAnalysisFilename,
   type AnalysisStore,
   type EnsureHistoryEntryResult,
+  type ReconcileDiffResult,
   type WrittenAnalysis,
   validateHistoryEntryForPersistence,
 } from '@truecourse/core/lib/analysis-store';
@@ -82,6 +84,14 @@ export class PgAnalysisStore implements AnalysisStore {
   }
   deleteDiff(repoKey: string): Promise<void> {
     return this.deleteCurrent(repoKey, 'diff');
+  }
+  async reconcileDiffWithLatest(repoKey: string): Promise<ReconcileDiffResult> {
+    const baselineId = activeCompletedBaselineId(await this.readLatest(repoKey));
+    const diff = await this.readDiff(repoKey);
+    if (!diff) return 'absent';
+    if (diff.baseAnalysisId === baselineId) return 'current';
+    await this.deleteDiff(repoKey);
+    return 'removed-stale';
   }
 
   // ---- per-analysis snapshots ----

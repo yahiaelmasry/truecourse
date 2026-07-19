@@ -17,6 +17,7 @@ import {
   latestPath,
   listAnalyses,
   promoteCompletedAnalysisBaseline,
+  reconcileDiffWithLatest,
   readAnalysis,
   readDiff,
   readHistory,
@@ -746,5 +747,47 @@ describe('diff.json lifecycle', () => {
     await deleteDiff(repoPath);
     expect(await readDiff(repoPath)).toBeNull();
     await expect(deleteDiff(repoPath)).resolves.toBeUndefined();   // double-delete safe
+  });
+
+  it('removes only a diff stale against the active completed baseline', async () => {
+    const first = makeSnapshot();
+    await writeLatest(repoPath, makeLatest(first, buildAnalysisFilename(first.id, first.createdAt)));
+
+    await writeDiff(repoPath, makeDiff('older-baseline'));
+    await expect(reconcileDiffWithLatest(repoPath)).resolves.toBe('removed-stale');
+    await expect(reconcileDiffWithLatest(repoPath)).resolves.toBe('absent');
+
+    await writeDiff(repoPath, makeDiff(first.id));
+    await expect(reconcileDiffWithLatest(repoPath)).resolves.toBe('current');
+
+    const second = { ...makeSnapshot(), createdAt: '2026-04-18T14:23:45.123Z' };
+    await writeLatest(repoPath, makeLatest(second, buildAnalysisFilename(second.id, second.createdAt)));
+    const current = makeDiff(second.id);
+    await writeDiff(repoPath, current);
+
+    // A delayed repair from the first promotion must preserve the newer diff.
+    await expect(reconcileDiffWithLatest(repoPath)).resolves.toBe('current');
+    expect(await readDiff(repoPath)).toEqual(current);
+
+    await writeDiff(repoPath, makeDiff(first.id));
+    await expect(reconcileDiffWithLatest(repoPath)).resolves.toBe('removed-stale');
+    expect(await readDiff(repoPath)).toBeNull();
+  });
+
+  it('fails closed without a trustworthy completed baseline', async () => {
+    const diff = makeDiff('missing-baseline');
+    await writeDiff(repoPath, diff);
+
+    await expect(reconcileDiffWithLatest(repoPath)).rejects.toThrow(
+      'Cannot reconcile diff without an active completed baseline',
+    );
+    expect(await readDiff(repoPath)).toEqual(diff);
+
+    const corrupt = makeLatest(makeSnapshot(), 'wrong-head.json');
+    await writeLatest(repoPath, corrupt);
+    await expect(reconcileDiffWithLatest(repoPath)).rejects.toThrow(
+      'Cannot reconcile diff without an active completed baseline',
+    );
+    expect(await readDiff(repoPath)).toEqual(diff);
   });
 });

@@ -115,6 +115,7 @@ export interface WrittenAnalysis {
 }
 
 export type EnsureHistoryEntryResult = 'inserted' | 'present';
+export type ReconcileDiffResult = 'absent' | 'current' | 'removed-stale';
 
 export function validateHistoryEntryForPersistence(entry: HistoryEntry): void {
   let persisted: unknown;
@@ -126,6 +127,26 @@ export function validateHistoryEntryForPersistence(entry: HistoryEntry): void {
   if (!isDeepStrictEqual(persisted, entry)) {
     throw new Error('History entry must be exactly JSON-round-trippable');
   }
+}
+
+export function activeCompletedBaselineId(latest: LatestSnapshot | null): string {
+  const analysis = latest?.analysis;
+  const createdAt = analysis?.createdAt;
+  const canonicalTimestamp = typeof createdAt === 'string'
+    && !Number.isNaN(Date.parse(createdAt))
+    && new Date(createdAt).toISOString() === createdAt;
+  if (
+    !latest
+    || !analysis
+    || analysis.status !== 'completed'
+    || typeof analysis.id !== 'string'
+    || analysis.id.length === 0
+    || !canonicalTimestamp
+    || latest.head !== buildAnalysisFilename(analysis.id, createdAt)
+  ) {
+    throw new Error('Cannot reconcile diff without an active completed baseline');
+  }
+  return analysis.id;
 }
 
 interface StoredCompletedAnalysisPromotion {
@@ -166,6 +187,11 @@ export interface AnalysisStore {
   readDiff(repoPath: string): Promise<DiffSnapshot | null>;
   writeDiff(repoPath: string, diff: DiffSnapshot): Promise<void>;
   deleteDiff(repoPath: string): Promise<void>;
+  /**
+   * Reconcile the canonical diff against the current completed LATEST while
+   * holding the repository lifecycle lock. Never use this for PR-scoped diffs.
+   */
+  reconcileDiffWithLatest(repoPath: string): Promise<ReconcileDiffResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +450,15 @@ class FileAnalysisStore implements AnalysisStore {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
   }
+
+  async reconcileDiffWithLatest(repoPath: string): Promise<ReconcileDiffResult> {
+    const baselineId = activeCompletedBaselineId(this.readLatestUncached(repoPath));
+    const diff = await this.readDiff(repoPath);
+    if (!diff) return 'absent';
+    if (diff.baseAnalysisId === baselineId) return 'current';
+    await this.deleteDiff(repoPath);
+    return 'removed-stale';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +520,9 @@ export const writeDiff = (repoPath: string, diff: DiffSnapshot): Promise<void> =
   active.writeDiff(repoPath, diff);
 export const deleteDiff = (repoPath: string): Promise<void> =>
   active.deleteDiff(repoPath);
+/** Call only for the canonical repository key while holding its lifecycle lock. */
+export const reconcileDiffWithLatest = (repoPath: string): Promise<ReconcileDiffResult> =>
+  active.reconcileDiffWithLatest(repoPath);
 
 /** Clear the LATEST.json in-memory cache (tests). File impl only. */
 export function clearLatestCache(): void {
