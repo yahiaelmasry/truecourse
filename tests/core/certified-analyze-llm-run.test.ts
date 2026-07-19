@@ -878,6 +878,71 @@ describe('certified analyze LLM run', () => {
     await expect(certified.execute(activation)).rejects.toBe(sessionLimit);
   });
 
+  it('reports limiter admission and settlement for every certified work item', async () => {
+    const providerFailure = new Error('queued work stopped by provider circuit');
+    const progress: Array<{
+      event: 'start' | 'done';
+      family: CertifiedAnalyzeLlmWork['family'];
+      started?: boolean;
+      ok?: boolean;
+    }> = [];
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work, options?: { onStart?: () => void }) {
+        if (work.family === 'code') {
+          options?.onStart?.();
+          return outcomeFor(work, { ok: true });
+        }
+        throw providerFailure;
+      },
+    };
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'work-progress',
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+      database: databaseContext,
+    }, adapter);
+    const activation = await activate(certified, 'work-progress');
+
+    await expect(certified.execute(activation, {
+      onWorkStart: (work) => progress.push({ event: 'start', family: work.family }),
+      onWorkDone: (work, state) => progress.push({
+        event: 'done', family: work.family, started: state.started, ok: state.ok,
+      }),
+    })).rejects.toBe(providerFailure);
+
+    expect(progress).toEqual(expect.arrayContaining([
+      { event: 'start', family: 'code' },
+      { event: 'done', family: 'code', started: true, ok: true },
+      { event: 'done', family: 'database', started: false, ok: false },
+    ]));
+    expect(progress).toHaveLength(3);
+  });
+
+  it('does not let a progress observer mask a provider session limit', async () => {
+    const sessionLimit = new LlmSessionLimitError('7pm');
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(_work, options) {
+        options?.onStart?.();
+        throw sessionLimit;
+      },
+    };
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'observer-session-limit',
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, 'observer-session-limit');
+
+    await expect(certified.execute(activation, {
+      onWorkStart: async () => { throw new Error('start observer failed'); },
+      onWorkDone: async () => { throw new Error('done observer failed'); },
+    })).rejects.toBe(sessionLimit);
+  });
+
   it('admits a durable activation receipt only once under concurrent execution', async () => {
     const adapter = new RecordingAdapter();
     const certified = certifyAnalyzeLlmRun({

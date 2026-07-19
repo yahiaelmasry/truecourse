@@ -180,7 +180,11 @@ describe('CLI certified analyze execution adapter', () => {
       provider: 'transport:unverified',
       requestedModel: 'sonnet',
     });
-    const outcomes = await Promise.all(work.map((item) => provider.execute(item)));
+    const started: string[] = [];
+    const outcomes = await Promise.all(work.map((item) => provider.execute(item, {
+      onStart: () => started.push(`${item.family}:${item.mode}`),
+    })));
+    expect(started.sort()).toEqual(work.map((item) => `${item.family}:${item.mode}`).sort());
     expect(outcomes.map(({ family, mode, resultContractId, result }) => ({
       family, mode, resultContractId, result,
     }))).toEqual(plans.map(([family, , mode, planned]) => ({

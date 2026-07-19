@@ -4,6 +4,7 @@ import {
   admitAnalyzeRunPlanExecution,
   type AnalyzeRunPlanActivation,
 } from '../../lib/analyze-run-journal.js';
+import { log } from '../../lib/logger.js';
 import type {
   CodeViolationContext,
   DatabaseViolationContext,
@@ -70,7 +71,23 @@ export interface AnalyzeLlmPlanManifest {
 
 export interface AnalyzeLlmExecutionAdapter {
   readonly execution: Readonly<LlmWorkExecutionIntent>;
-  execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome>;
+  execute(
+    work: CertifiedAnalyzeLlmWork,
+    options?: AnalyzeLlmExecutionOptions,
+  ): Promise<AnalyzeLlmExecutionOutcome>;
+}
+
+export interface AnalyzeLlmExecutionOptions {
+  /** Fires only after the provider concurrency limiter admits this work item. */
+  readonly onStart?: () => void;
+}
+
+export interface AnalyzeLlmWorkProgressObserver {
+  readonly onWorkStart?: (work: CertifiedAnalyzeLlmWork) => void | Promise<void>;
+  readonly onWorkDone?: (
+    work: CertifiedAnalyzeLlmWork,
+    state: Readonly<{ started: boolean; ok: boolean }>,
+  ) => void | Promise<void>;
 }
 
 /** Raw parsed provider output echoed with the certified work identity that produced it. */
@@ -88,6 +105,7 @@ export interface CertifiedAnalyzeLlmRun {
   readonly manifest: AnalyzeLlmPlanManifest;
   execute(
     activation: AnalyzeRunPlanActivation,
+    observer?: AnalyzeLlmWorkProgressObserver,
   ): Promise<readonly {
     readonly work: CertifiedAnalyzeLlmWork;
     readonly result: unknown;
@@ -242,7 +260,10 @@ export function certifyAnalyzeLlmRun(
 
   return Object.freeze({
     manifest,
-    async execute(activation: AnalyzeRunPlanActivation) {
+    async execute(
+      activation: AnalyzeRunPlanActivation,
+      observer?: AnalyzeLlmWorkProgressObserver,
+    ) {
       if (executed) {
         throw new AnalyzeLlmPlanError('already-executed', 'Certified analyze LLM run already executed');
       }
@@ -256,7 +277,7 @@ export function certifyAnalyzeLlmRun(
         },
         () => {
           executed = true;
-          return executeCertifiedWork();
+          return executeCertifiedWork(observer);
         },
       );
       if (!admission.admitted) {
@@ -270,14 +291,37 @@ export function certifyAnalyzeLlmRun(
     },
   });
 
-  async function executeCertifiedWork(): Promise<readonly {
+  async function executeCertifiedWork(
+    observer?: AnalyzeLlmWorkProgressObserver,
+  ): Promise<readonly {
     readonly work: CertifiedAnalyzeLlmWork;
     readonly result: unknown;
   }[]> {
-    const settled = await Promise.allSettled(certifiedWork.map(async (item) => ({
-      work: item,
-      result: certifyExecutionOutcome(item, await adapter.execute(item)).result,
-    })));
+    const settled = await Promise.allSettled(certifiedWork.map(async (item) => {
+      let started = false;
+      let ok = false;
+      let startNotification = Promise.resolve();
+      try {
+        const outcome = await adapter.execute(item, {
+          onStart: () => {
+            if (started) return;
+            started = true;
+            startNotification = notifyProgressObserver(
+              'start',
+              item,
+              () => observer?.onWorkStart?.(item),
+            );
+          },
+        });
+        const result = certifyExecutionOutcome(item, outcome).result;
+        ok = true;
+        return { work: item, result };
+      } finally {
+        await startNotification;
+        await notifyProgressObserver('done', item, () =>
+          observer?.onWorkDone?.(item, Object.freeze({ started, ok })));
+      }
+    }));
     const rejected = settled.find(
       (result): result is PromiseRejectedResult =>
         result.status === 'rejected' && isLlmSessionLimitError(result.reason),
@@ -290,6 +334,20 @@ export function certifyAnalyzeLlmRun(
         work: CertifiedAnalyzeLlmWork;
         result: unknown;
       }>).value);
+  }
+}
+
+async function notifyProgressObserver(
+  event: 'start' | 'done',
+  work: CertifiedAnalyzeLlmWork,
+  notify: () => void | Promise<void> | undefined,
+): Promise<void> {
+  try {
+    await notify();
+  } catch (error) {
+    log.warn(
+      `[LLM] Analyze work ${event} observer failed for ${work.workId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 

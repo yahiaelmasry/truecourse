@@ -71,6 +71,7 @@ import {
 import type { UsageData } from '../usage.service.js';
 import type {
   AnalyzeLlmExecutionAdapter,
+  AnalyzeLlmExecutionOptions,
   AnalyzeLlmExecutionOutcome,
   CertifiedAnalyzeLlmWork,
 } from './certified-analyze-llm-run.js';
@@ -308,20 +309,23 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     });
   }
 
-  async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
+  async execute(
+    work: CertifiedAnalyzeLlmWork,
+    options?: AnalyzeLlmExecutionOptions,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
     let result: unknown;
     switch (work.family) {
       case 'code':
-        result = await this.executePlannedCodeViolationWork(work.planned);
+        result = await this.executePlannedCodeViolationWork(work.planned, options);
         break;
       case 'database':
-        result = await this.executePlannedDatabaseViolationWork(work.planned);
+        result = await this.executePlannedDatabaseViolationWork(work.planned, options);
         break;
       case 'service':
-        result = await this.executePlannedServiceViolationWork(work.planned);
+        result = await this.executePlannedServiceViolationWork(work.planned, options);
         break;
       case 'module':
-        result = await this.executePlannedModuleViolationWork(work.planned);
+        result = await this.executePlannedModuleViolationWork(work.planned, options);
         break;
     }
     return {
