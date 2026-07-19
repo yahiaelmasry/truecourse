@@ -2,7 +2,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { persistFullAnalysis } from '../../packages/core/src/commands/analyze-persist.js';
+import {
+  buildFullAnalysisFinalizationPlan,
+  persistFullAnalysis,
+} from '../../packages/core/src/commands/analyze-persist.js';
 import type { AnalyzeCoreResult } from '../../packages/core/src/commands/analyze-core.js';
 import {
   getProjectBySlug,
@@ -22,6 +25,8 @@ import {
   writeDiff,
   writeLatest,
 } from '../../packages/core/src/lib/analysis-store.js';
+import { validateCompletedAnalysisProjectionIntent } from '../../packages/core/src/lib/completed-analysis-projection.js';
+import { validateCompletedAnalysisPromotion } from '../../packages/core/src/lib/completed-analysis-promotion.js';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
@@ -110,6 +115,30 @@ afterEach(() => {
   for (const repository of repositories.splice(0)) {
     fs.rmSync(repository, { recursive: true, force: true });
   }
+});
+
+describe('full analysis finalization plan', () => {
+  it('builds the exact promotion and projection payloads used by persistence', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-analyze-persist-'));
+    repositories.push(repoPath);
+    const project = await registerProject(repoPath, 'Finalization plan');
+    const core = coreResult();
+
+    const plan = buildFullAnalysisFinalizationPlan(project, core);
+
+    expect(() => validateCompletedAnalysisPromotion(plan.promotion, plan.filename)).not.toThrow();
+    expect(() => validateCompletedAnalysisProjectionIntent(plan.projection)).not.toThrow();
+
+    const result = await persistFullAnalysis(project, core, Date.now());
+
+    await expect(readAnalysis(repoPath, plan.filename)).resolves.toEqual(plan.promotion.snapshot);
+    await expect(readLatest(repoPath)).resolves.toEqual(plan.promotion.latest);
+    await expect(readHistory(repoPath)).resolves.toEqual({
+      analyses: [plan.projection.historyEntry],
+    });
+    expect(result).toMatchObject(plan.result);
+    expect(result.durationMs).toEqual(expect.any(Number));
+  });
 });
 
 describe('full analysis persistence', () => {

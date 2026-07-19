@@ -19,8 +19,14 @@ import {
   writeDiff,
   promoteCompletedAnalysisBaseline,
 } from '../lib/analysis-store.js';
-import { projectCompletedAnalysis } from '../lib/completed-analysis-projection.js';
-import { makeViolationDenormalizer } from '../lib/completed-analysis-promotion.js';
+import {
+  projectCompletedAnalysis,
+  type CompletedAnalysisProjectionIntent,
+} from '../lib/completed-analysis-projection.js';
+import {
+  makeViolationDenormalizer,
+  type CompletedAnalysisPromotion,
+} from '../lib/completed-analysis-promotion.js';
 import { PromotedAnalysisNotInLineageError } from '../lib/completed-analysis-lineage.js';
 import type {
   AnalysisSnapshot,
@@ -48,11 +54,23 @@ export interface PersistFullResult {
   violationsSummary: { total: number; bySeverity: Record<string, number> };
 }
 
-export async function persistFullAnalysis(
+export interface FullAnalysisFinalizationPlan {
+  filename: string;
+  promotion: CompletedAnalysisPromotion;
+  projection: CompletedAnalysisProjectionIntent;
+  result: Omit<PersistFullResult, 'durationMs'>;
+}
+
+/**
+ * Build the exact completed-baseline and projection payloads for one full run.
+ * The legacy writer consumes this plan now; the recovery-safe run finalizer can
+ * consume it when production journal wiring is enabled, without reconstructing
+ * analysis state after provider work.
+ */
+export function buildFullAnalysisFinalizationPlan(
   project: RegistryEntry,
   core: AnalyzeCoreResult,
-  startedAt: number,
-): Promise<PersistFullResult> {
+): FullAnalysisFinalizationPlan {
   const filename = buildAnalysisFilename(core.analysisId, core.now);
 
   const snapshot = persistedJson<AnalysisSnapshot>({
@@ -78,22 +96,43 @@ export async function persistFullAnalysis(
     core.pipelineResult.unchanged,
     core.pipelineResult.added,
   ), 'LATEST snapshot');
-
+  const historyEntry = buildHistoryEntry(snapshot, filename, core.pipelineResult);
   const { bySeverity, total } = summarizeActiveViolations(latest.violations);
-  const projection = {
-    projectSlug: project.slug,
-    promotedSnapshot: snapshot,
-    historyEntry: buildHistoryEntry(snapshot, filename, core.pipelineResult),
-  };
 
-  const promotion = await promoteCompletedAnalysisBaseline(project.path, {
-    expectedBaseline: core.latestBaseline,
-    snapshot,
-    latest,
-  });
+  return {
+    filename,
+    promotion: {
+      expectedBaseline: core.latestBaseline,
+      snapshot,
+      latest,
+    },
+    projection: {
+      projectSlug: project.slug,
+      promotedSnapshot: snapshot,
+      historyEntry,
+    },
+    result: {
+      analysisId: core.analysisId,
+      filename,
+      serviceCount: core.graph.services.length,
+      fileCount: core.analysisResult.fileAnalyses?.length ?? 0,
+      architecture: core.architecture,
+      violationsSummary: { total, bySeverity },
+    },
+  };
+}
+
+export async function persistFullAnalysis(
+  project: RegistryEntry,
+  core: AnalyzeCoreResult,
+  startedAt: number,
+): Promise<PersistFullResult> {
+  const plan = buildFullAnalysisFinalizationPlan(project, core);
+
+  const promotion = await promoteCompletedAnalysisBaseline(project.path, plan.promotion);
   if (promotion.state === 'conflict') {
     try {
-      await projectCompletedAnalysis(project.path, projection);
+      await projectCompletedAnalysis(project.path, plan.projection);
     } catch (error) {
       if (!(error instanceof PromotedAnalysisNotInLineageError)) throw error;
       throw new Error(
@@ -101,17 +140,12 @@ export async function persistFullAnalysis(
       );
     }
   } else {
-    await projectCompletedAnalysis(project.path, projection);
+    await projectCompletedAnalysis(project.path, plan.projection);
   }
 
   return {
-    analysisId: core.analysisId,
-    filename,
-    serviceCount: core.graph.services.length,
-    fileCount: core.analysisResult.fileAnalyses?.length ?? 0,
-    architecture: core.architecture,
+    ...plan.result,
     durationMs: Date.now() - startedAt,
-    violationsSummary: { total, bySeverity },
   };
 }
 
