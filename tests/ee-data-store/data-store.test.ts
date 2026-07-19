@@ -339,6 +339,58 @@ describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () 
     )).toBeNull();
   });
 
+  it('certifies exact completed lineage and rejects ambiguous hosted ancestors', async () => {
+    const store = new PgAnalysisStore(db);
+    const first = snap('lineage-a1', '2026-01-01T00:00:00.000Z');
+    const firstLatest = latestFor(first);
+    await store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: null,
+      snapshot: first,
+      latest: firstLatest,
+    });
+    const second = {
+      ...snap('lineage-a2', '2026-01-02T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: first.id },
+    };
+    await store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: firstLatest,
+      snapshot: second,
+      latest: latestFor(second),
+    });
+
+    await expect(store.certifyCompletedAnalysisLineage(REPO, first)).resolves.toEqual({
+      activeAnalysisId: second.id,
+      generations: 1,
+    });
+
+    const cyclic = {
+      ...snap('cyclic', '2026-01-03T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: 'cyclic' },
+    };
+    await store.writeAnalysis(REPO, cyclic);
+    await store.writeLatest(REPO, latestFor(cyclic));
+    await expect(store.certifyCompletedAnalysisLineage(
+      REPO,
+      snap('not-in-cycle', '2026-01-03T12:00:00.000Z'),
+    )).rejects.toThrow(
+      'Completed-analysis lineage contains a cycle',
+    );
+
+    const duplicateOne = snap('duplicate', '2026-01-04T00:00:00.000Z');
+    const duplicateTwo = snap('duplicate', '2026-01-05T00:00:00.000Z');
+    const current = {
+      ...snap('lineage-a3', '2026-01-06T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: 'duplicate' },
+    };
+    await store.writeAnalysis(REPO, duplicateOne);
+    await store.writeAnalysis(REPO, duplicateTwo);
+    await store.writeAnalysis(REPO, current);
+    await store.writeLatest(REPO, latestFor(current));
+    await expect(store.certifyCompletedAnalysisLineage(REPO, duplicateOne)).rejects.toThrow(
+      'Completed-analysis lineage contains duplicate analysis IDs',
+    );
+  });
+
   it('appendHistory accumulates; removeFromHistory drops by analysis id', async () => {
     const store = new PgAnalysisStore(db);
     expect((await store.readHistory(REPO)).analyses).toEqual([]);

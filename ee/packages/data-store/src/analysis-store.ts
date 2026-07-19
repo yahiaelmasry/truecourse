@@ -20,6 +20,10 @@ import {
   validateHistoryEntryForPersistence,
 } from '@truecourse/core/lib/analysis-store';
 import {
+  certifyCompletedAnalysisLineageSnapshots,
+  type CompletedAnalysisLineageCertification,
+} from '@truecourse/core/lib/completed-analysis-lineage';
+import {
   validateCompletedAnalysisPromotion,
   type AnalysisPromotionOptions,
   type CompletedAnalysisPromotion,
@@ -210,6 +214,28 @@ export class PgAnalysisStore implements AnalysisStore {
 
     if (result.state === 'promoted') await options.faultInjector?.('after-commit');
     return result;
+  }
+
+  async certifyCompletedAnalysisLineage(
+    repoKey: string,
+    promotedSnapshot: AnalysisSnapshot,
+  ): Promise<CompletedAnalysisLineageCertification> {
+    const latest = await this.readLatest(repoKey);
+    activeCompletedBaselineId(latest);
+    const rows = await this.db
+      .select({ filename: analyses.filename, snapshot: analyses.snapshot })
+      .from(analyses)
+      .where(eq(analyses.repoKey, repoKey))
+      .orderBy(asc(analyses.filename));
+    return certifyCompletedAnalysisLineageSnapshots(
+      latest!,
+      promotedSnapshot,
+      rows.map((row) => ({
+        filename: row.filename,
+        snapshot: row.snapshot as AnalysisSnapshot,
+      })),
+      buildAnalysisFilename,
+    );
   }
 
   async readAnalysis(repoKey: string, filename: string): Promise<AnalysisSnapshot | null> {

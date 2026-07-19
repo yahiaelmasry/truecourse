@@ -7,6 +7,7 @@ import {
   analysisFilePath,
   appendHistory,
   buildAnalysisFilename,
+  certifyCompletedAnalysisLineage,
   clearLatestCache,
   deleteAnalysis,
   deleteDiff,
@@ -682,6 +683,145 @@ describe('completed-baseline promotion', () => {
 
     expect(await readLatest(repoPath)).toBeNull();
     expect(await listAnalyses(repoPath)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// completed-analysis lineage certification
+// ---------------------------------------------------------------------------
+
+describe('completed-analysis lineage certification', () => {
+  it('certifies the exact active snapshot and an exact committed ancestor', async () => {
+    const first = makeSnapshot();
+    const firstFilename = buildAnalysisFilename(first.id, first.createdAt);
+    const firstLatest = makeLatest(first, firstFilename);
+    await promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: null,
+      snapshot: first,
+      latest: firstLatest,
+    });
+
+    const second = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: first.id },
+    };
+    const secondFilename = buildAnalysisFilename(second.id, second.createdAt);
+    await promoteCompletedAnalysisBaseline(repoPath, {
+      expectedBaseline: firstLatest,
+      snapshot: second,
+      latest: makeLatest(second, secondFilename),
+    });
+
+    await expect(certifyCompletedAnalysisLineage(repoPath, second)).resolves.toEqual({
+      activeAnalysisId: second.id,
+      generations: 0,
+    });
+    await expect(certifyCompletedAnalysisLineage(repoPath, first)).resolves.toEqual({
+      activeAnalysisId: second.id,
+      generations: 1,
+    });
+  });
+
+  it('rejects same-ID content replacement and a missing ancestor', async () => {
+    const first = makeSnapshot();
+    const { filename: firstFilename } = await writeAnalysis(repoPath, first);
+    await writeLatest(repoPath, makeLatest(first, firstFilename));
+
+    await expect(certifyCompletedAnalysisLineage(repoPath, {
+      ...first,
+      usage: [{
+        provider: 'changed',
+        callType: 'changed',
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 2,
+        costUsd: null,
+        durationMs: 1,
+        createdAt: first.createdAt,
+      }],
+    })).rejects.toThrow('Stored lineage snapshot does not exactly match the promoted snapshot');
+
+    const missingParentId = randomUUID();
+    const current = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: missingParentId },
+    };
+    const { filename: currentFilename } = await writeAnalysis(repoPath, current);
+    await writeLatest(repoPath, makeLatest(current, currentFilename));
+    const missing = { ...makeSnapshot(), id: missingParentId };
+    await expect(certifyCompletedAnalysisLineage(repoPath, missing)).rejects.toThrow(
+      'Completed-analysis lineage is missing an ancestor snapshot',
+    );
+  });
+
+  it('rejects cycles and duplicate analysis IDs in the raw lineage', async () => {
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    const first = {
+      ...makeSnapshot(),
+      id: firstId,
+      violations: { added: [], resolved: [], previousAnalysisId: secondId },
+    };
+    const second = {
+      ...makeSnapshot(),
+      id: secondId,
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: firstId },
+    };
+    const { filename: firstFilename } = await writeAnalysis(repoPath, first);
+    await writeAnalysis(repoPath, second);
+    await writeLatest(repoPath, makeLatest(first, firstFilename));
+    await expect(certifyCompletedAnalysisLineage(repoPath, makeSnapshot())).rejects.toThrow(
+      'Completed-analysis lineage contains a cycle',
+    );
+
+    const duplicateId = randomUUID();
+    const duplicateOne = { ...makeSnapshot(), id: duplicateId };
+    const duplicateTwo = {
+      ...duplicateOne,
+      createdAt: '2026-04-17T14:31:10.000Z',
+    };
+    const current = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:32:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: duplicateId },
+    };
+    await writeAnalysis(repoPath, duplicateOne);
+    await writeAnalysis(repoPath, duplicateTwo);
+    const { filename: currentFilename } = await writeAnalysis(repoPath, current);
+    await writeLatest(repoPath, makeLatest(current, currentFilename));
+    await expect(certifyCompletedAnalysisLineage(repoPath, duplicateOne)).rejects.toThrow(
+      'Completed-analysis lineage contains duplicate analysis IDs',
+    );
+  });
+
+  it('uses an exact retained target as an anchor after an older snapshot is deleted', async () => {
+    const first = makeSnapshot();
+    const { filename: firstFilename } = await writeAnalysis(repoPath, first);
+    const second = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:30:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: first.id },
+    };
+    await writeAnalysis(repoPath, second);
+    const third = {
+      ...makeSnapshot(),
+      createdAt: '2026-04-17T14:31:10.000Z',
+      violations: { added: [], resolved: [], previousAnalysisId: second.id },
+    };
+    const { filename: thirdFilename } = await writeAnalysis(repoPath, third);
+    await writeLatest(repoPath, makeLatest(third, thirdFilename));
+
+    // Dashboard history deletion is allowed to remove an older non-head row.
+    await deleteAnalysis(repoPath, firstFilename);
+    await expect(certifyCompletedAnalysisLineage(repoPath, second)).resolves.toEqual({
+      activeAnalysisId: third.id,
+      generations: 1,
+    });
   });
 });
 

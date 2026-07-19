@@ -20,6 +20,11 @@ import {
   type CompletedAnalysisPromotion,
   type CompletedAnalysisPromotionResult,
 } from './completed-analysis-promotion.js';
+import {
+  certifyCompletedAnalysisLineageSnapshots,
+  type CompletedAnalysisLineageCertification,
+  type StoredCompletedAnalysisSnapshot,
+} from './completed-analysis-lineage.js';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
@@ -178,6 +183,14 @@ export interface AnalysisStore {
     promotion: CompletedAnalysisPromotion,
     options?: AnalysisPromotionOptions,
   ): Promise<CompletedAnalysisPromotionResult>;
+  /**
+   * Prove that an exact snapshot is the active completed baseline or one of
+   * its committed ancestors. The caller must hold the lifecycle lock.
+   */
+  certifyCompletedAnalysisLineage(
+    repoPath: string,
+    promotedSnapshot: AnalysisSnapshot,
+  ): Promise<CompletedAnalysisLineageCertification>;
   readAnalysis(repoPath: string, filename: string): Promise<AnalysisSnapshot | null>;
   listAnalyses(repoPath: string): Promise<string[]>;
   findAnalysisFilename(repoPath: string, analysisId: string): Promise<string | null>;
@@ -232,6 +245,17 @@ class FileAnalysisStore implements AnalysisStore {
     const file = analysisFilePath(repoPath, filename);
     if (!fs.existsSync(file)) return null;
     return JSON.parse(fs.readFileSync(file, 'utf-8')) as AnalysisSnapshot;
+  }
+
+  private readRawLineageSnapshots(repoPath: string): StoredCompletedAnalysisSnapshot[] {
+    const dir = analysesDir(repoPath);
+    if (!fs.existsSync(dir)) return [];
+    const snapshots: StoredCompletedAnalysisSnapshot[] = [];
+    for (const filename of fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort()) {
+      const snapshot = this.readAnalysisUnpatched(repoPath, filename);
+      if (snapshot) snapshots.push({ filename, snapshot });
+    }
+    return snapshots;
   }
 
   private removePromotionMarker(repoPath: string, filename: string): void {
@@ -362,6 +386,20 @@ class FileAnalysisStore implements AnalysisStore {
     await options.faultInjector?.('after-commit');
     this.removePromotionMarker(repoPath, filename);
     return { state: 'promoted', filename };
+  }
+
+  async certifyCompletedAnalysisLineage(
+    repoPath: string,
+    promotedSnapshot: AnalysisSnapshot,
+  ): Promise<CompletedAnalysisLineageCertification> {
+    const latest = this.readLatestUncached(repoPath);
+    activeCompletedBaselineId(latest);
+    return certifyCompletedAnalysisLineageSnapshots(
+      latest!,
+      promotedSnapshot,
+      this.readRawLineageSnapshots(repoPath),
+      buildAnalysisFilename,
+    );
   }
 
   async readAnalysis(repoPath: string, filename: string): Promise<AnalysisSnapshot | null> {
@@ -507,6 +545,12 @@ export const promoteCompletedAnalysisBaseline = (
   options?: AnalysisPromotionOptions,
 ): Promise<CompletedAnalysisPromotionResult> =>
   active.promoteCompletedAnalysisBaseline(repoPath, promotion, options);
+/** Call only while holding the repository lifecycle lock. */
+export const certifyCompletedAnalysisLineage = (
+  repoPath: string,
+  promotedSnapshot: AnalysisSnapshot,
+): Promise<CompletedAnalysisLineageCertification> =>
+  active.certifyCompletedAnalysisLineage(repoPath, promotedSnapshot);
 export const readAnalysis = (repoPath: string, filename: string): Promise<AnalysisSnapshot | null> =>
   active.readAnalysis(repoPath, filename);
 export const listAnalyses = (repoPath: string): Promise<string[]> =>

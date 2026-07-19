@@ -88,6 +88,10 @@
       "types": "./dist/lib/completed-analysis-promotion.d.ts",
       "import": "./dist/lib/completed-analysis-promotion.js"
     },
+    "./lib/completed-analysis-lineage": {
+      "types": "./dist/lib/completed-analysis-lineage.d.ts",
+      "import": "./dist/lib/completed-analysis-lineage.js"
+    },
     "./lib/analyze-run-journal": {
       "types": "./dist/lib/analyze-run-journal.d.ts",
       "import": "./dist/lib/analyze-run-journal.js"
