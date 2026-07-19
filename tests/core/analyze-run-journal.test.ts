@@ -12,6 +12,7 @@ import {
   dispatchAnalyzeRun,
   readAnalyzeRun,
   resetAnalyzeRunStorage,
+  sealAnalyzeRunPlan,
   setAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 
@@ -87,6 +88,68 @@ describe('analyze run journal', () => {
       counts: { total: 1, pending: 1 },
     });
     await expect(readAnalyzeRun(repoKey, 'latest-attempt')).resolves.toEqual(sealed);
+  });
+
+  it('does not cross storage adapters when the active adapter changes during plan sealing', async () => {
+    const repoKey = 'hosted:storage-swap';
+    let storedA: StoredAnalyzeRun | null = null;
+    let storedB: StoredAnalyzeRun | null = null;
+    let swapOnRead = false;
+    let writesA = 0;
+    let writesB = 0;
+    const storageB: AnalyzeRunStorage = {
+      async createLatest(_key, run) {
+        storedB = { ...run, attemptSequence: 1 };
+        return storedB;
+      },
+      async read() { return storedB; },
+      async readLatest() { return storedB; },
+      async compareAndSwap(_key, _runId, _revision, next) {
+        writesB += 1;
+        storedB = next;
+      },
+    };
+    const storageA: AnalyzeRunStorage = {
+      async createLatest(_key, run) {
+        storedA = { ...run, attemptSequence: 1 };
+        return storedA;
+      },
+      async read() {
+        if (swapOnRead) {
+          swapOnRead = false;
+          setAnalyzeRunStorage(storageB);
+        }
+        return storedA;
+      },
+      async readLatest() { return storedA; },
+      async compareAndSwap(_key, _runId, _revision, next) {
+        writesA += 1;
+        storedA = next;
+      },
+    };
+    setAnalyzeRunStorage(storageA);
+    await dispatchAnalyzeRun(repoKey, {
+      kind: 'begin',
+      runId: 'storage-swap-run',
+      candidateAnalysisId: 'storage-swap-analysis',
+      startedAt: '2026-07-19T00:40:00.000Z',
+      source: 'hosted',
+      branch: null,
+      commitHash: null,
+      completedBaselineId: null,
+    });
+    swapOnRead = true;
+
+    await expect(sealAnalyzeRunPlan(repoKey, {
+      kind: 'seal-plan',
+      runId: 'storage-swap-run',
+      sealedAt: '2026-07-19T00:40:01.000Z',
+      work: [{ workId: 'analyze:v1:swap', inputFingerprint: `sha256:${'c'.repeat(64)}` }],
+    })).rejects.toThrow(/storage changed during plan activation/);
+    expect(writesA).toBe(0);
+    expect(writesB).toBe(0);
+    expect(storedA?.plan.state).toBe('unsealed');
+    expect(storedB).toBeNull();
   });
 
   it('durably exposes a new running attempt without changing the completed baseline', async () => {

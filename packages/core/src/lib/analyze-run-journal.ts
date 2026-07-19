@@ -30,6 +30,27 @@ export interface SealAnalyzeRunPlanCommand {
   }>;
 }
 
+declare const analyzeRunPlanActivationBrand: unique symbol;
+
+/**
+ * In-process proof that the journal durably sealed one exact analyze work plan.
+ * The runtime value is issued and tracked privately by this module; a caller
+ * cannot manufacture a valid receipt by satisfying the TypeScript shape.
+ */
+export type AnalyzeRunPlanActivation = Readonly<{
+  [analyzeRunPlanActivationBrand]: true;
+}>;
+
+const analyzeRunPlanActivations = new WeakMap<object, {
+  storage: AnalyzeRunStorage;
+  repoKey: string;
+  scopeKey: string;
+  runId: string;
+  revision: number;
+  workKey: string;
+  claimed: boolean;
+}>();
+
 export interface BlockAnalyzeRunCommand {
   kind: 'block';
   runId: string;
@@ -306,13 +327,14 @@ export async function dispatchAnalyzeRun(
   repoKey: string,
   command: AnalyzeRunCommand,
 ): Promise<AnalyzeRunView> {
+  const storage = activeStorage;
   if (!isRecord(command) || !['begin', 'seal-plan', 'block', 'fail'].includes(String(command.kind))) {
     throw new InvalidAnalyzeRunTransitionError(
       `Invalid analyze-run command kind: ${String(isRecord(command) ? command.kind : undefined)}`,
     );
   }
   if (command.kind === 'seal-plan') {
-    return sealPlan(repoKey, command);
+    return sealPlan(repoKey, command, storage);
   }
   if (command.kind === 'block') {
     return blockRun(repoKey, command);
@@ -322,7 +344,7 @@ export async function dispatchAnalyzeRun(
   }
 
   const source = validateSource(command.source);
-  if (source === 'hosted' && activeStorage instanceof FileAnalyzeRunStorage) {
+  if (source === 'hosted' && storage instanceof FileAnalyzeRunStorage) {
     throw new InvalidAnalyzeRunTransitionError(
       'A hosted analyze run requires an explicitly installed hosted storage adapter',
     );
@@ -341,8 +363,100 @@ export async function dispatchAnalyzeRun(
     completedBaselineId: validateNullableString(command.completedBaselineId, 'completedBaselineId'),
     plan: { state: 'unsealed' },
   };
-  const stored = await activeStorage.createLatest(repoKey, run);
+  const stored = await storage.createLatest(repoKey, run);
   return toView(stored);
+}
+
+/**
+ * Seal a certified plan and return a one-use activation receipt only after the
+ * storage compare-and-swap succeeds. Execution consumes this receipt so a
+ * no-op callback cannot bypass durable plan activation.
+ */
+export async function sealAnalyzeRunPlan(
+  repoKey: string,
+  command: SealAnalyzeRunPlanCommand,
+): Promise<AnalyzeRunPlanActivation> {
+  const storage = activeStorage;
+  const durableRepoKey = activationScopeKey(repoKey, storage);
+  await sealPlan(durableRepoKey, command, storage);
+  assertAnalyzeRunStorage(storage);
+  const stored = await storage.read(durableRepoKey, validateRunId(command.runId));
+  assertAnalyzeRunStorage(storage);
+  if (
+    !stored ||
+    stored.status.state !== 'running' ||
+    stored.plan.state !== 'sealed'
+  ) {
+    throw new AnalyzeRunJournalCorruptError(
+      `Analyze run ${command.runId} was not sealed and running after plan activation`,
+    );
+  }
+  const receipt = Object.freeze({}) as AnalyzeRunPlanActivation;
+  analyzeRunPlanActivations.set(receipt, {
+    storage,
+    repoKey: durableRepoKey,
+    scopeKey: durableRepoKey,
+    runId: stored.runId,
+    revision: stored.revision,
+    workKey: activationWorkKey(stored.plan.work),
+    claimed: false,
+  });
+  return receipt;
+}
+
+export type AnalyzeRunPlanAdmission<T> =
+  | { readonly admitted: false }
+  | { readonly admitted: true; readonly execution: Promise<T> };
+
+/**
+ * Validate durable state and synchronously admit provider work in the same
+ * continuation. A rejected ownership/profile check leaves the receipt intact.
+ * The caller must also hold the repository lifecycle lock required by the
+ * storage contract so another process cannot publish a terminal transition
+ * between the durable read and this in-process admission callback.
+ */
+export async function admitAnalyzeRunPlanExecution<T>(
+  receipt: AnalyzeRunPlanActivation,
+  repoKey: string,
+  runId: string,
+  work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
+  admit: () => Promise<T>,
+): Promise<AnalyzeRunPlanAdmission<T>> {
+  if ((typeof receipt !== 'object' && typeof receipt !== 'function') || receipt === null) {
+    return { admitted: false };
+  }
+  const activation = analyzeRunPlanActivations.get(receipt);
+  if (!activation) return { admitted: false };
+  const storage = activeStorage;
+  const ownershipMatches = (
+    activation.storage === storage &&
+    activation.scopeKey === activationScopeKey(repoKey, storage) &&
+    activation.runId === runId &&
+    activation.workKey === activationWorkKey(work)
+  );
+  if (!ownershipMatches) return { admitted: false };
+
+  const stored = await storage.read(activation.repoKey, activation.runId);
+  assertAnalyzeRunStorage(storage);
+  const stillExecutable = (
+    stored?.status.state === 'running' &&
+    stored.plan.state === 'sealed' &&
+    stored.revision === activation.revision &&
+    activation.workKey === activationWorkKey(stored.plan.work)
+  );
+  if (!stillExecutable) return { admitted: false };
+  if (analyzeRunPlanActivations.get(receipt) !== activation || activation.claimed) {
+    return { admitted: false };
+  }
+  activation.claimed = true;
+  try {
+    const execution = admit();
+    analyzeRunPlanActivations.delete(receipt);
+    return { admitted: true, execution };
+  } catch (error) {
+    activation.claimed = false;
+    throw error;
+  }
 }
 
 export async function readAnalyzeRun(
@@ -480,9 +594,11 @@ async function blockRun(
 async function sealPlan(
   repoKey: string,
   command: SealAnalyzeRunPlanCommand,
+  storage: AnalyzeRunStorage,
 ): Promise<AnalyzeRunView> {
   const runId = validateRunId(command.runId);
-  const current = await activeStorage.read(repoKey, runId);
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
   if (!current) throw new AnalyzeRunNotFoundError(runId);
   if (current.status.state !== 'running' || current.plan.state !== 'unsealed') {
     throw new InvalidAnalyzeRunTransitionError(
@@ -530,8 +646,30 @@ async function sealPlan(
       work,
     },
   };
-  await activeStorage.compareAndSwap(repoKey, runId, current.revision, next);
+  await storage.compareAndSwap(repoKey, runId, current.revision, next);
+  assertAnalyzeRunStorage(storage);
   return toView(next);
+}
+
+function activationWorkKey(
+  work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
+): string {
+  return JSON.stringify(work.map(({ workId, inputFingerprint }) => ({
+    workId,
+    inputFingerprint,
+  })).sort((left, right) => Buffer.from(left.workId).compare(Buffer.from(right.workId))));
+}
+
+function activationScopeKey(repoKey: string, storage: AnalyzeRunStorage): string {
+  return storage instanceof FileAnalyzeRunStorage ? canonicalRepoPath(repoKey) : repoKey;
+}
+
+function assertAnalyzeRunStorage(storage: AnalyzeRunStorage): void {
+  if (activeStorage !== storage) {
+    throw new InvalidAnalyzeRunTransitionError(
+      'Analyze run storage changed during plan activation',
+    );
+  }
 }
 
 function runsDir(repoPath: string): string {
