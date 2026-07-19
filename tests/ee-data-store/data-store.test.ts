@@ -101,6 +101,42 @@ describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () 
     expect((await store.readHistory(REPO)).analyses.map((e) => e.id)).toEqual(['a2']);
   });
 
+  it('ensures one exact history entry and orders late recovery by analysis time', async () => {
+    const store = new PgAnalysisStore(db);
+    const entry = (id: string, createdAt: string): HistoryEntry => ({
+      id,
+      filename: `f-${id}`,
+      createdAt,
+    } as unknown as HistoryEntry);
+    const later = entry('later', '2026-01-02T00:00:00.000Z');
+    const earlier = entry('earlier', '2026-01-01T00:00:00.000Z');
+
+    await expect(store.ensureHistoryEntry(REPO, later)).resolves.toBe('inserted');
+    await expect(store.ensureHistoryEntry(REPO, earlier)).resolves.toBe('inserted');
+    await expect(store.ensureHistoryEntry(REPO, earlier)).resolves.toBe('present');
+    expect((await store.readHistory(REPO)).analyses).toEqual([earlier, later]);
+
+    await expect(store.ensureHistoryEntry(REPO, {
+      ...earlier,
+      filename: 'conflicting.json',
+    })).rejects.toThrow('History entry conflicts with the stored analysis ID');
+  });
+
+  it('rejects history entries that jsonb persistence would change', async () => {
+    const store = new PgAnalysisStore(db);
+    const entry = {
+      id: 'non-json-entry',
+      filename: 'non-json-entry.json',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      metadata: { values: [undefined] },
+    } as unknown as HistoryEntry;
+
+    await expect(store.ensureHistoryEntry(REPO, entry)).rejects.toThrow(
+      'History entry must be exactly JSON-round-trippable',
+    );
+    expect((await store.readHistory(REPO)).analyses).toEqual([]);
+  });
+
   it('keys by repoKey — a different repo sees nothing', async () => {
     const store = new PgAnalysisStore(db);
     await store.writeAnalysis(REPO, snap('a1', '2026-01-01T00:00:00.000Z'));

@@ -96,6 +96,20 @@ export interface WrittenAnalysis {
   snapshot: AnalysisSnapshot;
 }
 
+export type EnsureHistoryEntryResult = 'inserted' | 'present';
+
+export function validateHistoryEntryForPersistence(entry: HistoryEntry): void {
+  let persisted: unknown;
+  try {
+    persisted = JSON.parse(JSON.stringify(entry));
+  } catch {
+    throw new Error('History entry must be exactly JSON-round-trippable');
+  }
+  if (!isDeepStrictEqual(persisted, entry)) {
+    throw new Error('History entry must be exactly JSON-round-trippable');
+  }
+}
+
 /** Pluggable analysis store. File-backed by default; EE injects Postgres/Blob. */
 export interface AnalysisStore {
   readLatest(repoPath: string): Promise<LatestSnapshot | null>;
@@ -108,6 +122,14 @@ export interface AnalysisStore {
   deleteAnalysis(repoPath: string, filename: string): Promise<void>;
   readHistory(repoPath: string): Promise<History>;
   appendHistory(repoPath: string, entry: HistoryEntry): Promise<void>;
+  /**
+   * Idempotently inserts an entry while the caller holds the repository
+   * lifecycle lock. The lock is required across the full recovery operation.
+   */
+  ensureHistoryEntry(
+    repoPath: string,
+    entry: HistoryEntry,
+  ): Promise<EnsureHistoryEntryResult>;
   removeFromHistory(repoPath: string, analysisId: string): Promise<void>;
   readDiff(repoPath: string): Promise<DiffSnapshot | null>;
   writeDiff(repoPath: string, diff: DiffSnapshot): Promise<void>;
@@ -207,6 +229,28 @@ class FileAnalysisStore implements AnalysisStore {
     atomicWriteJson(historyPath(repoPath), history);
   }
 
+  /** Idempotent, recovery-safe history insertion under the analyze lock. */
+  async ensureHistoryEntry(
+    repoPath: string,
+    entry: HistoryEntry,
+  ): Promise<EnsureHistoryEntryResult> {
+    validateHistoryEntryForPersistence(entry);
+    const history = await this.readHistory(repoPath);
+    const matching = history.analyses.filter((candidate) => candidate.id === entry.id);
+    if (matching.length > 0) {
+      if (matching.length !== 1 || !isDeepStrictEqual(matching[0], entry)) {
+        throw new Error('History entry conflicts with the stored analysis ID');
+      }
+      return 'present';
+    }
+    history.analyses.push(entry);
+    history.analyses.sort(
+      (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+    );
+    atomicWriteJson(historyPath(repoPath), history);
+    return 'inserted';
+  }
+
   async removeFromHistory(repoPath: string, analysisId: string): Promise<void> {
     const history = await this.readHistory(repoPath);
     const next = history.analyses.filter((a) => a.id !== analysisId);
@@ -275,6 +319,12 @@ export const readHistory = (repoPath: string): Promise<History> =>
   active.readHistory(repoPath);
 export const appendHistory = (repoPath: string, entry: HistoryEntry): Promise<void> =>
   active.appendHistory(repoPath, entry);
+/** Call only while holding the repository lifecycle lock. */
+export const ensureHistoryEntry = (
+  repoPath: string,
+  entry: HistoryEntry,
+): Promise<EnsureHistoryEntryResult> =>
+  active.ensureHistoryEntry(repoPath, entry);
 export const removeFromHistory = (repoPath: string, analysisId: string): Promise<void> =>
   active.removeFromHistory(repoPath, analysisId);
 export const readDiff = (repoPath: string): Promise<DiffSnapshot | null> =>

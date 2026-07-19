@@ -12,6 +12,7 @@ import {
   deleteDiff,
   deleteLatest,
   diffPath,
+  ensureHistoryEntry,
   historyPath,
   latestPath,
   listAnalyses,
@@ -297,6 +298,38 @@ describe('history.json round-trip', () => {
     await removeFromHistory(repoPath, 'not-there');
     expect((await readHistory(repoPath)).analyses).toEqual([e1]);
     await removeFromHistory(repoPath, e1.id);
+    expect((await readHistory(repoPath)).analyses).toEqual([]);
+  });
+
+  it('ensures one exact entry and keeps out-of-order recovery chronological', async () => {
+    const later = makeHistoryEntry('later', '2026-04-18T00:00:00.000Z');
+    const earlier = makeHistoryEntry('earlier', '2026-04-17T00:00:00.000Z');
+
+    await expect(ensureHistoryEntry(repoPath, later)).resolves.toBe('inserted');
+    await expect(ensureHistoryEntry(repoPath, earlier)).resolves.toBe('inserted');
+    await expect(ensureHistoryEntry(repoPath, earlier)).resolves.toBe('present');
+
+    expect((await readHistory(repoPath)).analyses).toEqual([earlier, later]);
+  });
+
+  it('fails closed when the same analysis ID has different history content', async () => {
+    const entry = makeHistoryEntry('same-id', '2026-04-17T00:00:00.000Z');
+    await ensureHistoryEntry(repoPath, entry);
+
+    await expect(ensureHistoryEntry(repoPath, {
+      ...entry,
+      branch: 'different-branch',
+    })).rejects.toThrow('History entry conflicts with the stored analysis ID');
+    expect((await readHistory(repoPath)).analyses).toEqual([entry]);
+  });
+
+  it('rejects history entries that persistence would change', async () => {
+    const entry = makeHistoryEntry('non-json-entry', '2026-04-17T00:00:00.000Z');
+    entry.metadata = { values: [undefined] };
+
+    await expect(ensureHistoryEntry(repoPath, entry)).rejects.toThrow(
+      'History entry must be exactly JSON-round-trippable',
+    );
     expect((await readHistory(repoPath)).analyses).toEqual([]);
   });
 });

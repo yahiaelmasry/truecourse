@@ -12,7 +12,9 @@ import { analyses, analysisCurrent, analysisHistory, type EeDb } from '@truecour
 import {
   buildAnalysisFilename,
   type AnalysisStore,
+  type EnsureHistoryEntryResult,
   type WrittenAnalysis,
+  validateHistoryEntryForPersistence,
 } from '@truecourse/core/lib/analysis-store';
 import type {
   AnalysisSnapshot,
@@ -131,7 +133,11 @@ export class PgAnalysisStore implements AnalysisStore {
       .select({ entry: analysisHistory.entry })
       .from(analysisHistory)
       .where(eq(analysisHistory.repoKey, repoKey))
-      .orderBy(asc(analysisHistory.id));
+      .orderBy(
+        asc(analysisHistory.createdAt),
+        asc(analysisHistory.analysisId),
+        asc(analysisHistory.id),
+      );
     return { analyses: rows.map((r) => r.entry as HistoryEntry) };
   }
 
@@ -139,6 +145,31 @@ export class PgAnalysisStore implements AnalysisStore {
     await this.db
       .insert(analysisHistory)
       .values({ repoKey, analysisId: entry.id, entry, createdAt: entry.createdAt });
+  }
+
+  /** Idempotent, recovery-safe history insertion under the repository lock. */
+  async ensureHistoryEntry(
+    repoKey: string,
+    entry: HistoryEntry,
+  ): Promise<EnsureHistoryEntryResult> {
+    validateHistoryEntryForPersistence(entry);
+    const matching = await this.db
+      .select({ entry: analysisHistory.entry })
+      .from(analysisHistory)
+      .where(and(
+        eq(analysisHistory.repoKey, repoKey),
+        eq(analysisHistory.analysisId, entry.id),
+      ));
+    if (matching.length > 0) {
+      if (matching.length !== 1 || !isDeepStrictEqual(matching[0].entry, entry)) {
+        throw new Error('History entry conflicts with the stored analysis ID');
+      }
+      return 'present';
+    }
+    await this.db
+      .insert(analysisHistory)
+      .values({ repoKey, analysisId: entry.id, entry, createdAt: entry.createdAt });
+    return 'inserted';
   }
 
   async removeFromHistory(repoKey: string, analysisId: string): Promise<void> {
