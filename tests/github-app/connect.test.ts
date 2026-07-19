@@ -41,6 +41,7 @@ const stubRegistry: RegistryStore = {
   unregisterProject: async () => false,
   touchProject: async () => {},
   setLastAnalyzed: async () => {},
+  ensureLastAnalyzed: async () => 'untracked',
 };
 
 beforeEach(() => {

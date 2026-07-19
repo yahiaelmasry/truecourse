@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { atomicWriteJson } from '../lib/atomic-write.js';
 import { ensureRepoTruecourseDir, getGlobalDir, getRegistryPath, getRepoTruecourseDir } from './paths.js';
 
 export interface RegistryEntry {
@@ -46,6 +47,21 @@ interface RegistryFile {
   projects: RegistryEntry[];
 }
 
+export type EnsureLastAnalyzedResult = 'updated' | 'present' | 'superseded' | 'untracked';
+
+export function validateLastAnalyzedTimestamp(
+  isoTimestamp: string,
+  label = 'lastAnalyzed',
+): void {
+  if (
+    typeof isoTimestamp !== 'string'
+    || Number.isNaN(Date.parse(isoTimestamp))
+    || new Date(isoTimestamp).toISOString() !== isoTimestamp
+  ) {
+    throw new Error(`${label} must be a canonical ISO timestamp`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Store interface
 // ---------------------------------------------------------------------------
@@ -60,6 +76,11 @@ export interface RegistryStore {
   unregisterProject(slug: string): Promise<boolean>;
   touchProject(slug: string): Promise<void>;
   setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void>;
+  /** Call while holding the repository lifecycle lock. */
+  ensureLastAnalyzed?(
+    slug: string,
+    isoTimestamp: string,
+  ): Promise<EnsureLastAnalyzedResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,20 +88,48 @@ export interface RegistryStore {
 // ---------------------------------------------------------------------------
 
 class FileRegistryStore implements RegistryStore {
-  private loadRaw(): RegistryFile {
-    const file = getRegistryPath();
-    if (!fs.existsSync(file)) return { projects: [] };
+  private async withMutationLock<T>(operation: () => T): Promise<T> {
+    fs.mkdirSync(getGlobalDir(), { recursive: true });
+    const lockPath = `${getRegistryPath()}.lock`;
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx');
+        try {
+          fs.writeSync(fd, `${process.pid}\n${new Date().toISOString()}\n`);
+        } catch (error) {
+          fs.unlinkSync(lockPath);
+          throw error;
+        } finally {
+          fs.closeSync(fd);
+        }
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        if (Date.now() >= deadline) {
+          throw new Error(`Project registry is locked; remove ${lockPath} if no process owns it`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+
     try {
-      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<RegistryFile>;
-      return { projects: parsed.projects ?? [] };
-    } catch {
-      return { projects: [] };
+      return operation();
+    } finally {
+      fs.unlinkSync(lockPath);
     }
   }
 
+  private loadRaw(): RegistryFile {
+    const file = getRegistryPath();
+    if (!fs.existsSync(file)) return { projects: [] };
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<RegistryFile>;
+    if (!Array.isArray(parsed.projects)) throw new Error('Project registry is malformed');
+    return { projects: parsed.projects };
+  }
+
   private persist(file: RegistryFile): void {
-    fs.mkdirSync(getGlobalDir(), { recursive: true });
-    fs.writeFileSync(getRegistryPath(), JSON.stringify(file, null, 2), 'utf-8');
+    atomicWriteJson(getRegistryPath(), file);
   }
 
   async readRegistry(): Promise<RegistryEntry[]> {
@@ -88,12 +137,13 @@ class FileRegistryStore implements RegistryStore {
   }
 
   async pruneStaleProjects(): Promise<RegistryEntry[]> {
-    const file = this.loadRaw();
-    const alive = file.projects.filter((entry) => fs.existsSync(getRepoTruecourseDir(entry.path)));
-    if (alive.length !== file.projects.length) {
-      this.persist({ projects: alive });
-    }
-    return alive;
+    if (!fs.existsSync(getRegistryPath())) return [];
+    return this.withMutationLock(() => {
+      const file = this.loadRaw();
+      const alive = file.projects.filter((entry) => fs.existsSync(getRepoTruecourseDir(entry.path)));
+      if (alive.length !== file.projects.length) this.persist({ projects: alive });
+      return alive;
+    });
   }
 
   async getProjectBySlug(slug: string): Promise<RegistryEntry | null> {
@@ -108,51 +158,84 @@ class FileRegistryStore implements RegistryStore {
   async registerProject(repoPath: string, displayName?: string): Promise<RegistryEntry> {
     const normalized = path.resolve(repoPath);
     ensureRepoTruecourseDir(normalized);
-    const file = this.loadRaw();
-    const name = displayName || path.basename(normalized);
-    const existing = file.projects.find((p) => p.path === normalized);
+    return this.withMutationLock(() => {
+      const file = this.loadRaw();
+      const name = displayName || path.basename(normalized);
+      const existing = file.projects.find((p) => p.path === normalized);
 
-    if (existing) {
-      existing.name = name;
-      existing.lastOpened = new Date().toISOString();
+      if (existing) {
+        existing.name = name;
+        existing.lastOpened = new Date().toISOString();
+        this.persist(file);
+        return existing;
+      }
+
+      const entry: RegistryEntry = {
+        slug: slugify(name, file.projects.map((p) => p.slug)),
+        name,
+        path: normalized,
+        lastOpened: new Date().toISOString(),
+      };
+      file.projects.push(entry);
       this.persist(file);
-      return existing;
-    }
-
-    const entry: RegistryEntry = {
-      slug: slugify(name, file.projects.map((p) => p.slug)),
-      name,
-      path: normalized,
-      lastOpened: new Date().toISOString(),
-    };
-    file.projects.push(entry);
-    this.persist(file);
-    return entry;
+      return entry;
+    });
   }
 
   async unregisterProject(slug: string): Promise<boolean> {
-    const file = this.loadRaw();
-    const before = file.projects.length;
-    file.projects = file.projects.filter((p) => p.slug !== slug);
-    if (file.projects.length === before) return false;
-    this.persist(file);
-    return true;
+    if (!fs.existsSync(getRegistryPath())) return false;
+    if (!this.loadRaw().projects.some((entry) => entry.slug === slug)) return false;
+    return this.withMutationLock(() => {
+      const file = this.loadRaw();
+      const before = file.projects.length;
+      file.projects = file.projects.filter((p) => p.slug !== slug);
+      if (file.projects.length === before) return false;
+      this.persist(file);
+      return true;
+    });
   }
 
   async touchProject(slug: string): Promise<void> {
-    const file = this.loadRaw();
-    const entry = file.projects.find((p) => p.slug === slug);
-    if (!entry) return;
-    entry.lastOpened = new Date().toISOString();
-    this.persist(file);
+    if (!fs.existsSync(getRegistryPath())) return;
+    if (!this.loadRaw().projects.some((entry) => entry.slug === slug)) return;
+    await this.withMutationLock(() => {
+      const file = this.loadRaw();
+      const entry = file.projects.find((p) => p.slug === slug);
+      if (!entry) return;
+      entry.lastOpened = new Date().toISOString();
+      this.persist(file);
+    });
+  }
+
+  async ensureLastAnalyzed(
+    slug: string,
+    isoTimestamp: string,
+  ): Promise<EnsureLastAnalyzedResult> {
+    validateLastAnalyzedTimestamp(isoTimestamp);
+    return this.withMutationLock(() => {
+      const file = this.loadRaw();
+      const entry = file.projects.find((p) => p.slug === slug);
+      if (!entry) throw new Error('Cannot project lastAnalyzed for an untracked project');
+      if (entry.lastAnalyzed) {
+        validateLastAnalyzedTimestamp(entry.lastAnalyzed, 'Stored lastAnalyzed');
+        if (entry.lastAnalyzed === isoTimestamp) return 'present';
+        if (entry.lastAnalyzed > isoTimestamp) return 'superseded';
+      }
+      entry.lastAnalyzed = isoTimestamp;
+      this.persist(file);
+      return 'updated';
+    });
   }
 
   async setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void> {
-    const file = this.loadRaw();
-    const entry = file.projects.find((p) => p.slug === slug);
-    if (!entry) return;
-    entry.lastAnalyzed = isoTimestamp;
-    this.persist(file);
+    if (!fs.existsSync(getRegistryPath())) return;
+    if (!this.loadRaw().projects.some((entry) => entry.slug === slug)) return;
+    try {
+      await this.ensureLastAnalyzed(slug, isoTimestamp);
+    } catch (error) {
+      if ((error as Error).message === 'Cannot project lastAnalyzed for an untracked project') return;
+      throw error;
+    }
   }
 }
 
@@ -200,10 +283,20 @@ export const unregisterProject = (slug: string): Promise<boolean> =>
 export const touchProject = (slug: string): Promise<void> => active.touchProject(slug);
 
 /**
- * Record a successful analysis completion for `slug`. Called once per
- * analyze run from `analyzeInProcess`. This is the ONLY write path for
- * `lastAnalyzed` — everything else treats it as read-only.
+ * Idempotently project a successful analysis completion while holding the
+ * repository lifecycle lock. A delayed older recovery never lowers the value.
  */
+export const ensureLastAnalyzed = (
+  slug: string,
+  isoTimestamp: string,
+): Promise<EnsureLastAnalyzedResult> => {
+  if (!active.ensureLastAnalyzed) {
+    return Promise.reject(new Error('Active registry store does not support monotonic projection'));
+  }
+  return active.ensureLastAnalyzed(slug, isoTimestamp);
+};
+
+/** Backward-compatible command API, including unknown-project no-op behavior. */
 export const setLastAnalyzed = (slug: string, isoTimestamp: string): Promise<void> =>
   active.setLastAnalyzed(slug, isoTimestamp);
 

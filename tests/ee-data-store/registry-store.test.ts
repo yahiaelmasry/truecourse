@@ -50,4 +50,13 @@ describe('GhReposRegistryStore', () => {
       expect.objectContaining({ path: 'acme/api', defaultBranch: 'develop' }),
     ]);
   });
+
+  it('reports that lastAnalyzed is intentionally untracked', async () => {
+    await link('acme/api', 'main');
+
+    await expect(store.ensureLastAnalyzed(
+      'acme-api',
+      '2026-05-01T00:00:00.000Z',
+    )).resolves.toBe('untracked');
+  });
 });

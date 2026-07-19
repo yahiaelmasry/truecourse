@@ -11,7 +11,13 @@
 
 import { asc, eq } from 'drizzle-orm';
 import { registry, type EeDb } from '@truecourse/ee-db';
-import { slugify, type RegistryEntry, type RegistryStore } from '@truecourse/core/config/registry';
+import {
+  slugify,
+  validateLastAnalyzedTimestamp,
+  type EnsureLastAnalyzedResult,
+  type RegistryEntry,
+  type RegistryStore,
+} from '@truecourse/core/config/registry';
 
 interface RegistryRow {
   slug: string;
@@ -105,10 +111,31 @@ export class PgRegistryStore implements RegistryStore {
       .where(eq(registry.slug, slug));
   }
 
-  async setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void> {
+  async ensureLastAnalyzed(
+    slug: string,
+    isoTimestamp: string,
+  ): Promise<EnsureLastAnalyzedResult> {
+    validateLastAnalyzedTimestamp(isoTimestamp);
+    const current = await this.getProjectBySlug(slug);
+    if (!current) throw new Error('Cannot project lastAnalyzed for an untracked project');
+    if (current.lastAnalyzed) {
+      validateLastAnalyzedTimestamp(current.lastAnalyzed, 'Stored lastAnalyzed');
+      if (current.lastAnalyzed === isoTimestamp) return 'present';
+      if (current.lastAnalyzed > isoTimestamp) return 'superseded';
+    }
     await this.db
       .update(registry)
       .set({ lastAnalyzed: isoTimestamp })
       .where(eq(registry.slug, slug));
+    return 'updated';
+  }
+
+  async setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void> {
+    try {
+      await this.ensureLastAnalyzed(slug, isoTimestamp);
+    } catch (error) {
+      if ((error as Error).message === 'Cannot project lastAnalyzed for an untracked project') return;
+      throw error;
+    }
   }
 }
