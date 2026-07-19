@@ -28,6 +28,8 @@ import {
   FlowEnrichmentOutputSchema,
 } from './schemas.js';
 import {
+  type CodeViolationLifecycleOutput,
+  type CodeViolationOutput,
   type PreparedCodeOwnership,
 } from './prepared-code-violation-request.js';
 import type {
@@ -52,7 +54,10 @@ import {
   serializePreparedRequestSchema,
   type PreparedLlmRequest,
 } from './prepared-request.js';
-import { planCodeViolationWork } from './code-work-planner.js';
+import {
+  planCodeViolationWork,
+  type PlannedCodeViolationWork,
+} from './code-work-planner.js';
 import {
   planDatabaseViolationWork,
   type PlannedDatabaseViolationWork,
@@ -581,6 +586,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     > & { readonly label: string; readonly timeoutMs: number };
     extraArgs: string[];
     startMessage: string;
+    accept?: (result: T) => void;
     doneMessage: (result: T, durationMs: number) => string;
     onStart?: () => void;
   }): Promise<T> {
@@ -595,6 +601,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
       timeoutMs: options.request.timeoutMs,
       onStart: options.onStart,
     });
+    options.accept?.(data);
     const dur = Date.now() - t0;
     log.info(options.doneMessage(data, dur));
     this.collectUsage(options.callType, cliUsage, dur);
@@ -736,6 +743,54 @@ export abstract class BaseCLIProvider implements LLMProvider {
       startMessage: `[CLI] Module violations call starting (${request.ownership.moduleNames.length} modules)...`,
       doneMessage: (result, dur) =>
         `[CLI] Module violations call done in ${dur}ms — ${result.violations.length} violations`,
+      onStart: opts?.onStart,
+    });
+  }
+
+  /** Execute and certify one already-planned code request without rebuilding its source context. */
+  protected async executePlannedCodeViolationWork(
+    planned: PlannedCodeViolationWork,
+    opts?: { onStart?: () => void },
+  ): Promise<CodeViolationOutput | CodeViolationLifecycleOutput> {
+    const request = planned.request;
+    const codeExtraArgs = request.toolPolicy === 'read'
+      ? ['--allowedTools', 'Read']
+      : ['--tools', ''];
+    if (request.resultContractId === 'analyze.code-lifecycle@1') {
+      const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
+      return this.executePreparedViolationWork({
+        callType: 'code',
+        attemptIdPrefix: 'llm.code.attempt',
+        workId: planned.workId,
+        inputFingerprint: planned.inputFingerprint,
+        request,
+        extraArgs: codeExtraArgs,
+        startMessage: `[CLI] Code violations call starting (${request.ownership.fileCount} files, lifecycle)...`,
+        accept: (result) => {
+          certifyCodeResultOwnership(request.ownership, result.newViolations);
+          certifyCodeLifecyclePartition(
+            result.resolvedViolationIds,
+            result.unchangedViolationIds,
+            idMap,
+          );
+          certifyNoPriorCodeCollision(request.ownership, result.newViolations);
+        },
+        doneMessage: (result, dur) =>
+          `[CLI] Code violations call done in ${dur}ms — new: ${result.newViolations.length}, resolved: ${result.resolvedViolationIds.length}, unchanged: ${result.unchangedViolationIds.length}`,
+        onStart: opts?.onStart,
+      });
+    }
+    return this.executePreparedViolationWork({
+      callType: 'code',
+      attemptIdPrefix: 'llm.code.attempt',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      request,
+      extraArgs: codeExtraArgs,
+      startMessage: `[CLI] Code violations call starting (${request.ownership.fileCount} files, first-run)...`,
+      accept: (result) => certifyCodeResultOwnership(request.ownership, result.violations),
+      doneMessage: (result, dur) =>
+        `[CLI] Code violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
     });
   }
@@ -1136,35 +1191,10 @@ export abstract class BaseCLIProvider implements LLMProvider {
       repositoryRoot: this._repoPath,
     });
     const request = planned.request;
-    // Keep transport attempts unique. A pre-execution plan has no served
-    // provider/model receipt (and Read-enabled work has no read-set receipt),
-    // so agentTransport must not resume a prior response yet.
-    const transportId = `llm.code.attempt:${randomUUID()}`;
-    const hasExisting = request.resultContractId === 'analyze.code-lifecycle@1';
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
+    const object = await this.executePlannedCodeViolationWork(planned, opts);
 
-    log.info(`[CLI] Code violations call starting (${request.ownership.fileCount} files, ${hasExisting ? 'lifecycle' : 'first-run'})...`);
-    const t0 = Date.now();
-
-    // Only give Read tool access when files have real paths to read
-    const codeExtraArgs = request.toolPolicy === 'read' ? ['--allowedTools', 'Read'] : ['--tools', ''];
-
-    if (hasExisting) {
-      const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
-        id: transportId, workId: planned.workId, inputFingerprint: planned.inputFingerprint,
-        extraArgs: codeExtraArgs, label: request.label, timeoutMs: request.timeoutMs, onStart: opts?.onStart,
-      });
-      certifyCodeResultOwnership(request.ownership, object.newViolations);
-      certifyCodeLifecyclePartition(
-        object.resolvedViolationIds,
-        object.unchangedViolationIds,
-        idMap,
-      );
-      certifyNoPriorCodeCollision(request.ownership, object.newViolations);
-      const dur = Date.now() - t0;
-      log.info(`[CLI] Code violations call done in ${dur}ms — new: ${object.newViolations.length}, resolved: ${object.resolvedViolationIds.length}, unchanged: ${object.unchangedViolationIds.length}`);
-      this.collectUsage('code', cliUsage, dur);
-
+    if ('newViolations' in object) {
       return {
         violations: object.newViolations.map((v) => ({
           ruleKey: v.ruleKey,
@@ -1181,15 +1211,6 @@ export abstract class BaseCLIProvider implements LLMProvider {
         unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
       };
     }
-
-    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
-      id: transportId, workId: planned.workId, inputFingerprint: planned.inputFingerprint,
-      extraArgs: codeExtraArgs, label: request.label, timeoutMs: request.timeoutMs, onStart: opts?.onStart,
-    });
-    certifyCodeResultOwnership(request.ownership, object.violations);
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Code violations call done in ${dur}ms — ${object.violations.length} violations`);
-    this.collectUsage('code', cliUsage, dur);
 
     return {
       violations: object.violations.map((v) => ({

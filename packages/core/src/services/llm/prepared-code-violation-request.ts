@@ -27,8 +27,8 @@ export interface PreparedCodeOwnership {
   }[];
 }
 
-type CodeViolationOutput = ReturnType<typeof CodeViolationOutputSchema.parse>;
-type CodeViolationLifecycleOutput = ReturnType<typeof CodeViolationLifecycleOutputSchema.parse>;
+export type CodeViolationOutput = ReturnType<typeof CodeViolationOutputSchema.parse>;
+export type CodeViolationLifecycleOutput = ReturnType<typeof CodeViolationLifecycleOutputSchema.parse>;
 
 export type PreparedCodeViolationRequest =
   | (PreparedLlmRequest<CodeViolationOutput> & {
