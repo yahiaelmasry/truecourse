@@ -30,13 +30,22 @@ import {
 import {
   type PreparedCodeOwnership,
 } from './prepared-code-violation-request.js';
+import type {
+  PreparedLifecycleServiceViolationRequest,
+  PreparedNormalServiceViolationRequest,
+  ServiceLifecycleViolationOutput,
+  ServiceViolationOutput,
+} from './prepared-service-violation-request.js';
 import {
   serializePreparedRequestSchema,
   type PreparedLlmRequest,
 } from './prepared-request.js';
 import { planCodeViolationWork } from './code-work-planner.js';
 import { planDatabaseViolationWork } from './database-work-planner.js';
-import { planServiceViolationWork } from './service-work-planner.js';
+import {
+  planServiceViolationWork,
+  type PlannedServiceViolationWork,
+} from './service-work-planner.js';
 import { planModuleViolationWork } from './module-work-planner.js';
 import type { UsageData } from '../usage.service.js';
 import type {
@@ -543,6 +552,60 @@ export abstract class BaseCLIProvider implements LLMProvider {
   // LLMProvider implementation
   // ---------------------------------------------------------------------------
 
+  /** Execute one already-planned service request without rebuilding its source context. */
+  protected executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork<PreparedNormalServiceViolationRequest>,
+    opts?: { onStart?: () => void },
+  ): Promise<ServiceViolationOutput>;
+  protected executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork<PreparedLifecycleServiceViolationRequest>,
+    opts?: { onStart?: () => void },
+  ): Promise<ServiceLifecycleViolationOutput>;
+  protected executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork,
+    opts?: { onStart?: () => void },
+  ): Promise<ServiceViolationOutput | ServiceLifecycleViolationOutput>;
+  protected async executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork,
+    opts?: { onStart?: () => void },
+  ): Promise<ServiceViolationOutput | ServiceLifecycleViolationOutput> {
+    const request = planned.request;
+    const lifecycle = request.resultContractId === 'analyze.service-lifecycle@1';
+
+    log.info(lifecycle
+      ? '[CLI] Lifecycle service call starting...'
+      : '[CLI] Service violations call starting...');
+    const t0 = Date.now();
+    const execute = async <T>(
+      prepared: Pick<
+        PreparedLlmRequest<T>,
+        'stage' | 'system' | 'prompt' | 'schemaJson' | 'responseFormat' | 'parse'
+      > & { readonly label: string; readonly timeoutMs: number },
+      summary: (result: T, durationMs: number) => string,
+    ): Promise<T> => {
+      const { data, usage: cliUsage } = await this.spawnPreparedAndParse(prepared, {
+        id: `llm.service.attempt:${randomUUID()}`,
+        workId: planned.workId,
+        inputFingerprint: planned.inputFingerprint,
+        extraArgs: ['--tools', ''],
+        label: prepared.label,
+        timeoutMs: prepared.timeoutMs,
+        onStart: opts?.onStart,
+      });
+      const dur = Date.now() - t0;
+      log.info(summary(data, dur));
+      this.collectUsage('service', cliUsage, dur);
+      return data;
+    };
+
+    if (request.resultContractId === 'analyze.service-lifecycle@1') {
+      return execute(request, (result, dur) =>
+        `[CLI] Lifecycle service call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`);
+    }
+    return execute(request, (result, dur) =>
+      `[CLI] Service violations call done in ${dur}ms — ${result.violations.length} violations`);
+  }
+
   async generateServiceViolations(
     context: ServiceViolationContext,
     opts?: { onStart?: () => void },
@@ -554,20 +617,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
     const request = planned.request;
     const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
 
-    log.info('[CLI] Service violations call starting...');
-    const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
-      id: `llm.service.attempt:${randomUUID()}`,
-      workId: planned.workId,
-      inputFingerprint: planned.inputFingerprint,
-      extraArgs: ['--tools', ''],
-      label: request.label,
-      timeoutMs: request.timeoutMs,
-      onStart: opts?.onStart,
-    });
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Service violations call done in ${dur}ms — ${object.violations.length} violations`);
-    this.collectUsage('service', cliUsage, dur);
+    const object = await this.executePlannedServiceViolationWork(planned, opts);
 
     return {
       violations: object.violations.map((v) => ({
@@ -803,21 +853,9 @@ export abstract class BaseCLIProvider implements LLMProvider {
           const request = planned.request;
           const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
           idMaps.service = idMap;
-          log.info('[CLI] Lifecycle service call starting...');
-          const t0 = Date.now();
-          const { data: object, usage: cliUsage } = await this.spawnPreparedAndParse(request, {
-            id: `llm.service.attempt:${randomUUID()}`,
-            workId: planned.workId,
-            inputFingerprint: planned.inputFingerprint,
-            extraArgs: ['--tools', ''],
-            label: request.label,
-            timeoutMs: request.timeoutMs,
+          return this.executePlannedServiceViolationWork(planned, {
             onStart: () => onCallStart?.('service'),
           });
-          const dur = Date.now() - t0;
-          log.info(`[CLI] Lifecycle service call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
-          this.collectUsage('service', cliUsage, dur);
-          return object;
         })()]);
       } else {
         promises.push(['service-normal', this.generateServiceViolations(ctx, {

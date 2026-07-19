@@ -23,8 +23,8 @@ export interface PreparedServiceOwnership {
   }[];
 }
 
-type ServiceViolationOutput = ReturnType<typeof ServiceViolationOutputSchema.parse>;
-type ServiceLifecycleViolationOutput = ReturnType<typeof LifecycleServiceOutputSchema.parse>;
+export type ServiceViolationOutput = ReturnType<typeof ServiceViolationOutputSchema.parse>;
+export type ServiceLifecycleViolationOutput = ReturnType<typeof LifecycleServiceOutputSchema.parse>;
 
 interface PreparedServiceRequestMetadata {
   readonly system: '';
