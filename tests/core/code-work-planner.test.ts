@@ -71,6 +71,76 @@ const execution = {
 } as const;
 
 describe('code work planner', () => {
+  it('rejects repository inputs that escape the certified root', () => {
+    const outsideFile = lifecycleContext('/checkout/one');
+    outsideFile.files[0].path = '/checkout/other/orders.ts';
+    expect(() => planCodeViolationWork(outsideFile, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/outside repository root/);
+
+    const traversal = lifecycleContext('/checkout/one');
+    traversal.sources![0].path = '../outside.ts';
+    expect(() => planCodeViolationWork(traversal, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/outside repository root/);
+  });
+
+  it('rejects duplicate paths and ranges after repository-path normalization', () => {
+    const duplicateFiles = lifecycleContext('/checkout/one');
+    duplicateFiles.files.push({
+      ...duplicateFiles.files[0],
+      path: '\\checkout\\one\\src\\orders.ts',
+    });
+    expect(() => planCodeViolationWork(duplicateFiles, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/duplicate code file path/);
+
+    const duplicateSources = lifecycleContext('/checkout/one');
+    duplicateSources.sources!.push({
+      ...duplicateSources.sources![0],
+      path: '\\checkout\\one\\src\\orders.ts',
+    });
+    expect(() => planCodeViolationWork(duplicateSources, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/duplicate code source path/);
+
+    const duplicateScopes = lifecycleContext('/checkout/one');
+    duplicateScopes.sourceScopes.push({
+      path: '\\checkout\\one\\src\\orders.ts',
+      ranges: [{ lineStart: 1, lineEnd: 1 }],
+    });
+    expect(() => planCodeViolationWork(duplicateScopes, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/duplicate code source-scope path/);
+
+    const duplicateRanges = lifecycleContext('/checkout/one');
+    duplicateRanges.sourceScopes[0].ranges.push({ lineStart: 1, lineEnd: 1 });
+    expect(() => planCodeViolationWork(duplicateRanges, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/duplicate code source range/);
+  });
+
+  it('normalizes equivalent Windows and POSIX checkout paths to the same identity', () => {
+    const posix = planCodeViolationWork(lifecycleContext('/checkout/one'), {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    });
+    const windowsContext = lifecycleContext('C:\\checkout\\one');
+    const windows = planCodeViolationWork(windowsContext, {
+      ...execution,
+      repositoryRoot: 'C:\\checkout\\one',
+    });
+
+    expect(windows.workId).toBe(posix.workId);
+    expect(windows.inputFingerprint).toBe(posix.inputFingerprint);
+  });
+
   it('keeps semantic work identity independent of checkout roots, runtime IDs, and mutable inputs', () => {
     const original = lifecycleContext('/checkout/one');
     addSecondSemanticInput(original, '/checkout/one');

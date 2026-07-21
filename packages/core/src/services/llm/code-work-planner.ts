@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import path from 'node:path';
 import type {
   CodeContextSource,
   CodeSourceScope,
@@ -52,19 +53,67 @@ function fingerprint(value: unknown): string {
 }
 
 function normalizeRepositoryPath(filePath: string, repositoryRoot?: string | null): string {
-  const normalizedPath = filePath.replaceAll('\\', '/');
-  const normalizedRoot = repositoryRoot?.replaceAll('\\', '/').replace(/\/$/, '');
-  if (!normalizedRoot) return normalizedPath;
+  const normalizePortablePath = (value: string): string => {
+    const portable = path.posix.normalize(value.replaceAll('\\', '/'));
+    return portable.replace(/^([A-Z]):\//, (_, drive: string) => `${drive.toLowerCase()}:/`);
+  };
+  const isAbsolute = (value: string): boolean => path.posix.isAbsolute(value) || /^[a-z]:\//i.test(value);
+  const normalizedPath = normalizePortablePath(filePath);
+  const normalizedRoot = repositoryRoot ? normalizePortablePath(repositoryRoot).replace(/\/$/, '') : null;
+
+  if (!normalizedRoot) {
+    if (normalizedPath === '..' || normalizedPath.startsWith('../')) {
+      throw new Error(`Code work path is outside repository root: ${filePath}`);
+    }
+    return normalizedPath.replace(/^\.\//, '');
+  }
+
+  if (!isAbsolute(normalizedPath)) {
+    if (normalizedPath === '..' || normalizedPath.startsWith('../')) {
+      throw new Error(`Code work path is outside repository root: ${filePath}`);
+    }
+    return normalizedPath.replace(/^\.\//, '');
+  }
+
   if (normalizedPath === normalizedRoot) return '.';
-  return normalizedPath.startsWith(`${normalizedRoot}/`)
-    ? normalizedPath.slice(normalizedRoot.length + 1)
-    : normalizedPath;
+  if (!normalizedPath.startsWith(`${normalizedRoot}/`)) {
+    throw new Error(`Code work path is outside repository root: ${filePath}`);
+  }
+  return normalizedPath.slice(normalizedRoot.length + 1);
+}
+
+function assertUnique(values: readonly string[], description: string): void {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) throw new Error(`Code work contains duplicate ${description}: ${value}`);
+    seen.add(value);
+  }
 }
 
 function canonicalRanges(ranges: CodeSourceScope['ranges']): Array<{ lineStart: number; lineEnd: number }> {
-  return ranges
+  const canonical = ranges
     .map(({ lineStart, lineEnd }) => ({ lineStart, lineEnd }))
     .sort((left, right) => left.lineStart - right.lineStart || left.lineEnd - right.lineEnd);
+  assertUnique(canonical.map(({ lineStart, lineEnd }) => `${lineStart}:${lineEnd}`), 'code source range');
+  return canonical;
+}
+
+function canonicalSelection(selection: CodeContextSource['selection']): CodeContextSource['selection'] {
+  if (selection.kind === 'metadata') {
+    return { kind: 'metadata', fields: [...selection.fields].sort(compareText) };
+  }
+  if (selection.kind === 'targeted') {
+    return {
+      kind: 'targeted',
+      functions: selection.functions
+        .map((fn) => ({ ...fn }))
+        .sort((left, right) =>
+          left.startLine - right.startLine
+          || left.endLine - right.endLine
+          || compareText(left.name, right.name)),
+    };
+  }
+  return { kind: 'full-file' };
 }
 
 function canonicalSources(
@@ -80,35 +129,30 @@ function canonicalSources(
     path: scope.path,
     selection: fallbackSelection(),
   }));
-  return supplied.map((source) => ({
+  const canonical = supplied.map((source) => ({
     path: normalizeRepositoryPath(source.path, repositoryRoot),
-    selection: source.selection.kind === 'metadata'
-      ? { kind: 'metadata' as const, fields: [...source.selection.fields].sort(compareText) }
-      : source.selection.kind === 'targeted'
-        ? {
-            kind: 'targeted' as const,
-            functions: source.selection.functions
-              .map((fn) => ({ ...fn }))
-              .sort((left, right) =>
-                left.startLine - right.startLine
-                || left.endLine - right.endLine
-                || compareText(left.name, right.name)),
-          }
-        : { ...source.selection },
+    selection: canonicalSelection(source.selection),
   })).sort((left, right) => compareText(left.path, right.path));
+  assertUnique(canonical.map((source) => source.path), 'code source path');
+  return canonical;
 }
 
 function canonicalSourceScopes(
   sourceScopes: CodeSourceScope[],
   repositoryRoot?: string | null,
 ): Array<{ path: string; ranges: Array<{ lineStart: number; lineEnd: number }> }> {
-  return sourceScopes.map((scope) => ({
+  const canonical = sourceScopes.map((scope) => ({
     path: normalizeRepositoryPath(scope.path, repositoryRoot),
     ranges: canonicalRanges(scope.ranges),
   })).sort((left, right) => compareText(left.path, right.path));
+  assertUnique(canonical.map((scope) => scope.path), 'code source-scope path');
+  return canonical;
 }
 
-function canonicalContext(context: CodeViolationContext): CodeViolationContext {
+function canonicalContext(
+  context: CodeViolationContext,
+  repositoryRoot?: string | null,
+): CodeViolationContext {
   const semanticPriorKey = (violation: NonNullable<CodeViolationContext['existingViolations']>[number]): string =>
     canonicalJson({
       filePath: violation.filePath,
@@ -120,7 +164,10 @@ function canonicalContext(context: CodeViolationContext): CodeViolationContext {
       content: violation.content,
     });
 
-  const existingViolations = context.existingViolations?.map((violation) => ({ ...violation }))
+  const existingViolations = context.existingViolations?.map((violation) => ({
+    ...violation,
+    filePath: normalizeRepositoryPath(violation.filePath, repositoryRoot),
+  }))
     .sort((left, right) => compareText(semanticPriorKey(left), semanticPriorKey(right)));
   if (existingViolations) {
     const semanticKeys = existingViolations.map(semanticPriorKey);
@@ -129,29 +176,19 @@ function canonicalContext(context: CodeViolationContext): CodeViolationContext {
     }
   }
 
+  const files = context.files.map((file) => ({
+    ...file,
+    path: normalizeRepositoryPath(file.path, repositoryRoot),
+  }))
+    .sort((left, right) => compareText(left.path, right.path) || compareText(left.content, right.content));
+  assertUnique(files.map((file) => file.path), 'code file path');
+  const sourceScopes = canonicalSourceScopes(context.sourceScopes, repositoryRoot);
+  const sources = context.sources ? canonicalSources(context, repositoryRoot) : undefined;
+
   return {
-    files: context.files.map((file) => ({ ...file }))
-      .sort((left, right) => compareText(left.path, right.path) || compareText(left.content, right.content)),
-    sourceScopes: context.sourceScopes.map((scope) => ({
-      path: scope.path,
-      ranges: canonicalRanges(scope.ranges),
-    })).sort((left, right) =>
-      compareText(left.path, right.path) || compareText(canonicalJson(left.ranges), canonicalJson(right.ranges))),
-    sources: context.sources?.map((source) => ({
-      path: source.path,
-      selection: source.selection.kind === 'metadata'
-        ? { kind: 'metadata' as const, fields: [...source.selection.fields].sort(compareText) }
-        : source.selection.kind === 'targeted'
-          ? {
-              kind: 'targeted' as const,
-              functions: source.selection.functions.map((fn) => ({ ...fn })).sort((left, right) =>
-                left.startLine - right.startLine
-                || left.endLine - right.endLine
-                || compareText(left.name, right.name)),
-            }
-          : { kind: 'full-file' as const },
-    })).sort((left, right) =>
-      compareText(left.path, right.path) || compareText(canonicalJson(left.selection), canonicalJson(right.selection))),
+    files,
+    sourceScopes,
+    sources,
     llmRules: context.llmRules.map((rule) => ({ ...rule }))
       .sort((left, right) => compareText(left.key, right.key) || compareText(canonicalJson(left), canonicalJson(right))),
     tier: context.tier,
@@ -168,9 +205,9 @@ export function planCodeViolationWork(
   context: CodeViolationContext,
   execution: CodeWorkExecutionIntent,
 ): PlannedCodeViolationWork {
-  const preparedContext = canonicalContext(context);
-  const request = prepareCodeViolationRequest(preparedContext);
   const repositoryRoot = execution.repositoryRoot;
+  const preparedContext = canonicalContext(context, repositoryRoot);
+  const request = prepareCodeViolationRequest(preparedContext);
   const sources = canonicalSources(preparedContext, repositoryRoot);
   const sourceScopes = canonicalSourceScopes(preparedContext.sourceScopes, repositoryRoot);
   const ruleKeys = [...new Set(preparedContext.llmRules.map((rule) => rule.key))].sort(compareText);
