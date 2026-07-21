@@ -72,6 +72,17 @@ The first `truecourse analyze` creates `.truecourse/` in your repo. Three files 
 
 Everything else (`analyses/`, `diff.json`, `history.json`, `ui-state.json`, `logs/`, `.analyze.lock`) is local-only and added to `.truecourse/.gitignore` automatically.
 
+Analyze attempts are tracked separately from the completed baseline under
+`.truecourse/analyses/runs/`. Each `<runId>.json` is an append-only-attempt
+journal entry, while `LATEST_ATTEMPT.json` points to the newest attempt. These
+files are local and gitignored: a running, blocked, or failed attempt never
+replaces the completed findings in `LATEST.json`. If a crash loses the pointer
+update after the run file is written, TrueCourse repairs it from the journals'
+durable attempt sequence. The versioned run-journal schema is owned by
+`packages/core/src/lib/analyze-run-journal.ts`; this initial schema records
+pending work and reset/failure information but deliberately does not reuse
+successful LLM responses yet.
+
 **First time, on `main`:**
 
 ```bash
