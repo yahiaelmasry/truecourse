@@ -386,6 +386,38 @@ describe('prepared analyze-run finalization', () => {
       .rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
   });
 
+  it.each(['analysis', 'registry', 'journal'] as const)(
+    'fails closed when the %s store changes after journal completion',
+    async (storeKind) => {
+      const candidate = snapshot(
+        `post-completion-${storeKind}`,
+        '2026-07-19T09:59:00.000Z',
+        null,
+      );
+      const runId = `run-post-completion-${storeKind}`;
+      await prepareRun(runId, candidate, null);
+
+      await expect(withAnalyzeLifecycleLock(repoPath, () => finalizePreparedAnalyzeRun(
+        repoPath,
+        { runId, completedAt: '2026-07-19T10:00:04.000Z' },
+        { faultInjector(point) {
+          if (point !== 'after-completion') return;
+          if (storeKind === 'analysis') {
+            setAnalysisStore(new Proxy(getAnalysisStore(), {}) as AnalysisStore);
+          } else if (storeKind === 'registry') {
+            setRegistryStore(new Proxy(getRegistryStore(), {}) as RegistryStore);
+          } else {
+            resetAnalyzeRunStorage();
+          }
+        } },
+      ))).rejects.toThrow(/storage changed/i);
+      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+        state: 'completed',
+        revision: 5,
+      });
+    },
+  );
+
   it('leaves a prepared attempt incomplete when the active baseline is unrelated', async () => {
     const candidate = snapshot('analysis-candidate', '2026-07-19T09:58:00.000Z', null);
     await prepareRun('run-unrelated', candidate, null);

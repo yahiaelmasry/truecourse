@@ -20,6 +20,7 @@ import { buildAnalysisFilename, getAnalysisStore } from './analysis-store.js';
 import { getRegistryStore } from '../config/registry.js';
 import type { HistoryEntry } from '../types/snapshot.js';
 import {
+  installPreparedAnalyzeRunFinalizationCompletionValidator,
   installPreparedAnalyzeRunFinalizationCompleter,
   installPreparedAnalyzeRunFinalizationCertifier,
   installPreparedAnalyzeRunFinalizationReader,
@@ -524,6 +525,21 @@ installPreparedAnalyzeRunFinalizationCompleter(async (repoKey, command) => {
   } catch (error) {
     certification.claimed = false;
     throw error;
+  }
+});
+
+installPreparedAnalyzeRunFinalizationCompletionValidator((completion) => {
+  const certification = preparedAnalyzeRunCompletions.get(completion);
+  if (
+    !certification
+    || !certification.claimed
+    || certification.storage !== activeStorage
+    || certification.analysisStore !== getAnalysisStore()
+    || certification.registryStore !== getRegistryStore()
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      'Analyze-run finalization storage changed after journal completion',
+    );
   }
 });
 

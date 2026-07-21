@@ -47,9 +47,14 @@ type PreparedFinalizationCompleter = (
   command: CompletePreparedAnalyzeRunCommand,
 ) => Promise<AnalyzeRunView>;
 
+type PreparedFinalizationCompletionValidator = (
+  completion: PreparedAnalyzeRunCompletion,
+) => void;
+
 let installedReader: PreparedFinalizationReader | null = null;
 let installedCertifier: PreparedFinalizationCertifier | null = null;
 let installedCompleter: PreparedFinalizationCompleter | null = null;
+let installedCompletionValidator: PreparedFinalizationCompletionValidator | null = null;
 
 export function installPreparedAnalyzeRunFinalizationReader(
   reader: PreparedFinalizationReader,
@@ -67,6 +72,12 @@ export function installPreparedAnalyzeRunFinalizationCertifier(
   certifier: PreparedFinalizationCertifier,
 ): void {
   installedCertifier = certifier;
+}
+
+export function installPreparedAnalyzeRunFinalizationCompletionValidator(
+  validator: PreparedFinalizationCompletionValidator,
+): void {
+  installedCompletionValidator = validator;
 }
 
 /** Internal recovery seam. This module is intentionally absent from the package export map. */
@@ -98,4 +109,13 @@ export async function completePreparedAnalyzeRunFinalization(
     throw new Error('Analyze-run finalization completion is not initialized');
   }
   return installedCompleter(repoKey, command);
+}
+
+export function assertPreparedAnalyzeRunFinalizationCompletionActive(
+  completion: PreparedAnalyzeRunCompletion,
+): void {
+  if (installedCompletionValidator === null) {
+    throw new Error('Analyze-run finalization completion validation is not initialized');
+  }
+  installedCompletionValidator(completion);
 }

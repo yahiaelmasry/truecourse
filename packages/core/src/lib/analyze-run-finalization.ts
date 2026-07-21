@@ -4,6 +4,7 @@ import {
 import { projectCompletedAnalysis } from './completed-analysis-projection.js';
 import { getRegistryStore } from '../config/registry.js';
 import {
+  assertPreparedAnalyzeRunFinalizationCompletionActive,
   certifyPreparedAnalyzeRunFinalization,
   completePreparedAnalyzeRunFinalization,
 } from './analyze-run-finalization-recovery.js';
@@ -92,5 +93,6 @@ export async function finalizePreparedAnalyzeRun(
     completion: certified.completion,
   });
   await options.faultInjector?.('after-completion');
+  assertPreparedAnalyzeRunFinalizationCompletionActive(certified.completion);
   return completed;
 }
