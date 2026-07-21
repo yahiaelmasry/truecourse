@@ -18,6 +18,21 @@ class AlternateCliProvider extends ClaudeCodeProvider {
   get providerId(): string { return 'alternate-cli'; }
 }
 
+class UsageDirectProvider extends ClaudeCodeProvider {
+  protected async spawnCLI(): Promise<string> {
+    return JSON.stringify({
+      structured_output: { violations: [], serviceDescriptions: [] },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 3,
+        cache_creation_input_tokens: 4,
+      },
+      total_cost_usd: 0.0123,
+    });
+  }
+}
+
 const serviceContext: ServiceViolationContext = {
   architecture: 'distributed services',
   services: [{
@@ -193,5 +208,38 @@ describe('CLI certified analyze execution adapter', () => {
       resultContractId: planned.request.resultContractId,
       result: resultsByStage[planned.request.stage],
     })));
+  });
+
+  it('returns one direct-CLI attempt identity and its exact usage with the certified result', async () => {
+    const provider = new UsageDirectProvider(undefined, 'sonnet');
+    const planned = planServiceViolationWork(serviceContext, 'normal', provider.execution);
+    const work = Object.freeze({
+      family: 'service',
+      domain: 'architecture',
+      mode: 'normal',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      planned,
+    }) as CertifiedAnalyzeLlmWork;
+
+    await expect(provider.execute(work)).resolves.toMatchObject({
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      resultContractId: 'analyze.service@1',
+      attemptId: expect.stringMatching(/^llm\.service\.attempt:/),
+      completedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      usage: {
+        provider: 'claude-code',
+        requestedModel: 'sonnet',
+        resolvedModel: null,
+        callType: 'service',
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 4,
+        totalTokens: 120,
+        costUsd: '0.0123',
+      },
+    });
   });
 });

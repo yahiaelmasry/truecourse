@@ -29,6 +29,7 @@ import {
   planServiceViolationWork,
   type PlannedServiceViolationWork,
 } from './service-work-planner.js';
+import type { AnalyzeLlmExecutionUsage } from './analyze-llm-execution-evidence.js';
 import type { LlmWorkExecutionIntent } from './work-identity.js';
 
 export type AnalyzeLlmWorkFamily = 'code' | 'database' | 'service' | 'module';
@@ -101,6 +102,10 @@ export interface AnalyzeLlmExecutionOutcome {
   readonly inputFingerprint: string;
   readonly resultContractId: string;
   readonly result: unknown;
+  /** Direct provider-attempt evidence; certified-run validation lands separately. */
+  readonly attemptId?: string;
+  readonly completedAt?: string;
+  readonly usage?: AnalyzeLlmExecutionUsage | null;
 }
 
 export interface CertifiedAnalyzeLlmRun {

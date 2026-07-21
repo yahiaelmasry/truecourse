@@ -69,6 +69,7 @@ import {
   type PlannedModuleViolationWork,
 } from './module-work-planner.js';
 import type { UsageData } from '../usage.service.js';
+import type { AnalyzeLlmExecutionUsage } from './analyze-llm-execution-evidence.js';
 import type {
   AnalyzeLlmExecutionAdapter,
   AnalyzeLlmExecutionOptions,
@@ -131,6 +132,16 @@ interface CLIUsage {
   totalTokens: number;
   costUsd?: string;
 }
+
+interface PlannedExecutionSuccess {
+  attemptId: string;
+  completedAt: string;
+  usage: AnalyzeLlmExecutionUsage | null;
+}
+
+type PlannedExecutionOptions = AnalyzeLlmExecutionOptions & {
+  onSuccess?: (evidence: PlannedExecutionSuccess) => void;
+};
 
 function certifyCodeResultOwnership(
   ownership: PreparedCodeOwnership,
@@ -314,20 +325,26 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     options?: AnalyzeLlmExecutionOptions,
   ): Promise<AnalyzeLlmExecutionOutcome> {
     let result: unknown;
+    let evidence: PlannedExecutionSuccess | undefined;
+    const plannedOptions: PlannedExecutionOptions = {
+      ...options,
+      onSuccess: (value) => { evidence = value; },
+    };
     switch (work.family) {
       case 'code':
-        result = await this.executePlannedCodeViolationWork(work.planned, options);
+        result = await this.executePlannedCodeViolationWork(work.planned, plannedOptions);
         break;
       case 'database':
-        result = await this.executePlannedDatabaseViolationWork(work.planned, options);
+        result = await this.executePlannedDatabaseViolationWork(work.planned, plannedOptions);
         break;
       case 'service':
-        result = await this.executePlannedServiceViolationWork(work.planned, options);
+        result = await this.executePlannedServiceViolationWork(work.planned, plannedOptions);
         break;
       case 'module':
-        result = await this.executePlannedModuleViolationWork(work.planned, options);
+        result = await this.executePlannedModuleViolationWork(work.planned, plannedOptions);
         break;
     }
+    if (!evidence) throw new Error(`Analyze work ${work.workId} returned without attempt evidence`);
     return {
       family: work.family,
       domain: work.domain,
@@ -336,12 +353,15 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       inputFingerprint: work.inputFingerprint,
       resultContractId: work.planned.request.resultContractId,
       result,
+      attemptId: evidence.attemptId,
+      completedAt: evidence.completedAt,
+      usage: evidence.usage,
     };
   }
 
-  private collectUsage(callType: string, cliUsage: CLIUsage | undefined, durationMs: number): void {
-    if (!cliUsage) return;
-    this._usageRecords.push({
+  private collectUsage(callType: string, cliUsage: CLIUsage | undefined, durationMs: number): UsageData | null {
+    if (!cliUsage) return null;
+    const usage = {
       provider: this.providerId,
       callType,
       inputTokens: cliUsage.inputTokens,
@@ -351,7 +371,9 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       totalTokens: cliUsage.totalTokens,
       costUsd: cliUsage.costUsd,
       durationMs,
-    });
+    };
+    this._usageRecords.push(usage);
+    return usage;
   }
 
   constructor(transport?: LlmTransport) {
@@ -663,11 +685,13 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     accept?: (result: T) => void;
     doneMessage: (result: T, durationMs: number) => string;
     onStart?: () => void;
+    onSuccess?: (evidence: PlannedExecutionSuccess) => void;
   }): Promise<T> {
     log.info(options.startMessage);
     const t0 = Date.now();
+    const attemptId = `${options.attemptIdPrefix}:${randomUUID()}`;
     const { data, usage: cliUsage } = await this.spawnPreparedAndParse(options.request, {
-      id: `${options.attemptIdPrefix}:${randomUUID()}`,
+      id: attemptId,
       workId: options.workId,
       inputFingerprint: options.inputFingerprint,
       extraArgs: options.extraArgs,
@@ -678,26 +702,38 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     options.accept?.(data);
     const dur = Date.now() - t0;
     log.info(options.doneMessage(data, dur));
-    this.collectUsage(options.callType, cliUsage, dur);
+    const usage = this.collectUsage(options.callType, cliUsage, dur);
+    options.onSuccess?.({
+      attemptId,
+      completedAt: new Date(t0 + dur).toISOString(),
+      usage: usage === null ? null : {
+        ...usage,
+        requestedModel: this.execution.requestedModel,
+        resolvedModel: null,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+        costUsd: usage.costUsd ?? null,
+      },
+    });
     return data;
   }
 
   /** Execute one already-planned service request without rebuilding its source context. */
   protected executePlannedServiceViolationWork(
     planned: PlannedServiceViolationWork<PreparedNormalServiceViolationRequest>,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ServiceViolationOutput>;
   protected executePlannedServiceViolationWork(
     planned: PlannedServiceViolationWork<PreparedLifecycleServiceViolationRequest>,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ServiceLifecycleViolationOutput>;
   protected executePlannedServiceViolationWork(
     planned: PlannedServiceViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ServiceViolationOutput | ServiceLifecycleViolationOutput>;
   protected async executePlannedServiceViolationWork(
     planned: PlannedServiceViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ServiceViolationOutput | ServiceLifecycleViolationOutput> {
     const request = planned.request;
 
@@ -713,6 +749,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         doneMessage: (result, dur) =>
           `[CLI] Lifecycle service call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
         onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
       });
     }
     return this.executePreparedViolationWork({
@@ -726,25 +763,26 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       doneMessage: (result, dur) =>
         `[CLI] Service violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
     });
   }
 
   /** Execute one already-planned database request without rebuilding its source context. */
   protected executePlannedDatabaseViolationWork(
     planned: PlannedDatabaseViolationWork<PreparedNormalDatabaseViolationRequest>,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<DatabaseViolationOutput>;
   protected executePlannedDatabaseViolationWork(
     planned: PlannedDatabaseViolationWork<PreparedLifecycleDatabaseViolationRequest>,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<DatabaseLifecycleViolationOutput>;
   protected executePlannedDatabaseViolationWork(
     planned: PlannedDatabaseViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<DatabaseViolationOutput | DatabaseLifecycleViolationOutput>;
   protected async executePlannedDatabaseViolationWork(
     planned: PlannedDatabaseViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<DatabaseViolationOutput | DatabaseLifecycleViolationOutput> {
     const request = planned.request;
     if (request.resultContractId === 'analyze.database-lifecycle@1') {
@@ -759,6 +797,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         doneMessage: (result, dur) =>
           `[CLI] Lifecycle database call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
         onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
       });
     }
     return this.executePreparedViolationWork({
@@ -772,25 +811,26 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       doneMessage: (result, dur) =>
         `[CLI] Database violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
     });
   }
 
   /** Execute one already-planned module request without rebuilding its source context. */
   protected executePlannedModuleViolationWork(
     planned: PlannedModuleViolationWork<PreparedNormalModuleViolationRequest>,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ModuleViolationOutput>;
   protected executePlannedModuleViolationWork(
     planned: PlannedModuleViolationWork<PreparedLifecycleModuleViolationRequest>,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ModuleLifecycleViolationOutput>;
   protected executePlannedModuleViolationWork(
     planned: PlannedModuleViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ModuleViolationOutput | ModuleLifecycleViolationOutput>;
   protected async executePlannedModuleViolationWork(
     planned: PlannedModuleViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<ModuleViolationOutput | ModuleLifecycleViolationOutput> {
     const request = planned.request;
     if (request.resultContractId === 'analyze.module-lifecycle@1') {
@@ -805,6 +845,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         doneMessage: (result, dur) =>
           `[CLI] Lifecycle module call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
         onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
       });
     }
     return this.executePreparedViolationWork({
@@ -818,13 +859,14 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       doneMessage: (result, dur) =>
         `[CLI] Module violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
     });
   }
 
   /** Execute and certify one already-planned code request without rebuilding its source context. */
   protected async executePlannedCodeViolationWork(
     planned: PlannedCodeViolationWork,
-    opts?: { onStart?: () => void },
+    opts?: PlannedExecutionOptions,
   ): Promise<CodeViolationOutput | CodeViolationLifecycleOutput> {
     const request = planned.request;
     const codeExtraArgs = request.toolPolicy === 'read'
@@ -852,6 +894,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         doneMessage: (result, dur) =>
           `[CLI] Code violations call done in ${dur}ms — new: ${result.newViolations.length}, resolved: ${result.resolvedViolationIds.length}, unchanged: ${result.unchangedViolationIds.length}`,
         onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
       });
     }
     return this.executePreparedViolationWork({
@@ -866,6 +909,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       doneMessage: (result, dur) =>
         `[CLI] Code violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
     });
   }
 
