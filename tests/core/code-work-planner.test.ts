@@ -72,6 +72,9 @@ const execution = {
 
 describe('code work planner', () => {
   it('rejects repository inputs that escape the certified root', () => {
+    expect(() => planCodeViolationWork(lifecycleContext('/checkout/one'), execution))
+      .toThrow(/outside repository root/);
+
     const outsideFile = lifecycleContext('/checkout/one');
     outsideFile.files[0].path = '/checkout/other/orders.ts';
     expect(() => planCodeViolationWork(outsideFile, {
@@ -85,6 +88,38 @@ describe('code work planner', () => {
       ...execution,
       repositoryRoot: '/checkout/one',
     })).toThrow(/outside repository root/);
+
+    for (const driveRelativePath of ['C:outside.ts', 'C:temp/../outside.ts']) {
+      const driveRelativeMutations: Array<(context: CodeViolationContext) => void> = [
+        (context) => { context.files[0].path = driveRelativePath; },
+        (context) => { context.sources![0].path = driveRelativePath; },
+        (context) => { context.sourceScopes[0].path = driveRelativePath; },
+        (context) => { context.existingViolations![0].filePath = driveRelativePath; },
+      ];
+      for (const mutate of driveRelativeMutations) {
+        const driveRelative = lifecycleContext('/checkout/one');
+        mutate(driveRelative);
+        expect(() => planCodeViolationWork(driveRelative, {
+          ...execution,
+          repositoryRoot: '/checkout/one',
+        })).toThrow(/outside repository root/);
+      }
+    }
+
+    const driveAbsoluteTraversalMutations: Array<(context: CodeViolationContext) => void> = [
+      (context) => { context.files[0].path = 'C:/repo/../../outside.ts'; },
+      (context) => { context.sources![0].path = 'C:/repo/../../outside.ts'; },
+      (context) => { context.sourceScopes[0].path = 'C:/repo/../../outside.ts'; },
+      (context) => { context.existingViolations![0].filePath = 'C:/repo/../../outside.ts'; },
+    ];
+    for (const mutate of driveAbsoluteTraversalMutations) {
+      const driveAbsoluteTraversal = lifecycleContext('C:/repo');
+      mutate(driveAbsoluteTraversal);
+      expect(() => planCodeViolationWork(driveAbsoluteTraversal, {
+        ...execution,
+        repositoryRoot: 'C:/repo',
+      })).toThrow(/outside repository root/);
+    }
   });
 
   it('rejects duplicate paths and ranges after repository-path normalization', () => {
@@ -139,6 +174,15 @@ describe('code work planner', () => {
 
     expect(windows.workId).toBe(posix.workId);
     expect(windows.inputFingerprint).toBe(posix.inputFingerprint);
+  });
+
+  it('preserves the filesystem root as a certified repository root', () => {
+    const planned = planCodeViolationWork(lifecycleContext('/'), {
+      ...execution,
+      repositoryRoot: '/',
+    });
+
+    expect(planned.request.ownership.sourceScopes[0].path).toBe('src/orders.ts');
   });
 
   it('keeps semantic work identity independent of checkout roots, runtime IDs, and mutable inputs', () => {

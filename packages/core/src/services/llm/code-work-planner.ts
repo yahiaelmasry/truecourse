@@ -54,19 +54,34 @@ function fingerprint(value: unknown): string {
 
 function normalizeRepositoryPath(filePath: string, repositoryRoot?: string | null): string {
   const normalizePortablePath = (value: string): string => {
-    const portable = path.posix.normalize(value.replaceAll('\\', '/'));
-    return portable.replace(/^([A-Z]):\//, (_, drive: string) => `${drive.toLowerCase()}:/`);
+    const portable = value.replaceAll('\\', '/');
+    const driveAbsolute = /^([a-z]):(\/.*)$/i.exec(portable);
+    if (driveAbsolute) {
+      return `${driveAbsolute[1].toLowerCase()}:${path.posix.normalize(driveAbsolute[2])}`;
+    }
+    return path.posix.normalize(portable);
   };
   const isAbsolute = (value: string): boolean => path.posix.isAbsolute(value) || /^[a-z]:\//i.test(value);
-  const normalizedPath = normalizePortablePath(filePath);
-  const normalizedRoot = repositoryRoot ? normalizePortablePath(repositoryRoot).replace(/\/$/, '') : null;
+  const portableInput = filePath.replaceAll('\\', '/');
 
-  if (!normalizedRoot) {
-    if (normalizedPath === '..' || normalizedPath.startsWith('../')) {
+  // Check before normalization: `C:temp/../foo.ts` otherwise collapses to
+  // `foo.ts` and loses the drive-relative process-state dependency.
+  if (/^[a-z]:(?!\/)/i.test(portableInput)) {
+    throw new Error(`Code work path is outside repository root: ${filePath}`);
+  }
+
+  const normalizedPath = normalizePortablePath(filePath);
+
+  if (repositoryRoot == null) {
+    if (isAbsolute(normalizedPath)
+      || normalizedPath === '..'
+      || normalizedPath.startsWith('../')) {
       throw new Error(`Code work path is outside repository root: ${filePath}`);
     }
     return normalizedPath.replace(/^\.\//, '');
   }
+
+  const normalizedRoot = normalizePortablePath(repositoryRoot);
 
   if (!isAbsolute(normalizedPath)) {
     if (normalizedPath === '..' || normalizedPath.startsWith('../')) {
@@ -76,10 +91,11 @@ function normalizeRepositoryPath(filePath: string, repositoryRoot?: string | nul
   }
 
   if (normalizedPath === normalizedRoot) return '.';
-  if (!normalizedPath.startsWith(`${normalizedRoot}/`)) {
+  const rootPrefix = normalizedRoot.endsWith('/') ? normalizedRoot : `${normalizedRoot}/`;
+  if (!normalizedPath.startsWith(rootPrefix)) {
     throw new Error(`Code work path is outside repository root: ${filePath}`);
   }
-  return normalizedPath.slice(normalizedRoot.length + 1);
+  return normalizedPath.slice(rootPrefix.length);
 }
 
 function assertUnique(values: readonly string[], description: string): void {

@@ -26,7 +26,7 @@ const rule = {
 
 const violation = {
   ruleKey: rule.key,
-  filePath: '/repo/a.ts',
+  filePath: 'a.ts',
   lineStart: 2,
   lineEnd: 2,
   severity: 'high',
@@ -37,7 +37,9 @@ const violation = {
 
 function providerReturning(output: unknown): CodeResultProvider {
   const transport: LlmTransport = async () => JSON.stringify(output);
-  return new CodeResultProvider(transport);
+  const provider = new CodeResultProvider(transport);
+  provider.setRepoPath('/repo');
+  return provider;
 }
 
 function fullFileContext(): CodeViolationContext {
@@ -74,7 +76,7 @@ describe('code-result ownership certification', () => {
 
   it('rejects a source path owned by a different batch', async () => {
     const output = {
-      violations: [{ ...violation, filePath: '/repo/b.ts' }],
+      violations: [{ ...violation, filePath: 'b.ts' }],
     };
 
     await expect(providerReturning(output).generateCodeViolations(fullFileContext()))
