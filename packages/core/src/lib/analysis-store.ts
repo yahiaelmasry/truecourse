@@ -32,6 +32,7 @@ import type {
 // Layout (file impl)
 //   <repo>/.truecourse/
 //     analyses/<iso>_<short-uuid>.json   per-analysis snapshots
+//     analyses/.promotions/<filename>    local prepared-promotion markers
 //     LATEST.json                         materialized current-state view
 //     history.json                        summaries (append-only)
 //     diff.json                           active diff against LATEST (optional)

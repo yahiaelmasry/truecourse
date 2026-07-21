@@ -19,9 +19,8 @@ import {
   appendHistory,
   buildAnalysisFilename,
   deleteDiff,
-  writeAnalysis,
   writeDiff,
-  writeLatest,
+  promoteCompletedAnalysisBaseline,
 } from '../lib/analysis-store.js';
 import { makeViolationDenormalizer } from '../lib/completed-analysis-promotion.js';
 import type {
@@ -83,8 +82,16 @@ export async function persistFullAnalysis(
 
   const { bySeverity, total } = summarizeActiveViolations(latest.violations);
 
-  await writeAnalysis(project.path, snapshot);
-  await writeLatest(project.path, latest);
+  const promotion = await promoteCompletedAnalysisBaseline(project.path, {
+    expectedBaseline: core.latestBaseline,
+    snapshot,
+    latest,
+  });
+  if (promotion.state === 'conflict') {
+    throw new Error(
+      `Completed analysis baseline changed before promotion (current: ${promotion.currentBaselineId ?? 'none'})`,
+    );
+  }
   await appendHistory(project.path, buildHistoryEntry(snapshot, filename, core.pipelineResult));
 
   // Baseline moved — any prior diff is obsolete.

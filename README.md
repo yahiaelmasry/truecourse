@@ -89,6 +89,12 @@ Before finalization is enabled, the schema-v1 reader also reserves the
 slice. This lets the immediately preceding release inspect a newer local
 journal instead of misclassifying it as corrupt.
 
+Completed analyses are promoted separately from attempted-run journals. Local
+prepared-promotion markers live under `.truecourse/analyses/.promotions/`
+while `LATEST.json` remains the commit point for the active completed baseline.
+The markers are local, gitignored, and removed after promotion or recovery;
+they never expose partial findings as the completed baseline.
+
 **First time, on `main`:**
 
 ```bash
