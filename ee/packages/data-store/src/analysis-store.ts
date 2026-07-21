@@ -8,6 +8,7 @@
  */
 
 import { and, asc, desc, eq } from 'drizzle-orm';
+import { isDeepStrictEqual } from 'node:util';
 import { analyses, analysisCurrent, analysisHistory, type EeDb } from '@truecourse/ee-db';
 import {
   buildAnalysisFilename,

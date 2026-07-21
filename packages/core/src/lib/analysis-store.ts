@@ -11,6 +11,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { atomicWriteJson } from './atomic-write.js';
 import type {
   AnalysisSnapshot,
