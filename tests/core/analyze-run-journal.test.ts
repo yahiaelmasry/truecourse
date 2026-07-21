@@ -65,6 +65,7 @@ async function certifySuccessfulExecution(
     execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
     async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
       providerCalls += 1;
+      const completedAt = new Date(Date.parse(sealedAt) + 1).toISOString();
       return {
         family: work.family,
         domain: work.domain,
@@ -73,6 +74,9 @@ async function certifySuccessfulExecution(
         inputFingerprint: work.inputFingerprint,
         resultContractId: work.planned.request.resultContractId,
         result: { violations: [] },
+        attemptId: `test:${work.workId}`,
+        completedAt,
+        usage: null,
       };
     },
   };

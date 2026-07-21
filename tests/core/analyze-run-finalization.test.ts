@@ -188,6 +188,9 @@ async function prepareRun(
         inputFingerprint: work.inputFingerprint,
         resultContractId: work.planned.request.resultContractId,
         result: { violations: [] },
+        attemptId: `test:${work.workId}`,
+        completedAt: '2026-07-19T10:00:01.001Z',
+        usage: null,
       };
     },
   };

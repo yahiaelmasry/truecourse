@@ -102,10 +102,9 @@ export interface AnalyzeLlmExecutionOutcome {
   readonly inputFingerprint: string;
   readonly resultContractId: string;
   readonly result: unknown;
-  /** Direct provider-attempt evidence; certified-run validation lands separately. */
-  readonly attemptId?: string;
-  readonly completedAt?: string;
-  readonly usage?: AnalyzeLlmExecutionUsage | null;
+  readonly attemptId: string;
+  readonly completedAt: string;
+  readonly usage: AnalyzeLlmExecutionUsage | null;
 }
 
 export interface CertifiedAnalyzeLlmRun {
@@ -329,7 +328,7 @@ export function certifyAnalyzeLlmRun(
             );
           },
         });
-        const result = certifyExecutionOutcome(item, outcome).result;
+        const result = certifyExecutionOutcome(item, outcome, execution).result;
         ok = true;
         return { work: item, result };
       } finally {
@@ -370,6 +369,7 @@ async function notifyProgressObserver(
 function certifyExecutionOutcome(
   work: CertifiedAnalyzeLlmWork,
   outcome: AnalyzeLlmExecutionOutcome,
+  execution: Readonly<LlmWorkExecutionIntent>,
 ): AnalyzeLlmExecutionOutcome {
   const matches = (
     outcome !== null &&
@@ -380,7 +380,10 @@ function certifyExecutionOutcome(
     outcome.workId === work.workId &&
     outcome.inputFingerprint === work.inputFingerprint &&
     outcome.resultContractId === work.planned.request.resultContractId &&
-    Object.prototype.hasOwnProperty.call(outcome, 'result')
+    Object.prototype.hasOwnProperty.call(outcome, 'result') &&
+    typeof outcome.attemptId === 'string' &&
+    outcome.attemptId.length > 0 &&
+    isCanonicalUtcTimestamp(outcome.completedAt)
   );
   if (!matches) {
     throw new AnalyzeLlmPlanError(
@@ -390,7 +393,65 @@ function certifyExecutionOutcome(
       work.domain,
     );
   }
-  return outcome;
+  const usage = outcome.usage;
+  if (usage !== null && !isValidExecutionUsage(usage, execution, work.family)) {
+    throw new AnalyzeLlmPlanError(
+      'result-not-certified',
+      `Analyze ${work.family} usage does not match its certified execution intent`,
+      work.family,
+      work.domain,
+    );
+  }
+  let result: unknown;
+  try {
+    result = work.planned.request.parse(outcome.result);
+  } catch (error) {
+    throw new AnalyzeLlmPlanError(
+      'result-not-certified',
+      `Analyze ${work.family} result does not satisfy ${work.planned.request.resultContractId}`,
+      work.family,
+      work.domain,
+      { cause: error },
+    );
+  }
+  return Object.freeze({ ...outcome, result });
+}
+
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return false;
+  return new Date(value).toISOString() === value;
+}
+
+function isValidExecutionUsage(
+  value: unknown,
+  execution: Readonly<LlmWorkExecutionIntent>,
+  family: AnalyzeLlmWorkFamily,
+): value is AnalyzeLlmExecutionUsage {
+  if (value === null || typeof value !== 'object') return false;
+  const usage = value as Record<string, unknown>;
+  const integerKeys = [
+    'inputTokens',
+    'outputTokens',
+    'cacheReadTokens',
+    'cacheWriteTokens',
+    'totalTokens',
+    'durationMs',
+  ] as const;
+  const costUsd = usage.costUsd;
+  return usage.provider === execution.provider
+    && usage.requestedModel === execution.requestedModel
+    && usage.callType === family
+    && (usage.resolvedModel === null || (
+      typeof usage.resolvedModel === 'string' && usage.resolvedModel.length > 0
+    ))
+    && integerKeys.every((key) => Number.isSafeInteger(usage[key]) && Number(usage[key]) >= 0)
+    && usage.totalTokens === Number(usage.inputTokens) + Number(usage.outputTokens)
+    && (costUsd === null || (
+      typeof costUsd === 'string'
+      && costUsd.trim().length > 0
+      && Number.isFinite(Number(costUsd))
+      && Number(costUsd) >= 0
+    ));
 }
 
 function certify<T extends CertifiedAnalyzeLlmWork>(

@@ -97,6 +97,9 @@ class Adapter implements AnalyzeLlmExecutionAdapter {
         }],
         serviceDescriptions: [{ id: 'service-orders', description: 'Orders' }],
       },
+      attemptId: `test:${work.workId}`,
+      completedAt: '2026-07-19T00:00:01.000Z',
+      usage: null,
     };
   }
 }

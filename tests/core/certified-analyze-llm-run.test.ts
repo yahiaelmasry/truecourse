@@ -137,13 +137,29 @@ class RecordingAdapter implements AnalyzeLlmExecutionAdapter {
 
   async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
     this.calls.push(work);
-    return outcomeFor(work, { ok: true });
+    return outcomeFor(work);
   }
+}
+
+function validResultFor(work: CertifiedAnalyzeLlmWork): unknown {
+  if (work.mode === 'normal') {
+    return work.family === 'service'
+      ? { violations: [], serviceDescriptions: [] }
+      : { violations: [] };
+  }
+  const lifecycle = {
+    newViolations: [],
+    resolvedViolationIds: [],
+    unchangedViolationIds: [],
+  };
+  return work.family === 'service'
+    ? { ...lifecycle, serviceDescriptions: [] }
+    : lifecycle;
 }
 
 function outcomeFor(
   work: CertifiedAnalyzeLlmWork,
-  result: unknown,
+  result: unknown = validResultFor(work),
 ): AnalyzeLlmExecutionOutcome {
   return {
     family: work.family,
@@ -153,6 +169,9 @@ function outcomeFor(
     inputFingerprint: work.inputFingerprint,
     resultContractId: work.planned.request.resultContractId,
     result,
+    attemptId: `test:${work.workId}`,
+    completedAt: new Date().toISOString(),
+    usage: null,
   };
 }
 
@@ -358,13 +377,9 @@ describe('certified analyze LLM run', () => {
     const executionResults = await certified.execute(activation);
 
     expect(adapter.calls).toHaveLength(5);
-    expect(executionResults.results.map(({ result }) => result)).toEqual([
-      { ok: true },
-      { ok: true },
-      { ok: true },
-      { ok: true },
-      { ok: true },
-    ]);
+    expect(executionResults.results.map(({ result }) => result)).toEqual(
+      adapter.calls.map((work) => validResultFor(work)),
+    );
     expect(adapter.calls.map(({ workId, inputFingerprint }) => ({ workId, inputFingerprint })))
       .toEqual(certified.manifest.work.map(({ workId, inputFingerprint }) => ({
         workId,
@@ -473,6 +488,104 @@ describe('certified analyze LLM run', () => {
     });
   });
 
+  it('rejects a result that does not satisfy the exact planned response contract', async () => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work) {
+        return outcomeFor(work, { notViolations: [] });
+      },
+    };
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'invalid-result-contract',
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, 'invalid-result-contract');
+
+    await expect(certified.execute(activation)).rejects.toMatchObject({
+      code: 'result-not-certified',
+      family: 'code',
+      domain: 'bugs',
+    });
+  });
+
+  it.each([
+    ['provider', { provider: 'other-provider' }],
+    ['requested model', { requestedModel: 'other-model' }],
+    ['call type', { callType: 'service' }],
+    ['token total', { totalTokens: 999 }],
+    ['negative input tokens', { inputTokens: -1, totalTokens: 1 }],
+    ['fractional output tokens', { outputTokens: 1.5, totalTokens: 11.5 }],
+    ['negative cache read tokens', { cacheReadTokens: -1 }],
+    ['infinite cache write tokens', { cacheWriteTokens: Number.POSITIVE_INFINITY }],
+    ['negative duration', { durationMs: -1 }],
+    ['invalid cost', { costUsd: 'not-a-number' }],
+    ['empty resolved model', { resolvedModel: '' }],
+  ] as const)('rejects checkpoint usage with invalid %s evidence', async (_case, override) => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work) {
+        return {
+          ...outcomeFor(work),
+          usage: {
+            provider: 'claude-code',
+            requestedModel: 'opus[1m]',
+            resolvedModel: null,
+            callType: 'code',
+            inputTokens: 10,
+            outputTokens: 2,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 12,
+            costUsd: null,
+            durationMs: 20,
+            ...override,
+          },
+        };
+      },
+    };
+    const runId = `invalid-usage-${String(_case).replaceAll(' ', '-')}`;
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, runId);
+
+    await expect(certified.execute(activation)).rejects.toMatchObject({
+      code: 'result-not-certified',
+      family: 'code',
+      domain: 'bugs',
+    });
+  });
+
+  it('rejects a non-canonical completion timestamp', async () => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work) {
+        return {
+          ...outcomeFor(work),
+          completedAt: 'July 19, 2026 04:00:02 UTC',
+        };
+      },
+    };
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'invalid-completion-timestamp',
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, 'invalid-completion-timestamp');
+
+    await expect(certified.execute(activation)).rejects.toMatchObject({
+      code: 'result-not-certified',
+      family: 'code',
+      domain: 'bugs',
+    });
+  });
+
   it.each([
     ['null', null],
     ['primitive', 'not-an-outcome'],
@@ -519,7 +632,7 @@ describe('certified analyze LLM run', () => {
     expect(adapter.calls).toEqual([]);
     const activation = await activate(certified, 'forged-activation');
     await expect(certified.execute(activation)).resolves.toMatchObject({
-      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      results: expect.arrayContaining([expect.objectContaining({ result: { violations: [] } })]),
       completion: expect.any(Object),
     });
     expect(adapter.calls).toHaveLength(1);
@@ -611,7 +724,7 @@ describe('certified analyze LLM run', () => {
     });
     expect(adapter.calls).toEqual([]);
     await expect(first.execute(activation)).resolves.toMatchObject({
-      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      results: expect.arrayContaining([expect.objectContaining({ result: { violations: [] } })]),
       completion: expect.any(Object),
     });
     expect(firstAdapter.calls).toHaveLength(1);
@@ -646,7 +759,7 @@ describe('certified analyze LLM run', () => {
       code: [{ domain: 'bugs', context: codeContext }],
     }, rightfulAdapter);
     await expect(rightful.execute(foreignActivation)).resolves.toMatchObject({
-      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      results: expect.arrayContaining([expect.objectContaining({ result: { violations: [] } })]),
       completion: expect.any(Object),
     });
     expect(rightfulAdapter.calls).toHaveLength(1);
@@ -731,7 +844,7 @@ describe('certified analyze LLM run', () => {
         provider: 'transport:unverified',
         requestedModel: 'opus[1m]',
       }),
-      async execute(work) { return outcomeFor(work, { ok: true }); },
+      async execute(work) { return outcomeFor(work); },
     };
 
     expect(() => certifyAnalyzeLlmRun({
@@ -757,7 +870,7 @@ describe('certified analyze LLM run', () => {
     const calls: CertifiedAnalyzeLlmWork[] = [];
     const adapter: AnalyzeLlmExecutionAdapter = {
       get execution() { return execution; },
-      async execute(work) { calls.push(work); return outcomeFor(work, { ok: true }); },
+      async execute(work) { calls.push(work); return outcomeFor(work); },
     };
     const certified = certifyAnalyzeLlmRun({
       runId: 'provider-drift',
@@ -774,7 +887,7 @@ describe('certified analyze LLM run', () => {
     expect(calls).toEqual([]);
     execution = { provider: 'claude-code', requestedModel: 'opus[1m]' };
     await expect(certified.execute(activation)).resolves.toMatchObject({
-      results: expect.arrayContaining([expect.objectContaining({ result: { ok: true } })]),
+      results: expect.arrayContaining([expect.objectContaining({ result: { violations: [] } })]),
       completion: expect.any(Object),
     });
     expect(calls).toHaveLength(1);
@@ -846,7 +959,7 @@ describe('certified analyze LLM run', () => {
         if (work.family === 'code') {
           await codeGate;
           codeDrained = true;
-          return outcomeFor(work, { ok: true });
+          return outcomeFor(work);
         }
         throw providerFailure;
       },
@@ -903,7 +1016,7 @@ describe('certified analyze LLM run', () => {
       async execute(work, options?: { onStart?: () => void }) {
         if (work.family === 'code') {
           options?.onStart?.();
-          return outcomeFor(work, { ok: true });
+          return outcomeFor(work);
         }
         throw providerFailure;
       },
