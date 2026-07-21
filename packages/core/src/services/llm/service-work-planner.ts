@@ -6,6 +6,7 @@ import {
   type PreparedServiceViolationRequest,
 } from './prepared-service-violation-request.js';
 import {
+  assertUniqueLlmIdentity,
   canonicalJson,
   compareCanonicalText,
   fingerprint,
@@ -31,6 +32,12 @@ function sortCanonical<T>(values: T[]): T[] {
 }
 
 function canonicalContext(context: ServiceViolationContext): ServiceViolationContext {
+  assertUniqueLlmIdentity(context.llmRules.map((rule) => rule.key), 'rule key');
+  assertUniqueLlmIdentity(context.services.map((service) => service.id), 'service runtime ID');
+  assertUniqueLlmIdentity(
+    (context.existingViolations ?? []).map((violation) => violation.id),
+    'prior runtime ID',
+  );
   const semanticPriorKey = ({ id: _id, ...semantic }: NonNullable<ServiceViolationContext['existingViolations']>[number]): string =>
     canonicalJson(semantic);
   const existingViolations = (context.existingViolations ?? [])

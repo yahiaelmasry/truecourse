@@ -6,6 +6,7 @@ import {
   type PreparedNormalDatabaseViolationRequest,
 } from './prepared-database-violation-request.js';
 import {
+  assertUniqueLlmIdentity,
   canonicalJson,
   compareCanonicalText,
   fingerprint,
@@ -31,6 +32,12 @@ function sortCanonical<T>(values: T[]): T[] {
 }
 
 function canonicalContext(context: DatabaseViolationContext): DatabaseViolationContext {
+  assertUniqueLlmIdentity(context.llmRules.map((rule) => rule.key), 'rule key');
+  assertUniqueLlmIdentity(context.databases.map((database) => database.id), 'database runtime ID');
+  assertUniqueLlmIdentity(
+    (context.existingViolations ?? []).map((violation) => violation.id),
+    'prior runtime ID',
+  );
   const semanticPriorKey = ({ id: _id, ...semantic }: NonNullable<DatabaseViolationContext['existingViolations']>[number]): string =>
     canonicalJson(semantic);
   const existingViolations = (context.existingViolations ?? [])

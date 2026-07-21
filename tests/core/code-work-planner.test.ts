@@ -328,6 +328,24 @@ describe('code work planner', () => {
     })).toThrow(/duplicate semantic prior findings/);
   });
 
+  it('rejects duplicate rule and prior runtime identities', () => {
+    const duplicateRules = lifecycleContext();
+    addSecondSemanticInput(duplicateRules);
+    duplicateRules.llmRules[1].key = duplicateRules.llmRules[0].key;
+    expect(() => planCodeViolationWork(duplicateRules, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/duplicate rule key/);
+
+    const duplicatePriorIds = lifecycleContext();
+    addSecondSemanticInput(duplicatePriorIds);
+    duplicatePriorIds.existingViolations![1].id = duplicatePriorIds.existingViolations![0].id;
+    expect(() => planCodeViolationWork(duplicatePriorIds, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    })).toThrow(/duplicate prior runtime ID/);
+  });
+
   it('forwards the planner-owned work ID through the real provider transport call', async () => {
     const context = lifecycleContext();
     const planned = planCodeViolationWork(context, {

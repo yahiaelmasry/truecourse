@@ -6,6 +6,7 @@ import {
   type PreparedNormalModuleViolationRequest,
 } from './prepared-module-violation-request.js';
 import {
+  assertUniqueLlmIdentity,
   canonicalJson,
   compareCanonicalText,
   fingerprint,
@@ -31,6 +32,16 @@ function sortCanonical<T>(values: T[]): T[] {
 }
 
 function canonicalContext(context: ModuleViolationContext): ModuleViolationContext {
+  assertUniqueLlmIdentity(context.llmRules.map((rule) => rule.key), 'rule key');
+  assertUniqueLlmIdentity(context.modules.map((module) => module.id), 'module runtime ID');
+  assertUniqueLlmIdentity(
+    context.methods.flatMap((method) => method.id ? [method.id] : []),
+    'method runtime ID',
+  );
+  assertUniqueLlmIdentity(
+    (context.existingViolations ?? []).map((violation) => violation.id),
+    'prior runtime ID',
+  );
   const semanticPriorKey = ({ id: _id, ...semantic }: NonNullable<ModuleViolationContext['existingViolations']>[number]): string =>
     canonicalJson(semantic);
   const existingViolations = (context.existingViolations ?? [])

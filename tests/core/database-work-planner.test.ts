@@ -175,6 +175,23 @@ describe('database work planner', () => {
       .toThrow(/duplicate semantic databases/);
   });
 
+  it('rejects duplicate rule, target, and prior runtime identities', () => {
+    const duplicateRules = lifecycleContext();
+    duplicateRules.llmRules[1].key = duplicateRules.llmRules[0].key;
+    expect(() => planDatabaseViolationWork(duplicateRules, 'lifecycle', execution))
+      .toThrow(/duplicate rule key/);
+
+    const duplicateDatabaseIds = lifecycleContext();
+    duplicateDatabaseIds.databases[1].id = duplicateDatabaseIds.databases[0].id;
+    expect(() => planDatabaseViolationWork(duplicateDatabaseIds, 'lifecycle', execution))
+      .toThrow(/duplicate database runtime ID/);
+
+    const duplicatePriorIds = lifecycleContext();
+    duplicatePriorIds.existingViolations![1].id = duplicatePriorIds.existingViolations![0].id;
+    expect(() => planDatabaseViolationWork(duplicatePriorIds, 'lifecycle', execution))
+      .toThrow(/duplicate prior runtime ID/);
+  });
+
   it('forwards stable identity metadata with a unique attempt ID through the real provider call', async () => {
     const context = lifecycleContext();
     const planned = planDatabaseViolationWork(context, 'lifecycle', {

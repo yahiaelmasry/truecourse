@@ -9,6 +9,7 @@ import {
   type PreparedCodeViolationRequest,
 } from './prepared-code-violation-request.js';
 import {
+  assertUniqueLlmIdentity,
   canonicalJson,
   compareCanonicalText as compareText,
   fingerprint,
@@ -148,6 +149,11 @@ function canonicalContext(
   context: CodeViolationContext,
   repositoryRoot?: string | null,
 ): CodeViolationContext {
+  assertUniqueLlmIdentity(context.llmRules.map((rule) => rule.key), 'rule key');
+  assertUniqueLlmIdentity(
+    (context.existingViolations ?? []).map((violation) => violation.id),
+    'prior runtime ID',
+  );
   const semanticPriorKey = (violation: NonNullable<CodeViolationContext['existingViolations']>[number]): string =>
     canonicalJson({
       filePath: violation.filePath,

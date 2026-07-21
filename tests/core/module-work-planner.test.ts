@@ -248,6 +248,28 @@ describe('module work planner', () => {
       .toThrow(/duplicate semantic methods/);
   });
 
+  it('rejects duplicate rule, target, method, and prior runtime identities', () => {
+    const duplicateRules = lifecycleContext();
+    duplicateRules.llmRules[1].key = duplicateRules.llmRules[0].key;
+    expect(() => planModuleViolationWork(duplicateRules, 'lifecycle', execution))
+      .toThrow(/duplicate rule key/);
+
+    const duplicateModuleIds = lifecycleContext();
+    duplicateModuleIds.modules[1].id = duplicateModuleIds.modules[0].id;
+    expect(() => planModuleViolationWork(duplicateModuleIds, 'lifecycle', execution))
+      .toThrow(/duplicate module runtime ID/);
+
+    const duplicateMethodIds = lifecycleContext();
+    duplicateMethodIds.methods[1].id = duplicateMethodIds.methods[0].id;
+    expect(() => planModuleViolationWork(duplicateMethodIds, 'lifecycle', execution))
+      .toThrow(/duplicate method runtime ID/);
+
+    const duplicatePriorIds = lifecycleContext();
+    duplicatePriorIds.existingViolations![1].id = duplicatePriorIds.existingViolations![0].id;
+    expect(() => planModuleViolationWork(duplicatePriorIds, 'lifecycle', execution))
+      .toThrow(/duplicate prior runtime ID/);
+  });
+
   it('forwards stable identity metadata with a unique attempt ID through the real provider call', async () => {
     const context = lifecycleContext();
     const planned = planModuleViolationWork(context, 'normal', {

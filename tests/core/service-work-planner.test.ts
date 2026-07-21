@@ -175,6 +175,23 @@ describe('service work planner', () => {
       .toThrow(/duplicate semantic services/);
   });
 
+  it('rejects duplicate rule, target, and prior runtime identities', () => {
+    const duplicateRules = lifecycleContext();
+    duplicateRules.llmRules[1].key = duplicateRules.llmRules[0].key;
+    expect(() => planServiceViolationWork(duplicateRules, 'lifecycle', execution))
+      .toThrow(/duplicate rule key/);
+
+    const duplicateServiceIds = lifecycleContext();
+    duplicateServiceIds.services[1].id = duplicateServiceIds.services[0].id;
+    expect(() => planServiceViolationWork(duplicateServiceIds, 'lifecycle', execution))
+      .toThrow(/duplicate service runtime ID/);
+
+    const duplicatePriorIds = lifecycleContext();
+    duplicatePriorIds.existingViolations![1].id = duplicatePriorIds.existingViolations![0].id;
+    expect(() => planServiceViolationWork(duplicatePriorIds, 'lifecycle', execution))
+      .toThrow(/duplicate prior runtime ID/);
+  });
+
   it('forwards stable identity metadata with a unique attempt ID through the real provider call', async () => {
     const context = lifecycleContext();
     const planned = planServiceViolationWork(context, 'normal', {

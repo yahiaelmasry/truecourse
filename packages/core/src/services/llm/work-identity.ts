@@ -33,3 +33,14 @@ export function canonicalJson(value: unknown): string {
 export function fingerprint(value: unknown): string {
   return `sha256:${createHash('sha256').update(canonicalJson(value)).digest('hex')}`;
 }
+
+export function assertUniqueLlmIdentity(
+  values: readonly string[],
+  description: string,
+): void {
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (seen.has(value)) throw new Error(`LLM work contains duplicate ${description}: ${value}`);
+    seen.add(value);
+  }
+}
