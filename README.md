@@ -84,6 +84,11 @@ pending work and reset/failure information and reserves its initial execution-
 admission revisions for the next lifecycle slice. It deliberately does not
 reuse successful LLM responses yet.
 
+Before finalization is enabled, the schema-v1 reader also reserves the
+`finalizing` and `succeeded-uncheckpointed` states written by the next ordered
+slice. This lets the immediately preceding release inspect a newer local
+journal instead of misclassifying it as corrupt.
+
 **First time, on `main`:**
 
 ```bash

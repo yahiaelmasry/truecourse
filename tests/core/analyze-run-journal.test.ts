@@ -186,6 +186,7 @@ describe('analyze run journal', () => {
       counts: null,
       blocked: null,
       failure: null,
+      finalization: null,
       resume: {
         available: false,
         reason: 'successful-results-not-checkpointed',
@@ -364,6 +365,68 @@ describe('analyze run journal', () => {
       plan: 'sealed',
       counts: { total: 1, pending: 1, succeeded: 0, failed: 0 },
       resume: { available: false, reason: 'successful-results-not-checkpointed' },
+    });
+  });
+
+  it('reads the schema-v1 finalization states reserved for the next lifecycle writer', async () => {
+    const runId = 'reserved-finalization-run';
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId,
+      candidateAnalysisId: 'reserved-finalization-analysis',
+      startedAt: '2026-07-19T02:50:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'reserved123',
+      completedBaselineId: 'safe-baseline',
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId,
+      sealedAt: '2026-07-19T02:50:01.000Z',
+      work: [{ workId: 'analyze:v1:reserved', inputFingerprint: `sha256:${'a'.repeat(64)}` }],
+    });
+    const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+    const sealed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    const plan = sealed.plan as { state: string; sealedAt: string; work: Array<Record<string, unknown>> };
+    const finalizingAt = '2026-07-19T02:50:02.000Z';
+    const finalizing = {
+      ...sealed,
+      revision: 3,
+      updatedAt: finalizingAt,
+      status: { state: 'finalizing', finalizingAt },
+      plan: { ...plan, work: plan.work.map((item) => ({ ...item, state: 'succeeded-uncheckpointed' })) },
+    };
+    fs.writeFileSync(file, JSON.stringify(finalizing));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      revision: 3,
+      state: 'finalizing',
+      counts: { pending: 0, succeeded: 1 },
+      finalization: { finalizingAt },
+    });
+
+    const failedAt = '2026-07-19T02:50:03.000Z';
+    fs.writeFileSync(file, JSON.stringify({
+      ...finalizing,
+      revision: 4,
+      updatedAt: failedAt,
+      status: {
+        state: 'failed',
+        code: 'ANALYSIS_PERSIST_FAILED',
+        message: 'The newer writer could not persist the candidate.',
+        failedAt,
+        finalizingAt,
+      },
+    }));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      revision: 4,
+      state: 'failed',
+      counts: { pending: 0, succeeded: 1 },
+      finalization: { finalizingAt },
     });
   });
 

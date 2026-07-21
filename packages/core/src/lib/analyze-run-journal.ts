@@ -84,7 +84,7 @@ export interface AnalyzeRunView {
   revision: number;
   runId: string;
   candidateAnalysisId: string;
-  state: 'running' | 'blocked' | 'failed';
+  state: 'running' | 'blocked' | 'failed' | 'finalizing';
   startedAt: string;
   updatedAt: string;
   source: AnalyzeRunSource;
@@ -109,6 +109,9 @@ export interface AnalyzeRunView {
     message: string;
     failedAt: string;
   };
+  finalization: null | {
+    finalizingAt: string;
+  };
   resume: {
     available: false;
     reason: 'successful-results-not-checkpointed';
@@ -118,7 +121,7 @@ export interface AnalyzeRunView {
 export interface StoredAnalyzeRunWork {
   workId: string;
   inputFingerprint: string;
-  state: 'pending';
+  state: 'pending' | 'succeeded-uncheckpointed';
 }
 
 export interface StoredAnalyzeRun {
@@ -140,6 +143,11 @@ export interface StoredAnalyzeRun {
         code: string;
         message: string;
         failedAt: string;
+        finalizingAt: string | null;
+      }
+    | {
+        state: 'finalizing';
+        finalizingAt: string;
       };
   startedAt: string;
   updatedAt: string;
@@ -534,7 +542,7 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
         total: run.plan.work.length,
         pending: run.plan.work.filter((work) => work.state === 'pending').length,
         running: 0,
-        succeeded: 0,
+        succeeded: run.plan.work.filter((work) => work.state === 'succeeded-uncheckpointed').length,
         failed: 0,
       }
     : null;
@@ -564,8 +572,13 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
           code: run.status.code,
           message: run.status.message,
           failedAt: run.status.failedAt,
-        }
+      }
       : null,
+    finalization: run.status.state === 'finalizing'
+      ? { finalizingAt: run.status.finalizingAt }
+      : run.status.state === 'failed' && run.status.finalizingAt !== null
+        ? { finalizingAt: run.status.finalizingAt }
+        : null,
     resume: {
       available: false,
       reason: 'successful-results-not-checkpointed',
@@ -607,6 +620,7 @@ async function failRun(
       code: validateErrorCode(command.error.code),
       message: validatePublicErrorMessage(command.error.message),
       failedAt,
+      finalizingAt: null,
     },
   };
   await activeStorage.compareAndSwap(repoKey, runId, current.revision, next);
@@ -866,7 +880,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     typeof value.runId !== 'string' ||
     typeof value.candidateAnalysisId !== 'string' ||
     !isRecord(value.status) ||
-    !['running', 'blocked', 'failed'].includes(String(value.status.state)) ||
+    !['running', 'blocked', 'failed', 'finalizing'].includes(String(value.status.state)) ||
     typeof value.startedAt !== 'string' ||
     typeof value.updatedAt !== 'string' ||
     !['cli', 'dashboard', 'hosted'].includes(String(value.source)) ||
@@ -886,7 +900,9 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     ? status.blockedAt
     : status.state === 'failed'
       ? status.failedAt
-      : null;
+      : status.state === 'finalizing'
+        ? status.finalizingAt
+        : null;
   const terminalTimestampIsImpossible = terminalAt !== null && (
     Date.parse(terminalAt) < Date.parse(value.startedAt) ||
     (plan.state === 'sealed' && Date.parse(terminalAt) < Date.parse(plan.sealedAt))
@@ -894,23 +910,61 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const lifecycleIsReachable = plan.state === 'unsealed'
     ? (
       (status.state === 'running' && revision === 0 && value.updatedAt === value.startedAt) ||
-      (status.state === 'failed' && revision === 1 && status.failedAt === value.updatedAt)
+      (
+        status.state === 'failed' &&
+        status.finalizingAt === null &&
+        revision === 1 &&
+        status.failedAt === value.updatedAt
+      )
     )
     : (
       Date.parse(plan.sealedAt) >= Date.parse(value.startedAt) && (
-        (status.state === 'running' && [1, 2].includes(revision) && value.updatedAt === plan.sealedAt) ||
-        (status.state === 'blocked' && [2, 3].includes(revision) && status.blockedAt === value.updatedAt) ||
-        (status.state === 'failed' && [2, 3].includes(revision) && status.failedAt === value.updatedAt)
+        (
+          status.state === 'running' &&
+          [1, 2].includes(revision) &&
+          value.updatedAt === plan.sealedAt &&
+          plan.work.every((work) => work.state === 'pending')
+        ) ||
+        (
+          status.state === 'blocked' &&
+          [2, 3].includes(revision) &&
+          status.blockedAt === value.updatedAt &&
+          plan.work.every((work) => work.state === 'pending')
+        ) ||
+        (
+          status.state === 'failed' &&
+          (
+            (
+              [2, 3].includes(revision) &&
+              status.finalizingAt === null &&
+              plan.work.every((work) => work.state === 'pending')
+            ) ||
+            (
+              revision === 4 &&
+              status.finalizingAt !== null &&
+              Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
+              Date.parse(status.failedAt) >= Date.parse(status.finalizingAt) &&
+              plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
+            )
+          ) &&
+          status.failedAt === value.updatedAt
+        ) ||
+        (
+          status.state === 'finalizing' &&
+          revision === 3 &&
+          status.finalizingAt === value.updatedAt &&
+          plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
+        )
       )
     );
   if (!lifecycleIsReachable || terminalTimestampIsImpossible) {
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
-    Schema v1 reserves and now uses revision 2 for running/sealed execution admission and revision 3
-    for its terminal transitions. The running/sealed revision 2 tombstone prevents a consumed plan
-    from issuing another receipt. Future work-result/finalization commands must migrate or extend
-    the durable schema together with these invariants.
+    Schema v1 uses revision 2 for running/sealed execution admission and reserves revision 3 for
+    finalization, with revision 4 reserved for a finalization failure. These read-only reservations
+    keep this reader compatible with the next lifecycle writer. Future work-result/completion
+    commands must migrate or extend the durable schema together with these invariants.
   */
 
   return {
@@ -940,11 +994,21 @@ function asCorruption(error: unknown, context: string): AnalyzeRunJournalCorrupt
 function parseStoredStatus(value: Record<string, unknown>, file: string): StoredAnalyzeRun['status'] {
   if (value.state === 'running') return { state: 'running' };
   if (value.state === 'failed') {
+    const finalizingAt = value.finalizingAt === null || value.finalizingAt === undefined
+      ? null
+      : validateTimestamp(value.finalizingAt, 'finalizingAt');
     return {
       state: 'failed',
       code: validateErrorCode(value.code),
       message: validatePublicErrorMessage(value.message),
       failedAt: validateTimestamp(value.failedAt, 'failedAt'),
+      finalizingAt,
+    };
+  }
+  if (value.state === 'finalizing') {
+    return {
+      state: 'finalizing',
+      finalizingAt: validateTimestamp(value.finalizingAt, 'finalizingAt'),
     };
   }
   if (
@@ -968,19 +1032,20 @@ function parseStoredPlan(value: Record<string, unknown>, file: string): StoredAn
   if (value.state !== 'sealed' || typeof value.sealedAt !== 'string' || !Array.isArray(value.work)) {
     throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run plan: ${file}`);
   }
-  const work = value.work.map((item) => {
+  const work = value.work.map<StoredAnalyzeRunWork>((item) => {
+    const state = isRecord(item) ? item.state : undefined;
     if (
       !isRecord(item) ||
       typeof item.workId !== 'string' ||
       typeof item.inputFingerprint !== 'string' ||
-      item.state !== 'pending'
+      (state !== 'pending' && state !== 'succeeded-uncheckpointed')
     ) {
       throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run work record: ${file}`);
     }
     return {
       workId: requireNonEmpty(item.workId, 'workId'),
       inputFingerprint: validateFingerprint(item.inputFingerprint),
-      state: 'pending' as const,
+      state,
     };
   });
   if (new Set(work.map((item) => item.workId)).size !== work.length) {
