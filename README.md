@@ -84,10 +84,12 @@ reset/failure information, durable execution admission, and an exact prepared
 finalization intent containing the completed-baseline promotion and secondary
 projection inputs. The intent is written to the attempted-run journal before
 completed artifacts are mutated and remains separate from `LATEST.json`.
-Executing a prepared finalization is added by the next ordered contribution;
-successful LLM response reuse is also not enabled yet. Schema-v1 journals and
-their reserved finalizing states remain readable and migrate safely to v2 when
-the preparation command is used.
+Prepared finalization replays completed-baseline promotion, idempotent history/
+diff/registry projections, and journal completion in that order. An exact retry
+repairs any interrupted step without replacing a newer completed descendant.
+Successful LLM response reuse is not enabled yet. Schema-v1 journals and their
+reserved finalizing states remain readable and migrate safely to v2 when the
+preparation command is used.
 
 Completed analyses are promoted separately from attempted-run journals. Local
 prepared-promotion markers live under `.truecourse/analyses/.promotions/`
