@@ -6,6 +6,7 @@ import { LlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   AnalyzeLlmPlanError,
   certifyAnalyzeLlmRun,
+  type AnalyzeLlmPlanInput,
   type AnalyzeLlmExecutionAdapter,
   type CertifiedAnalyzeLlmWork,
 } from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
@@ -225,6 +226,55 @@ describe('certified analyze LLM run', () => {
     expect(adapter.calls).toEqual([]);
   });
 
+  it('rejects empty or cross-domain aggregate rule sets before provider admission', () => {
+    const adapter = new RecordingAdapter();
+    const invalidCases: Array<{
+      runId: string;
+      family: 'database' | 'service' | 'module';
+      input: Pick<AnalyzeLlmPlanInput, 'database' | 'service' | 'module'>;
+    }> = [
+      {
+        runId: 'empty-database-rules',
+        family: 'database',
+        input: { database: { ...structuredClone(databaseContext), llmRules: [] } },
+      },
+      {
+        runId: 'cross-domain-service-rules',
+        family: 'service',
+        input: {
+          service: {
+            ...structuredClone(serviceContext),
+            llmRules: [{ ...rule, key: 'database/llm/not-architecture' }],
+          },
+        },
+      },
+      {
+        runId: 'cross-domain-module-rules',
+        family: 'module',
+        input: {
+          module: {
+            ...structuredClone(validLifecycleModuleContext),
+            llmRules: [{ ...rule, key: 'bugs/llm/not-architecture' }],
+          },
+        },
+      },
+    ];
+
+    for (const { runId, family, input } of invalidCases) {
+      expect(() => certifyAnalyzeLlmRun({
+        runId,
+        journalKey: journalRepository,
+        repositoryRoot: '/repo',
+        code: [],
+        ...input,
+      }, adapter)).toThrow(expect.objectContaining({
+        code: 'invalid-context',
+        family,
+      }));
+    }
+    expect(adapter.calls).toEqual([]);
+  });
+
   it('certifies every request before executing the exact frozen multi-family plan', async () => {
     const adapter = new RecordingAdapter();
     const firstCode = structuredClone(codeContext);
@@ -375,6 +425,59 @@ describe('certified analyze LLM run', () => {
     const activation = await activate(certified, 'forged-activation');
     await expect(certified.execute(activation)).resolves.toHaveLength(1);
     expect(adapter.calls).toHaveLength(1);
+  });
+
+  it('recovers one executable receipt for an exact already-sealed manifest', async () => {
+    const adapter = new RecordingAdapter();
+    const runId = 'recover-sealed-activation';
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: structuredClone(codeContext) }],
+    }, adapter);
+    runSequence += 1;
+    await dispatchAnalyzeRun(journalRepository, {
+      kind: 'begin',
+      runId,
+      candidateAnalysisId: `candidate-${runSequence}`,
+      startedAt: '2026-07-19T00:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'abc123',
+      completedBaselineId: 'completed-baseline',
+    });
+    const sealCommand = {
+      kind: 'seal-plan' as const,
+      runId,
+      sealedAt: '2026-07-19T00:00:01.000Z',
+      work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
+        workId,
+        inputFingerprint,
+      })),
+    };
+    await dispatchAnalyzeRun(journalRepository, sealCommand);
+
+    const [first, second] = await Promise.all([
+      sealAnalyzeRunPlan(journalRepository, sealCommand),
+      sealAnalyzeRunPlan(journalRepository, sealCommand),
+    ]);
+    expect(first).toBe(second);
+
+    const settled = await Promise.allSettled([
+      certified.execute(first),
+      certified.execute(second),
+    ]);
+    expect(settled.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(adapter.calls).toHaveLength(1);
+
+    await expect(sealAnalyzeRunPlan(journalRepository, {
+      ...sealCommand,
+      work: [{
+        ...sealCommand.work[0],
+        inputFingerprint: `sha256:${'f'.repeat(64)}`,
+      }],
+    })).rejects.toThrow(/sealed manifest/i);
   });
 
   it('rejects a durable receipt issued for a different run', async () => {

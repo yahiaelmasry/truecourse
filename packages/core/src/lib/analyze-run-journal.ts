@@ -48,8 +48,13 @@ const analyzeRunPlanActivations = new WeakMap<object, {
   runId: string;
   revision: number;
   workKey: string;
+  cacheKey: string;
   claimed: boolean;
 }>();
+const analyzeRunPlanActivationReceipts = new WeakMap<
+  AnalyzeRunStorage,
+  Map<string, AnalyzeRunPlanActivation>
+>();
 
 export interface BlockAnalyzeRunCommand {
   kind: 'block';
@@ -378,10 +383,25 @@ export async function sealAnalyzeRunPlan(
 ): Promise<AnalyzeRunPlanActivation> {
   const storage = activeStorage;
   const durableRepoKey = activationScopeKey(repoKey, storage);
-  await sealPlan(durableRepoKey, command, storage);
+  const runId = validateRunId(command.runId);
+  const expectedWork = normalizeSealPlanWork(command, runId);
+  let stored = await storage.read(durableRepoKey, runId);
   assertAnalyzeRunStorage(storage);
-  const stored = await storage.read(durableRepoKey, validateRunId(command.runId));
-  assertAnalyzeRunStorage(storage);
+  if (
+    stored?.status.state === 'running' &&
+    stored.plan.state === 'sealed'
+  ) {
+    if (activationWorkKey(stored.plan.work) !== activationWorkKey(expectedWork)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} already has a different sealed manifest`,
+      );
+    }
+  } else {
+    await sealPlan(durableRepoKey, command, storage);
+    assertAnalyzeRunStorage(storage);
+    stored = await storage.read(durableRepoKey, runId);
+    assertAnalyzeRunStorage(storage);
+  }
   if (
     !stored ||
     stored.status.state !== 'running' ||
@@ -391,6 +411,21 @@ export async function sealAnalyzeRunPlan(
       `Analyze run ${command.runId} was not sealed and running after plan activation`,
     );
   }
+  const workKey = activationWorkKey(stored.plan.work);
+  const cacheKey = JSON.stringify([
+    durableRepoKey,
+    stored.runId,
+    stored.revision,
+    workKey,
+  ]);
+  let receipts = analyzeRunPlanActivationReceipts.get(storage);
+  if (!receipts) {
+    receipts = new Map();
+    analyzeRunPlanActivationReceipts.set(storage, receipts);
+  }
+  const existing = receipts.get(cacheKey);
+  if (existing && analyzeRunPlanActivations.has(existing)) return existing;
+
   const receipt = Object.freeze({}) as AnalyzeRunPlanActivation;
   analyzeRunPlanActivations.set(receipt, {
     storage,
@@ -398,9 +433,11 @@ export async function sealAnalyzeRunPlan(
     scopeKey: durableRepoKey,
     runId: stored.runId,
     revision: stored.revision,
-    workKey: activationWorkKey(stored.plan.work),
+    workKey,
+    cacheKey,
     claimed: false,
   });
+  receipts.set(cacheKey, receipt);
   return receipt;
 }
 
@@ -452,6 +489,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
   try {
     const execution = admit();
     analyzeRunPlanActivations.delete(receipt);
+    analyzeRunPlanActivationReceipts.get(storage)?.delete(activation.cacheKey);
     return { admitted: true, execution };
   } catch (error) {
     activation.claimed = false;
@@ -606,6 +644,33 @@ async function sealPlan(
     );
   }
 
+  const work = normalizeSealPlanWork(command, runId);
+
+  const sealedAt = validateTimestamp(command.sealedAt, 'sealedAt');
+  if (Date.parse(sealedAt) < Date.parse(current.startedAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} plan cannot be sealed before the run starts`,
+    );
+  }
+  const next: StoredAnalyzeRun = {
+    ...current,
+    revision: current.revision + 1,
+    updatedAt: sealedAt,
+    plan: {
+      state: 'sealed',
+      sealedAt,
+      work,
+    },
+  };
+  await storage.compareAndSwap(repoKey, runId, current.revision, next);
+  assertAnalyzeRunStorage(storage);
+  return toView(next);
+}
+
+function normalizeSealPlanWork(
+  command: SealAnalyzeRunPlanCommand,
+  runId: string,
+): StoredAnalyzeRunWork[] {
   if (!Array.isArray(command.work)) {
     throw new InvalidAnalyzeRunTransitionError(`Analyze run ${runId} has an invalid LLM work plan`);
   }
@@ -629,26 +694,7 @@ async function sealPlan(
       `Analyze run ${runId} cannot seal an empty LLM work plan without an explicit disposition`,
     );
   }
-
-  const sealedAt = validateTimestamp(command.sealedAt, 'sealedAt');
-  if (Date.parse(sealedAt) < Date.parse(current.startedAt)) {
-    throw new InvalidAnalyzeRunTransitionError(
-      `Analyze run ${runId} plan cannot be sealed before the run starts`,
-    );
-  }
-  const next: StoredAnalyzeRun = {
-    ...current,
-    revision: current.revision + 1,
-    updatedAt: sealedAt,
-    plan: {
-      state: 'sealed',
-      sealedAt,
-      work,
-    },
-  };
-  await storage.compareAndSwap(repoKey, runId, current.revision, next);
-  assertAnalyzeRunStorage(storage);
-  return toView(next);
+  return work;
 }
 
 function activationWorkKey(

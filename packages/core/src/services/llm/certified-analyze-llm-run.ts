@@ -156,6 +156,7 @@ export function certifyAnalyzeLlmRun(
   if (input.database) {
     const mode = modeFor(input.database.existingViolations);
     work.push(certify('database', 'database', () => {
+      validateAggregateDomain('database', 'database', input.database!.llmRules);
       const planned = mode === 'lifecycle'
         ? planDatabaseViolationWork(input.database!, 'lifecycle', execution)
         : planDatabaseViolationWork(input.database!, 'normal', execution);
@@ -173,6 +174,7 @@ export function certifyAnalyzeLlmRun(
   if (input.service) {
     const mode = modeFor(input.service.existingViolations);
     work.push(certify('service', 'architecture', () => {
+      validateAggregateDomain('service', 'architecture', input.service!.llmRules);
       const planned = mode === 'lifecycle'
         ? planServiceViolationWork(input.service!, 'lifecycle', execution)
         : planServiceViolationWork(input.service!, 'normal', execution);
@@ -190,6 +192,7 @@ export function certifyAnalyzeLlmRun(
   if (input.module) {
     const mode = modeFor(input.module.existingViolations);
     work.push(certify('module', 'architecture', () => {
+      validateAggregateDomain('module', 'architecture', input.module!.llmRules);
       const planned = mode === 'lifecycle'
         ? planModuleViolationWork(input.module!, 'lifecycle', execution)
         : planModuleViolationWork(input.module!, 'normal', execution);
@@ -310,6 +313,24 @@ function validateCodeDomain(domain: RuleDomain, context: CodeViolationContext): 
       'invalid-context',
       `Analyze code domain ${domain} must match every eligible rule key`,
       'code',
+      domain,
+    );
+  }
+}
+
+function validateAggregateDomain(
+  family: 'database' | 'service' | 'module',
+  domain: 'database' | 'architecture',
+  rules: readonly { readonly key: string }[],
+): void {
+  if (
+    rules.length === 0 ||
+    !rules.every((rule) => rule.key.startsWith(`${domain}/`))
+  ) {
+    throw new AnalyzeLlmPlanError(
+      'invalid-context',
+      `Analyze ${family} work requires at least one ${domain} rule and no cross-domain rules`,
+      family,
       domain,
     );
   }
