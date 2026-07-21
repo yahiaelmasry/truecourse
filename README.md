@@ -88,10 +88,11 @@ are mutated and remains separate from `LATEST.json`.
 Prepared finalization replays completed-baseline promotion, idempotent history/
 diff/registry projections, and journal completion in that order. An exact retry
 repairs any interrupted step without replacing a newer completed descendant.
-The checkpoint storage seam is available at this stage, but the production
-certified executor does not write checkpoints yet and successful LLM response
-reuse is not enabled. Schema-v1 and schema-v2 journals remain readable and
-migrate safely to v3 when a current lifecycle command writes them.
+The certified executor writes each accepted result and its usage evidence to
+the attempted-run journal before reporting that work item successful. Eligible
+journaled architecture runs therefore preserve paid successes, but reuse and
+Resume are not enabled yet. Schema-v1 and schema-v2 journals remain readable
+and migrate safely to v3 when a current lifecycle command writes them.
 
 The first production-wiring slice journals full analyses only when their LLM
 plan contains certified aggregate architecture work and no code-batch or

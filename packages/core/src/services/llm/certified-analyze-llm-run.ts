@@ -2,10 +2,14 @@ import { CODE_DOMAINS, type RuleDomain } from '@truecourse/shared';
 import { isLlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   admitAnalyzeRunPlanExecution,
+  checkpointAnalyzeRunWork,
   type AnalyzeRunExecutionCompletion,
+  type AnalyzeRunCheckpointWriter,
   type AnalyzeRunPlanActivation,
 } from '../../lib/analyze-run-journal.js';
 import { certifyAnalyzeRunExecutionCompletion } from '../../lib/analyze-run-execution-completion.js';
+import { certifyAnalyzeRunWorkCheckpoint } from '../../lib/analyze-run-work-checkpoint-certification.js';
+import type { AnalyzeLlmExecutionUsage } from './analyze-llm-execution-evidence.js';
 import { log } from '../../lib/logger.js';
 import type {
   CodeViolationContext,
@@ -29,7 +33,6 @@ import {
   planServiceViolationWork,
   type PlannedServiceViolationWork,
 } from './service-work-planner.js';
-import type { AnalyzeLlmExecutionUsage } from './analyze-llm-execution-evidence.js';
 import type { LlmWorkExecutionIntent } from './work-identity.js';
 
 export type AnalyzeLlmWorkFamily = 'code' | 'database' | 'service' | 'module';
@@ -286,9 +289,9 @@ export function certifyAnalyzeLlmRun(
         () => {
           assertExecutionMatches(execution, adapter.execution);
         },
-        () => {
+        (checkpointWriter) => {
           executed = true;
-          return executeCertifiedWork(observer);
+          return executeCertifiedWork(observer, checkpointWriter);
         },
       );
       if (!admission.admitted) {
@@ -308,6 +311,7 @@ export function certifyAnalyzeLlmRun(
 
   async function executeCertifiedWork(
     observer?: AnalyzeLlmWorkProgressObserver,
+    checkpointWriter?: AnalyzeRunCheckpointWriter,
   ): Promise<readonly {
     readonly work: CertifiedAnalyzeLlmWork;
     readonly result: unknown;
@@ -328,9 +332,21 @@ export function certifyAnalyzeLlmRun(
             );
           },
         });
-        const result = certifyExecutionOutcome(item, outcome, execution).result;
+        const certified = certifyExecutionOutcome(item, outcome, execution);
+        if (!checkpointWriter) {
+          throw new AnalyzeLlmPlanError('plan-not-activated', 'Analyze checkpoint writer is missing');
+        }
+        await checkpointAnalyzeRunWork(certifyAnalyzeRunWorkCheckpoint(checkpointWriter, {
+          workId: item.workId,
+          inputFingerprint: item.inputFingerprint,
+          checkpointedAt: certified.completedAt,
+          attemptId: certified.attemptId,
+          resultContractId: certified.resultContractId,
+          result: certified.result,
+          usage: certified.usage,
+        }));
         ok = true;
-        return { work: item, result };
+        return { work: item, result: certified.result };
       } finally {
         await startNotification;
         await notifyProgressObserver('done', item, () =>

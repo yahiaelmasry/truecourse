@@ -65,11 +65,11 @@ async function certifySuccessfulExecution(
   sealedAt = '2026-07-19T01:30:01.000Z',
 ): Promise<CertifiedAnalyzeLlmExecution> {
   let providerCalls = 0;
+  const completedAt = new Date(Date.parse(sealedAt) + 1).toISOString();
   const adapter: AnalyzeLlmExecutionAdapter = {
     execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
     async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
       providerCalls += 1;
-      const completedAt = new Date(Date.parse(sealedAt) + 1).toISOString();
       return {
         family: work.family,
         domain: work.domain,
@@ -232,9 +232,9 @@ describe('analyze run journal', () => {
 
     expect(sealed).toMatchObject({
       runId: 'hosted-run',
-      revision: 2,
+      revision: 3,
       plan: 'sealed',
-      counts: { total: 1, pending: 1 },
+      counts: { total: 1, pending: 0, succeeded: 1 },
     });
     const finalizing = await beginFinalizeAnalyzeRun(repoKey, {
       runId: 'hosted-run',
@@ -416,7 +416,7 @@ describe('analyze run journal', () => {
     }, execution.completion);
 
     expect(finalizing).toMatchObject({
-      revision: 3,
+      revision: 4,
       state: 'finalizing',
       candidateAnalysisId: 'candidate-analysis',
       completedBaselineId: 'previous-completed-analysis',
@@ -424,7 +424,7 @@ describe('analyze run journal', () => {
       finalization: {
         finalizingAt: '2026-07-19T01:30:02.000Z',
       },
-      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
     });
     const journalPath = path.join(
       repoPath,
@@ -436,7 +436,7 @@ describe('analyze run journal', () => {
     expect(JSON.parse(fs.readFileSync(journalPath, 'utf8'))).toMatchObject({
       plan: {
         work: [
-          { state: 'succeeded-uncheckpointed' },
+          { state: 'succeeded-checkpointed' },
         ],
       },
     });
@@ -485,7 +485,7 @@ describe('analyze run journal', () => {
     });
     expect(prepared).toMatchObject({
       schemaVersion: 3,
-      revision: 4,
+      revision: 5,
       state: 'finalizing',
       finalization: {
         finalizingAt: '2026-07-19T01:30:02.000Z',
@@ -749,7 +749,7 @@ describe('analyze run journal', () => {
       error: { code: 'FINALIZE_FAILED', message: 'Projection write failed.' },
     });
     expect(failed).toMatchObject({
-      revision: 5,
+      revision: 6,
       state: 'failed',
       finalization: {
         finalizingAt: '2026-07-19T01:33:02.000Z',
@@ -822,7 +822,7 @@ describe('analyze run journal', () => {
     )).toHaveLength(1);
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'concurrent-finalization-run' }))
-      .resolves.toMatchObject({ revision: 4 });
+      .resolves.toMatchObject({ revision: 5 });
   });
 
   it('reads and safely migrates schema-v1 finalizing state and latest pointer', async () => {
@@ -851,6 +851,11 @@ describe('analyze run journal', () => {
     const legacy = JSON.parse(fs.readFileSync(runFile, 'utf8')) as Record<string, unknown>;
     legacy.schemaVersion = 1;
     legacy.revision = 2;
+    const legacyPlan = legacy.plan as { work: Array<Record<string, unknown>> };
+    legacyPlan.work = legacyPlan.work.map(({ checkpoint: _checkpoint, ...item }) => ({
+      ...item,
+      state: 'succeeded-uncheckpointed',
+    }));
     delete legacy.finalizationIntent;
     fs.writeFileSync(runFile, JSON.stringify(legacy), 'utf8');
     fs.writeFileSync(pointerFile, JSON.stringify({
@@ -931,6 +936,11 @@ describe('analyze run journal', () => {
     const legacy = JSON.parse(fs.readFileSync(runFile, 'utf8')) as Record<string, unknown>;
     legacy.schemaVersion = 1;
     legacy.revision = 2;
+    const legacyPlan = legacy.plan as { work: Array<Record<string, unknown>> };
+    legacyPlan.work = legacyPlan.work.map(({ checkpoint: _checkpoint, ...item }) => ({
+      ...item,
+      state: 'succeeded-uncheckpointed',
+    }));
     delete legacy.finalizationIntent;
     fs.writeFileSync(runFile, JSON.stringify(legacy), 'utf8');
     resetAnalyzeRunStorage();
@@ -979,17 +989,17 @@ describe('analyze run journal', () => {
     }, execution.completion)).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      revision: 2,
+      revision: 3,
       state: 'running',
-      counts: { pending: 1, succeeded: 0 },
+      counts: { pending: 0, succeeded: 1 },
     });
     await expect(beginFinalizeAnalyzeRun(repoPath, {
       runId: 'exact-finalize-run',
       finalizingAt: '2026-07-19T01:40:02.000Z',
-    }, execution.completion)).resolves.toMatchObject({ revision: 3, state: 'finalizing' });
+    }, execution.completion)).resolves.toMatchObject({ revision: 4, state: 'finalizing' });
   });
 
-  it('records a finalization failure without forgetting successful uncheckpointed calls', async () => {
+  it('records a finalization failure without forgetting successful checkpointed calls', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'finalization-failure-run',
@@ -1018,7 +1028,7 @@ describe('analyze run journal', () => {
     });
 
     expect(failed).toMatchObject({
-      revision: 4,
+      revision: 5,
       state: 'failed',
       completedBaselineId: 'safe-baseline',
       counts: { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 },
@@ -1027,7 +1037,7 @@ describe('analyze run journal', () => {
         failedAt: '2026-07-19T01:55:03.000Z',
       },
       finalization: { finalizingAt: '2026-07-19T01:55:02.000Z' },
-      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
     });
   });
 
@@ -1066,7 +1076,7 @@ describe('analyze run journal', () => {
       outcome.status === 'rejected' && outcome.reason instanceof AnalyzeRunRevisionConflictError,
     )).toHaveLength(1);
     const latest = await readAnalyzeRun(repoPath, 'latest-attempt');
-    expect(latest).toMatchObject({ revision: 3 });
+    expect(latest).toMatchObject({ revision: 4 });
     expect(latest?.counts).toEqual(
       latest?.state === 'finalizing'
         ? { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 }
@@ -1531,7 +1541,7 @@ describe('analyze run journal', () => {
 
     fs.writeFileSync(file, JSON.stringify({
       ...finalizing,
-      revision: 4,
+      revision: 2,
     }));
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(

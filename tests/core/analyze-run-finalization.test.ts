@@ -189,7 +189,7 @@ async function prepareRun(
         resultContractId: work.planned.request.resultContractId,
         result: { violations: [] },
         attemptId: `test:${work.workId}`,
-        completedAt: '2026-07-19T10:00:01.001Z',
+        completedAt: '2026-07-19T10:00:01.500Z',
         usage: null,
       };
     },
@@ -272,7 +272,7 @@ describe('prepared analyze-run finalization', () => {
         },
       ))).rejects.toThrow(`injected ${faultPoint}`);
       await expect(readAnalyzeRun(repoPath, { runId: 'run-a' })).resolves.toMatchObject({
-        revision: 4,
+        revision: 5,
         state: 'finalizing',
         finalization: { persistence: 'prepared' },
       });
@@ -283,7 +283,7 @@ describe('prepared analyze-run finalization', () => {
         { runId: 'run-a', completedAt: '2026-07-19T10:00:04.000Z' },
       ));
       expect(completed).toMatchObject({
-        revision: 5,
+        revision: 6,
         state: 'completed',
         updatedAt: '2026-07-19T10:00:04.000Z',
         resume: { available: false, reason: 'run-completed' },
@@ -327,7 +327,7 @@ describe('prepared analyze-run finalization', () => {
     await expect(withAnalyzeLifecycleLock(repoPath, () => finalizePreparedAnalyzeRun(
       repoPath,
       { runId: 'run-a', completedAt: '2026-07-19T10:00:04.000Z' },
-    ))).resolves.toMatchObject({ state: 'completed', revision: 5 });
+    ))).resolves.toMatchObject({ state: 'completed', revision: 6 });
     expect((await readLatest(repoPath))?.analysis.id).toBe(second.id);
     expect((await readHistory(repoPath)).analyses).toEqual([historyFor(first)]);
     expect((await getProjectBySlug(projectSlug))?.lastAnalyzed).toBe(second.createdAt);
@@ -350,7 +350,7 @@ describe('prepared analyze-run finalization', () => {
     expect((await readHistory(repoPath)).analyses).toEqual([]);
     expect((await getProjectBySlug(projectSlug))?.lastAnalyzed).toBeUndefined();
     await expect(readAnalyzeRun(repoPath, { runId: 'run-invalid-time' })).resolves.toMatchObject({
-      revision: 4,
+      revision: 5,
       state: 'finalizing',
     });
   });
@@ -367,12 +367,12 @@ describe('prepared analyze-run finalization', () => {
       } },
     ))).rejects.toThrow('ambiguous completed response');
     await expect(readAnalyzeRun(repoPath, { runId: 'run-completion-response' }))
-      .resolves.toMatchObject({ state: 'completed', revision: 5 });
+      .resolves.toMatchObject({ state: 'completed', revision: 6 });
 
     await expect(withAnalyzeLifecycleLock(repoPath, () => finalizePreparedAnalyzeRun(
       repoPath,
       { runId: 'run-completion-response', completedAt: '2026-07-19T10:00:04.000Z' },
-    ))).resolves.toMatchObject({ state: 'completed', revision: 5 });
+    ))).resolves.toMatchObject({ state: 'completed', revision: 6 });
 
     const runFile = path.join(
       repoPath,
@@ -416,7 +416,7 @@ describe('prepared analyze-run finalization', () => {
       ))).rejects.toThrow(/storage changed/i);
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
         state: 'completed',
-        revision: 5,
+        revision: 6,
       });
     },
   );
@@ -442,7 +442,7 @@ describe('prepared analyze-run finalization', () => {
     expect((await getProjectBySlug(projectSlug))?.lastAnalyzed).toBeUndefined();
     await expect(readAnalyzeRun(repoPath, { runId: 'run-unrelated' })).resolves.toMatchObject({
       state: 'finalizing',
-      revision: 4,
+      revision: 5,
     });
   });
 
@@ -463,8 +463,8 @@ describe('prepared analyze-run finalization', () => {
         if (point === 'after-projection') setAnalyzeRunStorage(storageB);
       } },
     ))).rejects.toThrow(/storage changed/i);
-    expect(storedA).toMatchObject({ revision: 4, status: { state: 'finalizing' } });
-    expect(storedB).toMatchObject({ revision: 4, status: { state: 'finalizing' } });
+    expect(storedA).toMatchObject({ revision: 5, status: { state: 'finalizing' } });
+    expect(storedB).toMatchObject({ revision: 5, status: { state: 'finalizing' } });
   });
 
   it('does not return completed from a journal storage that became inactive during its read', async () => {
@@ -493,7 +493,7 @@ describe('prepared analyze-run finalization', () => {
     const completedA = JSON.parse(JSON.stringify(storedA)) as StoredAnalyzeRun;
     storedB = {
       ...completedA,
-      revision: 4,
+      revision: 5,
       updatedAt: '2026-07-19T10:00:03.000Z',
       status: { state: 'finalizing', finalizingAt: '2026-07-19T10:00:02.000Z' },
     };
@@ -504,7 +504,7 @@ describe('prepared analyze-run finalization', () => {
       repoPath,
       { runId: 'run-completed-swap', completedAt: '2026-07-19T10:00:04.000Z' },
     ))).rejects.toThrow(/storage changed/i);
-    expect(storedB).toMatchObject({ revision: 4, status: { state: 'finalizing' } });
+    expect(storedB).toMatchObject({ revision: 5, status: { state: 'finalizing' } });
   });
 
   it('does not continue finalization after the analysis store changes', async () => {
@@ -533,7 +533,7 @@ describe('prepared analyze-run finalization', () => {
     expect((await readLatest(repoPath))?.analysis.id).toBe(candidate.id);
     expect((await readHistory(repoPath)).analyses).toEqual([]);
     await expect(readAnalyzeRun(repoPath, { runId: 'run-analysis-store-change' }))
-      .resolves.toMatchObject({ state: 'finalizing', revision: 4 });
+      .resolves.toMatchObject({ state: 'finalizing', revision: 5 });
   });
 
   it('does not continue projection after the registry store changes', async () => {
@@ -560,7 +560,7 @@ describe('prepared analyze-run finalization', () => {
     expect((await readLatest(repoPath))?.analysis.id).toBe(candidate.id);
     expect((await readHistory(repoPath)).analyses).toEqual([]);
     await expect(readAnalyzeRun(repoPath, { runId: 'run-registry-store-change' }))
-      .resolves.toMatchObject({ state: 'finalizing', revision: 4 });
+      .resolves.toMatchObject({ state: 'finalizing', revision: 5 });
   });
 
   it.each(['analysis', 'registry'] as const)(
@@ -600,7 +600,7 @@ describe('prepared analyze-run finalization', () => {
           if (point === 'after-projection') swapDuringCompletionRead = true;
         } },
       ))).rejects.toThrow(/persistence storage changed/i);
-      expect(stored).toMatchObject({ revision: 4, status: { state: 'finalizing' } });
+      expect(stored).toMatchObject({ revision: 5, status: { state: 'finalizing' } });
     },
   );
 
@@ -622,7 +622,7 @@ describe('prepared analyze-run finalization', () => {
           fs.symlinkSync(otherRepo, alias, 'dir');
         }
       } },
-    ))).resolves.toMatchObject({ state: 'completed', revision: 5 });
+    ))).resolves.toMatchObject({ state: 'completed', revision: 6 });
     expect((await readLatest(repoPath))?.analysis.id).toBe(candidate.id);
     expect(await readLatest(otherRepo)).toBeNull();
   });

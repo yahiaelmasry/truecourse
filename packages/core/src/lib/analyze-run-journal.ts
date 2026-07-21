@@ -809,10 +809,11 @@ export async function admitAnalyzeRunPlanExecution<T>(
         !completed
         || completed.status.state !== 'running'
         || completed.plan.state !== 'sealed'
+        || completed.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
         || activation.workKey !== activationWorkKey(completed.plan.work)
       ) {
         throw new InvalidAnalyzeRunTransitionError(
-          `Analyze run ${activation.runId} changed while its certified work was executing`,
+          `Analyze run ${activation.runId} did not durably checkpoint every certified result`,
         );
       }
       const certification = issueAnalyzeRunExecutionCertification({
@@ -1039,15 +1040,11 @@ export async function beginFinalizeAnalyzeRun(
       `Cannot finalize analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
     );
   }
-  const allPending = current.plan.work.every((item) => item.state === 'pending');
-  const allCheckpointed = current.plan.work.every(
-    (item) => item.state === 'succeeded-checkpointed',
-  );
   if (
     certified.claimed ||
     certified.revision !== current.revision ||
     certified.workKey !== activationWorkKey(current.plan.work) ||
-    (!allPending && !allCheckpointed)
+    current.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
   ) {
     throw new InvalidAnalyzeRunTransitionError(
       `Analyze execution completion does not certify run ${runId}'s current sealed plan`,
@@ -1067,16 +1064,7 @@ export async function beginFinalizeAnalyzeRun(
     updatedAt: finalizingAt,
     status: { state: 'finalizing', finalizingAt },
     finalizationIntent: null,
-    plan: allCheckpointed
-      ? current.plan
-      : {
-          ...current.plan,
-          work: current.plan.work.map((item) => ({
-            workId: item.workId,
-            inputFingerprint: item.inputFingerprint,
-            state: 'succeeded-uncheckpointed' as const,
-          })),
-        },
+    plan: current.plan,
   };
   certified.claimed = true;
   try {

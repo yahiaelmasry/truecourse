@@ -98,7 +98,7 @@ class Adapter implements AnalyzeLlmExecutionAdapter {
         serviceDescriptions: [{ id: 'service-orders', description: 'Orders' }],
       },
       attemptId: `test:${work.workId}`,
-      completedAt: '2026-07-19T00:00:01.000Z',
+      completedAt: new Date().toISOString(),
       usage: null,
     };
   }
@@ -122,7 +122,8 @@ describe('certified violation phase', () => {
     await expect(readAnalyzeRun(repositoryKey, { runId: 'successful-phase' }))
       .resolves.toMatchObject({
         state: 'running',
-        counts: { pending: 1, succeeded: 0 },
+        counts: { pending: 0, succeeded: 1 },
+        resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
       });
   });
 

@@ -6,7 +6,6 @@ import {
   AnalyzeRunJournalCorruptError,
   InvalidAnalyzeRunTransitionError,
   admitAnalyzeRunPlanExecution,
-  beginFinalizeAnalyzeRun,
   checkpointAnalyzeRunWork,
   dispatchAnalyzeRun,
   readAnalyzeRun,
@@ -15,7 +14,6 @@ import {
   type AnalyzeRunCheckpointWriter,
   type AnalyzeRunPlanActivation,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
-import { certifyAnalyzeRunExecutionCompletion } from '../../packages/core/src/lib/analyze-run-execution-completion.js';
 import { certifyAnalyzeRunWorkCheckpoint } from '../../packages/core/src/lib/analyze-run-work-checkpoint-certification.js';
 
 const fingerprints = [
@@ -193,17 +191,14 @@ describe('durable analyze-run work checkpoints', () => {
     });
   });
 
-  it('keeps uncheckpointed certified completion compatible until executor wiring lands', async () => {
+  it('rejects certified completion until every planned result is checkpointed', async () => {
     const { execution } = await admit(async () => 'legacy-result');
-    const completed = await execution;
+    await expect(execution).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
 
-    await expect(beginFinalizeAnalyzeRun(repoPath, {
-      runId: 'checkpoint-run',
-      finalizingAt: '2026-07-19T04:00:02.000Z',
-    }, certifyAnalyzeRunExecutionCompletion(completed.certification))).resolves.toMatchObject({
-      state: 'finalizing',
-      revision: 3,
-      counts: { pending: 0, succeeded: 2 },
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      state: 'running',
+      revision: 2,
+      counts: { pending: 2, succeeded: 0 },
     });
   });
 
