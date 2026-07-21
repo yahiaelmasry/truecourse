@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { LlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   AnalyzeLlmPlanError,
@@ -11,8 +11,12 @@ import {
   type CertifiedAnalyzeLlmWork,
 } from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
 import {
+  type AnalyzeRunStorage,
+  type StoredAnalyzeRun,
   dispatchAnalyzeRun,
+  resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
+  setAnalyzeRunStorage,
   type AnalyzeRunPlanActivation,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import type {
@@ -144,6 +148,10 @@ afterAll(() => {
   for (const repository of temporaryRepositories.splice(0)) {
     rmSync(repository, { recursive: true, force: true });
   }
+});
+
+afterEach(() => {
+  resetAnalyzeRunStorage();
 });
 
 async function activate(
@@ -671,6 +679,59 @@ describe('certified analyze LLM run', () => {
     execution = { provider: 'claude-code', requestedModel: 'opus[1m]' };
     await expect(certified.execute(activation)).resolves.toHaveLength(1);
     expect(calls).toHaveLength(1);
+  });
+
+  it('revalidates provider intent after the durable admission write', async () => {
+    const repoKey = 'hosted:provider-admission-drift';
+    let stored: StoredAnalyzeRun | null = null;
+    let releaseAdmission!: () => void;
+    let markAdmissionStarted!: () => void;
+    const admissionGate = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    const admissionStarted = new Promise<void>((resolve) => { markAdmissionStarted = resolve; });
+    const storage: AnalyzeRunStorage = {
+      async createLatest(_receivedRepoKey, run) {
+        stored = { ...run, attemptSequence: 1 };
+        return stored;
+      },
+      async read(_receivedRepoKey, runId) {
+        return stored?.runId === runId ? stored : null;
+      },
+      async readLatest() { return stored; },
+      async compareAndSwap(_receivedRepoKey, _runId, expectedRevision, next) {
+        if (expectedRevision === 1) {
+          markAdmissionStarted();
+          await admissionGate;
+        }
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = next;
+      },
+    };
+    setAnalyzeRunStorage(storage);
+    let execution = { provider: 'claude-code', requestedModel: 'opus[1m]' };
+    const calls: CertifiedAnalyzeLlmWork[] = [];
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      get execution() { return execution; },
+      async execute(work) {
+        calls.push(work);
+        return { ok: true };
+      },
+    };
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'provider-admission-drift',
+      journalKey: repoKey,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, 'provider-admission-drift', repoKey);
+
+    const result = certified.execute(activation);
+    await admissionStarted;
+    execution = { provider: 'claude-code', requestedModel: 'sonnet' };
+    releaseAdmission();
+
+    await expect(result).rejects.toMatchObject({ code: 'provider-not-certifiable' });
+    expect(calls).toEqual([]);
+    expect(stored).toMatchObject({ revision: 2, status: { state: 'running' } });
   });
 
   it('drains admitted siblings before preserving the provider failure', async () => {

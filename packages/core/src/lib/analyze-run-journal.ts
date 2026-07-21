@@ -505,6 +505,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
       admitted,
     );
     assertAnalyzeRunStorage(storage);
+    validate();
     const execution = admit();
     analyzeRunPlanActivations.delete(receipt);
     analyzeRunPlanActivationReceipts.get(storage)?.delete(activation.cacheKey);
