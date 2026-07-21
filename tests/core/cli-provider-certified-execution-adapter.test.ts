@@ -36,6 +36,33 @@ class UsageDirectProvider extends ClaudeCodeProvider {
   }
 }
 
+class PinningDirectProvider extends ClaudeCodeProvider {
+  readonly modelOverrides: Array<string | null> = [];
+  responseModel: string | null = null;
+  omitModelUsage = false;
+
+  cliArgsFor(modelOverride?: string): string[] {
+    return this.buildCLIArgs('{"type":"object"}', {
+      modelOverride,
+      extraArgs: ['--tools', ''],
+    });
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { modelOverride?: string },
+  ): Promise<string> {
+    this.modelOverrides.push(options?.modelOverride ?? null);
+    const resolvedModel = this.responseModel ?? options?.modelOverride ?? 'claude-sonnet-normal';
+    return JSON.stringify({
+      structured_output: { violations: [], serviceDescriptions: [] },
+      usage: { input_tokens: 100, output_tokens: 20 },
+      ...(this.omitModelUsage ? {} : { modelUsage: { [resolvedModel]: { inputTokens: 100 } } }),
+    });
+  }
+}
+
 const serviceContext: ServiceViolationContext = {
   architecture: 'distributed services',
   services: [{
@@ -244,5 +271,101 @@ describe('CLI certified analyze execution adapter', () => {
         costUsd: '0.0123',
       },
     });
+  });
+
+  it('scopes an exact concrete resume-model pin without changing planned alias identity', async () => {
+    const provider = new PinningDirectProvider(undefined, 'sonnet');
+    const planned = planServiceViolationWork(serviceContext, 'normal', provider.execution);
+    const work = Object.freeze({
+      family: 'service',
+      domain: 'architecture',
+      mode: 'normal',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      planned,
+    }) as CertifiedAnalyzeLlmWork;
+    const pinned = provider.createPinnedResumeAdapter('claude-sonnet-4-5-20250929');
+
+    expect(pinned.execution).toEqual({ provider: 'claude-code', requestedModel: 'sonnet' });
+    expect(pinned.resumeExecution).toEqual({
+      provider: 'claude-code',
+      requestedModel: 'sonnet',
+      modelSelection: 'pinned',
+      resolvedModel: 'claude-sonnet-4-5-20250929',
+    });
+    await expect(pinned.execute(work)).resolves.toMatchObject({
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      usage: {
+        requestedModel: 'sonnet',
+        resolvedModel: 'claude-sonnet-4-5-20250929',
+      },
+    });
+    expect(provider.modelOverrides).toEqual(['claude-sonnet-4-5-20250929']);
+    const pinnedArgs = provider.cliArgsFor('claude-sonnet-4-5-20250929');
+    expect(pinnedArgs.filter((arg) => arg === '--model')).toHaveLength(1);
+    expect(pinnedArgs[pinnedArgs.indexOf('--model') + 1]).toBe('claude-sonnet-4-5-20250929');
+    expect(pinnedArgs).not.toContain('sonnet');
+
+    await provider.execute(work);
+    expect(provider.modelOverrides).toEqual(['claude-sonnet-4-5-20250929', null]);
+  });
+
+  it('keeps concurrent resume-model pins isolated on one provider', async () => {
+    const provider = new PinningDirectProvider(undefined, 'sonnet');
+    const planned = planServiceViolationWork(serviceContext, 'normal', provider.execution);
+    const work = Object.freeze({
+      family: 'service',
+      domain: 'architecture',
+      mode: 'normal',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      planned,
+    }) as CertifiedAnalyzeLlmWork;
+
+    const [first, second] = await Promise.all([
+      provider.createPinnedResumeAdapter('claude-model-a').execute(work),
+      provider.createPinnedResumeAdapter('claude-model-b').execute(work),
+    ]);
+
+    expect(new Set(provider.modelOverrides)).toEqual(new Set(['claude-model-a', 'claude-model-b']));
+    expect(new Set([first.usage?.resolvedModel, second.usage?.resolvedModel])).toEqual(
+      new Set(['claude-model-a', 'claude-model-b']),
+    );
+  });
+
+  it('rejects missing, mismatched, or invalid resume-model evidence before recording usage', async () => {
+    const provider = new PinningDirectProvider(undefined, 'sonnet');
+    const planned = planServiceViolationWork(serviceContext, 'normal', provider.execution);
+    const work = Object.freeze({
+      family: 'service',
+      domain: 'architecture',
+      mode: 'normal',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      planned,
+    }) as CertifiedAnalyzeLlmWork;
+    provider.responseModel = 'claude-unexpected-model';
+
+    await expect(
+      provider.createPinnedResumeAdapter('claude-expected-model').execute(work),
+    ).rejects.toThrow(/expected resolved model "claude-expected-model".*"claude-unexpected-model"/);
+    expect(provider.flushUsage()).toEqual([]);
+
+    const missing = new PinningDirectProvider(undefined, 'sonnet');
+    missing.omitModelUsage = true;
+    await expect(
+      missing.createPinnedResumeAdapter('claude-expected-model').execute(work),
+    ).rejects.toThrow(/expected resolved model "claude-expected-model".*"unknown"/);
+    expect(missing.flushUsage()).toEqual([]);
+
+    expect(() => provider.createPinnedResumeAdapter('')).toThrow(/non-empty/);
+    expect(() => provider.createPinnedResumeAdapter(' model-with-whitespace ')).toThrow(/whitespace/);
+    expect(() => new AlternateCliProvider().createPinnedResumeAdapter('claude-model')).toThrow(
+      /direct Claude Code/,
+    );
+    expect(() => new ClaudeCodeProvider(async () => '{}').createPinnedResumeAdapter('claude-model')).toThrow(
+      /direct Claude Code/,
+    );
   });
 });

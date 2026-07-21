@@ -111,6 +111,8 @@ import type {
 
 interface SpawnOptions {
   timeoutMs?: number;
+  /** Replace the configured model flag for this one certified resume call. */
+  modelOverride?: string;
   /** Extra CLI args appended after base args */
   extraArgs?: string[];
   /** Fires once the concurrency limiter grants a slot, before spawnCLI runs. */
@@ -143,6 +145,7 @@ interface PlannedExecutionSuccess {
 
 type PlannedExecutionOptions = AnalyzeLlmExecutionOptions & {
   onSuccess?: (evidence: PlannedExecutionSuccess) => void;
+  resumeModelPin?: string;
 };
 
 function certifyCodeResultOwnership(
@@ -326,10 +329,27 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     work: CertifiedAnalyzeLlmWork,
     options?: AnalyzeLlmExecutionOptions,
   ): Promise<AnalyzeLlmExecutionOutcome> {
+    return this.executeCertifiedWork(work, options);
+  }
+
+  protected executeWithPinnedResumeModel(
+    work: CertifiedAnalyzeLlmWork,
+    resolvedModel: string,
+    options?: AnalyzeLlmExecutionOptions,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
+    return this.executeCertifiedWork(work, options, resolvedModel);
+  }
+
+  private async executeCertifiedWork(
+    work: CertifiedAnalyzeLlmWork,
+    options?: AnalyzeLlmExecutionOptions,
+    resumeModelPin?: string,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
     let result: unknown;
     let evidence: PlannedExecutionSuccess | undefined;
     const plannedOptions: PlannedExecutionOptions = {
       ...options,
+      resumeModelPin,
       onSuccess: (value) => { evidence = value; },
     };
     switch (work.family) {
@@ -414,6 +434,21 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
   }
 
   /** Spawn CLI subprocess, pipe prompt via stdin, collect stdout. */
+  protected buildCLIArgs(
+    jsonSchemaStr: string,
+    opts?: Pick<SpawnOptions, 'modelOverride' | 'extraArgs'>,
+  ): string[] {
+    const modelArgs = opts?.modelOverride
+      ? ['--model', opts.modelOverride]
+      : this.modelFlag;
+    return [
+      ...this.baseArgs,
+      ...modelArgs,
+      '--json-schema', jsonSchemaStr,
+      ...(opts?.extraArgs ?? []),
+    ];
+  }
+
   protected spawnCLI(prompt: string, jsonSchemaStr: string, opts?: SpawnOptions & { label?: string }): Promise<string> {
     // Check if already aborted before spawning
     if (this._abortSignal?.aborted) {
@@ -437,17 +472,12 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         system: opts?.system ?? '',
         schema: jsonSchemaStr,
         responseFormat: opts?.responseFormat ?? 'json',
-        model: this.modelFlag[1],
+        model: opts?.modelOverride ?? this.modelFlag[1],
         timeoutMs: timeout,
       }).then((text) => JSON.stringify({ result: text }));
     }
 
-    const args = [
-      ...this.baseArgs,
-      ...this.modelFlag,
-      '--json-schema', jsonSchemaStr,
-      ...(opts?.extraArgs ?? []),
-    ];
+    const args = this.buildCLIArgs(jsonSchemaStr, opts);
 
     return new Promise((resolve, reject) => {
       // cross-spawn handles Windows `.cmd`/`.ps1` shim resolution without
@@ -689,6 +719,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
     doneMessage: (result: T, durationMs: number) => string;
     onStart?: () => void;
     onSuccess?: (evidence: PlannedExecutionSuccess) => void;
+    resumeModelPin?: string;
   }): Promise<T> {
     log.info(options.startMessage);
     const t0 = Date.now();
@@ -698,10 +729,16 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       workId: options.workId,
       inputFingerprint: options.inputFingerprint,
       extraArgs: options.extraArgs,
+      modelOverride: options.resumeModelPin,
       label: options.request.label,
       timeoutMs: options.request.timeoutMs,
       onStart: options.onStart,
     });
+    if (options.resumeModelPin && cliUsage?.resolvedModel !== options.resumeModelPin) {
+      throw new Error(
+        `Certified resume expected resolved model "${options.resumeModelPin}" but provider reported "${cliUsage?.resolvedModel ?? 'unknown'}"`,
+      );
+    }
     options.accept?.(data);
     const dur = Date.now() - t0;
     log.info(options.doneMessage(data, dur));
@@ -753,6 +790,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
           `[CLI] Lifecycle service call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
         onStart: opts?.onStart,
         onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
       });
     }
     return this.executePreparedViolationWork({
@@ -767,6 +805,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         `[CLI] Service violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
       onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
     });
   }
 
@@ -801,6 +840,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
           `[CLI] Lifecycle database call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
         onStart: opts?.onStart,
         onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
       });
     }
     return this.executePreparedViolationWork({
@@ -815,6 +855,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         `[CLI] Database violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
       onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
     });
   }
 
@@ -849,6 +890,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
           `[CLI] Lifecycle module call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
         onStart: opts?.onStart,
         onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
       });
     }
     return this.executePreparedViolationWork({
@@ -863,6 +905,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         `[CLI] Module violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
       onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
     });
   }
 
@@ -898,6 +941,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
           `[CLI] Code violations call done in ${dur}ms — new: ${result.newViolations.length}, resolved: ${result.resolvedViolationIds.length}, unchanged: ${result.unchangedViolationIds.length}`,
         onStart: opts?.onStart,
         onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
       });
     }
     return this.executePreparedViolationWork({
@@ -913,6 +957,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         `[CLI] Code violations call done in ${dur}ms — ${result.violations.length} violations`,
       onStart: opts?.onStart,
       onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
     });
   }
 
@@ -1309,5 +1354,35 @@ export class ClaudeCodeProvider extends BaseCLIProvider {
     // CLAUDE_CODE_MODEL background default.
     const model = this.selectedModel || config.claudeCodeModel;
     return model ? ['--model', model] : [];
+  }
+
+  /**
+   * Create a resume-adapter-scoped executor that can prove and enforce the exact concrete
+   * Claude model recorded by a blocked run. The original requested alias stays
+   * in `execution`, so the certified work identity remains unchanged.
+   */
+  createPinnedResumeAdapter(resolvedModel: string): AnalyzeLlmExecutionAdapter {
+    if (this.transport || this.providerId !== 'claude-code') {
+      throw new Error('Resume model pinning is available only for direct Claude Code execution');
+    }
+    if (resolvedModel.length === 0) {
+      throw new Error('Resume model pin must be non-empty');
+    }
+    if (resolvedModel.trim() !== resolvedModel) {
+      throw new Error('Resume model pin must not contain surrounding whitespace');
+    }
+
+    const execution = this.execution;
+    const resumeExecution = Object.freeze({
+      ...execution,
+      modelSelection: 'pinned' as const,
+      resolvedModel,
+    });
+    return Object.freeze({
+      execution,
+      resumeExecution,
+      execute: (work: CertifiedAnalyzeLlmWork, options?: AnalyzeLlmExecutionOptions) =>
+        this.executeWithPinnedResumeModel(work, resolvedModel, options),
+    });
   }
 }

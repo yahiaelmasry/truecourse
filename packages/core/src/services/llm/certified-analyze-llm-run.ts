@@ -87,6 +87,8 @@ export interface AnalyzeLlmExecutionAdapter {
     readonly modelSelection: 'pinned';
     readonly resolvedModel: string;
   }>;
+  /** Create an adapter-scoped executor that can enforce an exact resume model, when supported. */
+  createPinnedResumeAdapter?(resolvedModel: string): AnalyzeLlmExecutionAdapter;
   execute(
     work: CertifiedAnalyzeLlmWork,
     options?: AnalyzeLlmExecutionOptions,
