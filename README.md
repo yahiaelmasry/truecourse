@@ -79,15 +79,15 @@ files are local and gitignored: a running, blocked, or failed attempt never
 replaces the completed findings in `LATEST.json`. If a crash loses the pointer
 update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
-`packages/core/src/lib/analyze-run-journal.ts`; this initial schema records
-pending work and reset/failure information and reserves its initial execution-
-admission revisions for the next lifecycle slice. It deliberately does not
-reuse successful LLM responses yet.
-
-Before finalization is enabled, the schema-v1 reader also reserves the
-`finalizing` and `succeeded-uncheckpointed` states written by the next ordered
-slice. This lets the immediately preceding release inspect a newer local
-journal instead of misclassifying it as corrupt.
+`packages/core/src/lib/analyze-run-journal.ts`. Schema v2 records pending work,
+reset/failure information, durable execution admission, and an exact prepared
+finalization intent containing the completed-baseline promotion and secondary
+projection inputs. The intent is written to the attempted-run journal before
+completed artifacts are mutated and remains separate from `LATEST.json`.
+Executing a prepared finalization is added by the next ordered contribution;
+successful LLM response reuse is also not enabled yet. Schema-v1 journals and
+their reserved finalizing states remain readable and migrate safely to v2 when
+the preparation command is used.
 
 Completed analyses are promoted separately from attempted-run journals. Local
 prepared-promotion markers live under `.truecourse/analyses/.promotions/`
