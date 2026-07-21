@@ -12,6 +12,7 @@ import type { Violation } from '@truecourse/shared';
 import {
   isLlmSessionLimitError,
   parseLlmSessionLimitError,
+  resolveEnvelopeModel,
   type LlmSessionLimitError,
   type LlmTransport,
 } from '@truecourse/shared/llm';
@@ -131,6 +132,7 @@ interface CLIUsage {
   cacheWriteTokens: number;
   totalTokens: number;
   costUsd?: string;
+  resolvedModel: string | null;
 }
 
 interface PlannedExecutionSuccess {
@@ -549,6 +551,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       cacheWriteTokens: cacheWrite,
       totalTokens: input + output,
       costUsd: costRaw != null ? String(costRaw) : undefined,
+      resolvedModel: resolveEnvelopeModel(this.execution.requestedModel, parsed),
     };
   }
 
@@ -709,7 +712,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       usage: usage === null ? null : {
         ...usage,
         requestedModel: this.execution.requestedModel,
-        resolvedModel: null,
+        resolvedModel: cliUsage?.resolvedModel ?? null,
         cacheReadTokens: usage.cacheReadTokens ?? 0,
         cacheWriteTokens: usage.cacheWriteTokens ?? 0,
         costUsd: usage.costUsd ?? null,

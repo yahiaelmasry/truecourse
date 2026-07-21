@@ -28,6 +28,9 @@ class UsageDirectProvider extends ClaudeCodeProvider {
         cache_read_input_tokens: 3,
         cache_creation_input_tokens: 4,
       },
+      modelUsage: {
+        'claude-sonnet-4-5-20250929': { inputTokens: 100 },
+      },
       total_cost_usd: 0.0123,
     });
   }
@@ -231,7 +234,7 @@ describe('CLI certified analyze execution adapter', () => {
       usage: {
         provider: 'claude-code',
         requestedModel: 'sonnet',
-        resolvedModel: null,
+        resolvedModel: 'claude-sonnet-4-5-20250929',
         callType: 'service',
         inputTokens: 100,
         outputTokens: 20,

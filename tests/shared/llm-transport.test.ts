@@ -7,11 +7,71 @@ import {
   cliTransport,
   resolveTimeoutScale,
   resolveStallTimeoutMs,
+  resolveEnvelopeModel,
   setLlmCallSink,
   stripCodeFences,
   extractJsonValue,
   type LlmCallRecord,
 } from '../../packages/shared/src/llm/transport.js';
+
+describe('resolveEnvelopeModel', () => {
+  it('returns the requested family model when it actually served the call', () => {
+    expect(resolveEnvelopeModel('sonnet', {
+      modelUsage: {
+        'claude-sonnet-4-5-20250929': { inputTokens: 100 },
+        'claude-opus-4-1': { inputTokens: 0 },
+      },
+    })).toBe('claude-sonnet-4-5-20250929');
+  });
+
+  it('returns the busiest fallback model and fails closed when evidence is absent', () => {
+    expect(resolveEnvelopeModel('sonnet', {
+      usage: {
+        modelUsage: {
+          'claude-sonnet-4-5-20250929': { inputTokens: 0 },
+          'claude-opus-4-1': { inputTokens: 80 },
+        },
+      },
+    })).toBe('claude-opus-4-1');
+    expect(resolveEnvelopeModel('sonnet', { usage: { input_tokens: 10 } })).toBeNull();
+    expect(resolveEnvelopeModel('sonnet', {
+      modelUsage: {
+        'claude-sonnet-4-5-20250929': { inputTokens: 0 },
+        'claude-opus-4-1': { inputTokens: 0 },
+      },
+    })).toBeNull();
+    expect(resolveEnvelopeModel('sonnet', {
+      modelUsage: [{ inputTokens: 80 }],
+    })).toBeNull();
+    expect(resolveEnvelopeModel('sonnet', {
+      modelUsage: 'claude-sonnet-4-5-20250929',
+    })).toBeNull();
+  });
+
+  it('recognizes captured Claude usage fields and fails closed on mixed-model activity', () => {
+    expect(resolveEnvelopeModel('opus', {
+      modelUsage: {
+        'claude-opus-4-8': {
+          inputTokens: 2,
+          outputTokens: 187,
+          cacheReadInputTokens: 7664,
+          cacheCreationInputTokens: 3909,
+        },
+      },
+    })).toBe('claude-opus-4-8');
+    expect(resolveEnvelopeModel('sonnet', {
+      modelUsage: {
+        'claude-sonnet-cache-only': { inputTokens: 0, cacheReadInputTokens: 90 },
+      },
+    })).toBe('claude-sonnet-cache-only');
+    expect(resolveEnvelopeModel('sonnet', {
+      modelUsage: {
+        'claude-sonnet-primary': { inputTokens: 20, outputTokens: 5 },
+        'claude-opus-fallback': { inputTokens: 4, outputTokens: 40 },
+      },
+    })).toBeNull();
+  });
+});
 
 function tmpIo(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tc-llmio-'));
