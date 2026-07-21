@@ -14,6 +14,8 @@ import type { AnalyzeLlmExecutionAdapter } from './certified-analyze-llm-run.js'
 // ---------------------------------------------------------------------------
 
 export interface ServiceViolationContext {
+  /** Broader certified-analysis configuration/rule compatibility evidence. */
+  analysisInputFingerprint?: string;
   architecture: string;
   services: {
     id: string;
@@ -54,6 +56,8 @@ export interface DatabaseViolationContext {
 }
 
 export interface ModuleViolationContext {
+  /** Broader certified-analysis configuration/rule compatibility evidence. */
+  analysisInputFingerprint?: string;
   modules: {
     id: string;
     name: string;

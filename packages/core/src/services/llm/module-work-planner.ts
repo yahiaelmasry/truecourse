@@ -73,6 +73,7 @@ function canonicalContext(context: ModuleViolationContext): ModuleViolationConte
   }
 
   return {
+    analysisInputFingerprint: context.analysisInputFingerprint,
     modules,
     methods,
     moduleDependencies: sortCanonical(context.moduleDependencies.map((dependency) => ({
@@ -144,6 +145,7 @@ export function planModuleViolationWork(
       mode,
       toolPolicy: request.toolPolicy,
       timeoutMs: request.timeoutMs,
+      analysisInputFingerprint: preparedContext.analysisInputFingerprint ?? null,
     }),
     request: fingerprint({
       stage: request.stage,
