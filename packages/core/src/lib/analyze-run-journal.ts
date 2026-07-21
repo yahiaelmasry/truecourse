@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { atomicWriteJson } from './atomic-write.js';
+import { fingerprint } from './canonical-json.js';
 import {
   inspectAnalyzeRunExecutionCompletion,
   issueAnalyzeRunExecutionCertification,
@@ -27,11 +28,17 @@ import {
   type PreparedAnalyzeRunCompletion,
   type PreparedAnalyzeRunFinalization,
 } from './analyze-run-finalization-recovery.js';
+import {
+  inspectAnalyzeRunWorkCheckpointCertification,
+  type AnalyzeRunWorkCheckpointCertification,
+} from './analyze-run-work-checkpoint-certification.js';
+import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execution-evidence.js';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 2 as const;
+const SCHEMA_VERSION = 3 as const;
 const LEGACY_SCHEMA_VERSION = 1 as const;
+const PREVIOUS_SCHEMA_VERSION = 2 as const;
 const RUNS_DIR = path.join('.truecourse', 'analyses', 'runs');
 const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
 
@@ -59,6 +66,7 @@ export interface SealAnalyzeRunPlanCommand {
 }
 
 declare const analyzeRunPlanActivationBrand: unique symbol;
+declare const analyzeRunCheckpointWriterBrand: unique symbol;
 
 /**
  * In-process proof that the journal durably sealed one exact analyze work plan.
@@ -67,6 +75,10 @@ declare const analyzeRunPlanActivationBrand: unique symbol;
  */
 export type AnalyzeRunPlanActivation = Readonly<{
   [analyzeRunPlanActivationBrand]: true;
+}>;
+
+export type AnalyzeRunCheckpointWriter = Readonly<{
+  [analyzeRunCheckpointWriterBrand]: true;
 }>;
 
 const analyzeRunPlanActivations = new WeakMap<object, {
@@ -83,6 +95,15 @@ const analyzeRunPlanActivationReceipts = new WeakMap<
   AnalyzeRunStorage,
   Map<string, AnalyzeRunPlanActivation>
 >();
+
+const analyzeRunCheckpointWriters = new WeakMap<object, {
+  storage: AnalyzeRunStorage;
+  repoKey: string;
+  runId: string;
+  workKey: string;
+  sealedAt: string;
+  active: boolean;
+}>();
 
 const preparedAnalyzeRunCompletions = new WeakMap<object, {
   storage: AnalyzeRunStorage;
@@ -109,6 +130,25 @@ export interface FailAnalyzeRunCommand {
     code: string;
     message: string;
   };
+}
+
+export interface CheckpointAnalyzeRunWorkCommand {
+  workId: string;
+  inputFingerprint: string;
+  checkpointedAt: string;
+  attemptId: string;
+  resultContractId: string;
+  result: unknown;
+  usage: AnalyzeLlmExecutionUsage | null;
+}
+
+export interface AnalyzeRunWorkCheckpoint {
+  checkpointedAt: string;
+  attemptId: string;
+  resultContractId: string;
+  resultFingerprint: string;
+  result: unknown;
+  usage: AnalyzeLlmExecutionUsage | null;
 }
 
 export interface BeginFinalizeAnalyzeRunCommand {
@@ -176,15 +216,20 @@ export interface AnalyzeRunView {
   };
   resume: {
     available: false;
-    reason: 'successful-results-not-checkpointed' | 'run-completed';
+    reason: 'successful-results-not-checkpointed' | 'checkpoint-reuse-not-enabled' | 'run-completed';
   };
 }
 
-export interface StoredAnalyzeRunWork {
+export type StoredAnalyzeRunWork = {
   workId: string;
   inputFingerprint: string;
   state: 'pending' | 'succeeded-uncheckpointed';
-}
+} | {
+  workId: string;
+  inputFingerprint: string;
+  state: 'succeeded-checkpointed';
+  checkpoint: AnalyzeRunWorkCheckpoint;
+};
 
 export interface StoredAnalyzeRun {
   schemaVersion: typeof SCHEMA_VERSION;
@@ -236,7 +281,7 @@ interface LatestAttemptPointer {
 }
 
 interface ParsedLatestAttemptPointer {
-  schemaVersion: typeof LEGACY_SCHEMA_VERSION | typeof SCHEMA_VERSION;
+  schemaVersion: typeof LEGACY_SCHEMA_VERSION | typeof PREVIOUS_SCHEMA_VERSION | typeof SCHEMA_VERSION;
   runId: string;
 }
 
@@ -692,7 +737,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
   runId: string,
   work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
   validate: () => void,
-  admit: () => Promise<T>,
+  admit: (checkpointWriter: AnalyzeRunCheckpointWriter) => Promise<T>,
 ): Promise<AnalyzeRunPlanAdmission<T>> {
   if ((typeof receipt !== 'object' && typeof receipt !== 'function') || receipt === null) {
     return { admitted: false };
@@ -716,12 +761,20 @@ export async function admitAnalyzeRunPlanExecution<T>(
     stored.revision === activation.revision &&
     activation.workKey === activationWorkKey(stored.plan.work)
   );
-  if (!stillExecutable) return { admitted: false };
+  if (!stillExecutable || !stored || stored.plan.state !== 'sealed') return { admitted: false };
   if (analyzeRunPlanActivations.get(receipt) !== activation || activation.claimed) {
     return { admitted: false };
   }
   validate();
   activation.claimed = true;
+  let checkpointBinding: {
+    storage: AnalyzeRunStorage;
+    repoKey: string;
+    runId: string;
+    workKey: string;
+    sealedAt: string;
+    active: boolean;
+  } | undefined;
   try {
     const admitted: StoredAnalyzeRun = {
       ...stored,
@@ -735,24 +788,56 @@ export async function admitAnalyzeRunPlanExecution<T>(
     );
     assertAnalyzeRunStorage(storage);
     validate();
-    const admittedExecution = admit();
+    const checkpointWriter = Object.freeze({}) as AnalyzeRunCheckpointWriter;
+    checkpointBinding = {
+      storage,
+      repoKey: activation.repoKey,
+      runId: activation.runId,
+      workKey: activation.workKey,
+      sealedAt: stored.plan.sealedAt,
+      active: true,
+    };
+    analyzeRunCheckpointWriters.set(checkpointWriter, checkpointBinding);
     analyzeRunPlanActivations.delete(receipt);
     analyzeRunPlanActivationReceipts.get(storage)?.delete(activation.cacheKey);
-    const execution = admittedExecution.then((result) => {
+    const admittedExecution = admit(checkpointWriter);
+    const execution = admittedExecution.then(async (result) => {
+      checkpointBinding!.active = false;
+      const completed = await storage.read(activation.repoKey, activation.runId);
+      assertAnalyzeRunStorage(storage);
+      if (
+        !completed
+        || completed.status.state !== 'running'
+        || completed.plan.state !== 'sealed'
+        || activation.workKey !== activationWorkKey(completed.plan.work)
+      ) {
+        throw new InvalidAnalyzeRunTransitionError(
+          `Analyze run ${activation.runId} changed while its certified work was executing`,
+        );
+      }
       const certification = issueAnalyzeRunExecutionCertification({
         storage,
         scopeKey: activation.scopeKey,
         runId: activation.runId,
-        revision: admitted.revision,
+        revision: completed.revision,
         workKey: activation.workKey,
       });
       return Object.freeze({ result, certification });
+    }, (error) => {
+      checkpointBinding!.active = false;
+      throw error;
     });
     return { admitted: true, execution };
   } catch (error) {
+    if (checkpointBinding) checkpointBinding.active = false;
     const current = await storage.read(activation.repoKey, activation.runId);
     assertAnalyzeRunStorage(storage);
-    if (current?.revision === activation.revision) activation.claimed = false;
+    if (current?.revision === activation.revision) {
+      activation.claimed = false;
+    } else {
+      analyzeRunPlanActivations.delete(receipt);
+      analyzeRunPlanActivationReceipts.get(storage)?.delete(activation.cacheKey);
+    }
     throw error;
   }
 }
@@ -767,13 +852,90 @@ export async function readAnalyzeRun(
   return stored ? toView(stored) : null;
 }
 
+/** Persist one schema-validated provider success before the run may become terminal. */
+export async function checkpointAnalyzeRunWork(
+  certification: AnalyzeRunWorkCheckpointCertification,
+): Promise<AnalyzeRunView> {
+  const certified = inspectAnalyzeRunWorkCheckpointCertification(certification);
+  if (!certified) {
+    throw new InvalidAnalyzeRunTransitionError('Analyze work checkpoint is not certified');
+  }
+  const { writer, command } = certified;
+  const binding = analyzeRunCheckpointWriters.get(writer);
+  if (!binding || !binding.active || binding.storage !== activeStorage) {
+    throw new InvalidAnalyzeRunTransitionError('Analyze checkpoint writer is invalid or inactive');
+  }
+  const { storage, repoKey, runId } = binding;
+  const workId = requireNonEmpty(command.workId, 'workId');
+  const inputFingerprint = validateFingerprint(command.inputFingerprint);
+  const validatedCheckpoint = validateWorkCheckpoint(command);
+  const checkpoint = validatedCheckpoint;
+
+  for (;;) {
+    const current = await storage.read(repoKey, runId);
+    assertAnalyzeRunStorage(storage);
+    if (!current) throw new AnalyzeRunNotFoundError(runId);
+    if (current.status.state !== 'running' || current.plan.state !== 'sealed') {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Cannot checkpoint analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+      );
+    }
+    if (binding.workKey !== activationWorkKey(current.plan.work)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId}'s sealed plan changed after checkpoint admission`,
+      );
+    }
+    if (Date.parse(checkpoint.checkpointedAt) < Date.parse(current.plan.sealedAt)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} checkpoint cannot precede its sealed plan`,
+      );
+    }
+    const index = current.plan.work.findIndex((item) => item.workId === workId);
+    const existing = current.plan.work[index];
+    if (!existing || existing.inputFingerprint !== inputFingerprint) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze work ${workId} does not match run ${runId}'s sealed plan`,
+      );
+    }
+    if (existing.state === 'succeeded-checkpointed') {
+      if (isDeepStrictEqual(existing.checkpoint, checkpoint)) return toView(current);
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze work ${workId} already has different checkpoint evidence`,
+      );
+    }
+    if (existing.state !== 'pending') {
+      throw new InvalidAnalyzeRunTransitionError(`Analyze work ${workId} is not checkpointable`);
+    }
+    const work = [...current.plan.work];
+    work[index] = { workId, inputFingerprint, state: 'succeeded-checkpointed', checkpoint };
+    const updatedAt = new Date(Math.max(
+      Date.parse(current.updatedAt),
+      Date.parse(checkpoint.checkpointedAt),
+    )).toISOString();
+    const next: StoredAnalyzeRun = {
+      ...current,
+      revision: current.revision + 1,
+      updatedAt,
+      plan: { ...current.plan, work },
+    };
+    try {
+      await storage.compareAndSwap(repoKey, runId, current.revision, next);
+      assertAnalyzeRunStorage(storage);
+      return toView(next);
+    } catch (error) {
+      if (error instanceof AnalyzeRunRevisionConflictError) continue;
+      throw error;
+    }
+  }
+}
+
 function toView(run: StoredAnalyzeRun): AnalyzeRunView {
   const counts = run.plan.state === 'sealed'
     ? {
         total: run.plan.work.length,
         pending: run.plan.work.filter((work) => work.state === 'pending').length,
         running: 0,
-        succeeded: run.plan.work.filter((work) => work.state === 'succeeded-uncheckpointed').length,
+        succeeded: run.plan.work.filter((work) => work.state !== 'pending').length,
         failed: 0,
       }
     : null;
@@ -822,7 +984,10 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
       available: false,
       reason: run.status.state === 'completed'
         ? 'run-completed'
-        : 'successful-results-not-checkpointed',
+        : run.plan.state === 'sealed'
+          && run.plan.work.some((work) => work.state === 'succeeded-checkpointed')
+          ? 'checkpoint-reuse-not-enabled'
+          : 'successful-results-not-checkpointed',
     },
   };
 }
@@ -864,7 +1029,7 @@ export async function beginFinalizeAnalyzeRun(
     current.revision === certified.revision + 1 &&
     current.status.finalizingAt === finalizingAt &&
     certified.workKey === activationWorkKey(current.plan.work) &&
-    current.plan.work.every((item) => item.state === 'succeeded-uncheckpointed')
+    current.plan.work.every((item) => item.state !== 'pending')
   ) {
     certified.claimed = true;
     return toView(current);
@@ -874,18 +1039,26 @@ export async function beginFinalizeAnalyzeRun(
       `Cannot finalize analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
     );
   }
+  const allPending = current.plan.work.every((item) => item.state === 'pending');
+  const allCheckpointed = current.plan.work.every(
+    (item) => item.state === 'succeeded-checkpointed',
+  );
   if (
     certified.claimed ||
     certified.revision !== current.revision ||
-    certified.workKey !== activationWorkKey(current.plan.work)
+    certified.workKey !== activationWorkKey(current.plan.work) ||
+    (!allPending && !allCheckpointed)
   ) {
     throw new InvalidAnalyzeRunTransitionError(
       `Analyze execution completion does not certify run ${runId}'s current sealed plan`,
     );
   }
-  if (Date.parse(finalizingAt) < Date.parse(current.plan.sealedAt)) {
+  if (
+    Date.parse(finalizingAt) < Date.parse(current.plan.sealedAt)
+    || Date.parse(finalizingAt) < Date.parse(current.updatedAt)
+  ) {
     throw new InvalidAnalyzeRunTransitionError(
-      `Analyze run ${runId} finalization cannot precede its sealed plan`,
+      `Analyze run ${runId} finalization cannot precede its latest durable progress`,
     );
   }
   const next: StoredAnalyzeRun = {
@@ -894,13 +1067,16 @@ export async function beginFinalizeAnalyzeRun(
     updatedAt: finalizingAt,
     status: { state: 'finalizing', finalizingAt },
     finalizationIntent: null,
-    plan: {
-      ...current.plan,
-      work: current.plan.work.map((item) => ({
-        ...item,
-        state: 'succeeded-uncheckpointed',
-      })),
-    },
+    plan: allCheckpointed
+      ? current.plan
+      : {
+          ...current.plan,
+          work: current.plan.work.map((item) => ({
+            workId: item.workId,
+            inputFingerprint: item.inputFingerprint,
+            state: 'succeeded-uncheckpointed' as const,
+          })),
+        },
   };
   certified.claimed = true;
   try {
@@ -1021,6 +1197,7 @@ async function failRun(
   const failedAt = validateTimestamp(command.failedAt, 'failedAt');
   if (
     Date.parse(failedAt) < Date.parse(current.startedAt) ||
+    Date.parse(failedAt) < Date.parse(current.updatedAt) ||
     (current.plan.state === 'sealed' && Date.parse(failedAt) < Date.parse(current.plan.sealedAt)) ||
     (
       current.status.state === 'finalizing' &&
@@ -1031,7 +1208,7 @@ async function failRun(
     )
   ) {
     throw new InvalidAnalyzeRunTransitionError(
-      `Analyze run ${runId} failure cannot precede its start, sealed plan, or prepared finalization`,
+      `Analyze run ${runId} failure cannot precede its latest durable progress`,
     );
   }
   const next: StoredAnalyzeRun = {
@@ -1071,10 +1248,11 @@ async function blockRun(
   const blockedAt = validateTimestamp(command.blockedAt, 'blockedAt');
   if (
     Date.parse(blockedAt) < Date.parse(current.startedAt) ||
-    Date.parse(blockedAt) < Date.parse(current.plan.sealedAt)
+    Date.parse(blockedAt) < Date.parse(current.plan.sealedAt) ||
+    Date.parse(blockedAt) < Date.parse(current.updatedAt)
   ) {
     throw new InvalidAnalyzeRunTransitionError(
-      `Analyze run ${runId} block cannot precede its start or sealed plan`,
+      `Analyze run ${runId} block cannot precede its latest durable progress`,
     );
   }
   const next: StoredAnalyzeRun = {
@@ -1277,7 +1455,7 @@ function parseLatestPointer(value: unknown, file: string): ParsedLatestAttemptPo
   try {
     if (
       !isRecord(value)
-      || (value.schemaVersion !== LEGACY_SCHEMA_VERSION && value.schemaVersion !== SCHEMA_VERSION)
+      || ![LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION].includes(value.schemaVersion as 1 | 2 | 3)
       || typeof value.runId !== 'string'
     ) {
       throw new AnalyzeRunJournalCorruptError(`Invalid latest analyze-run pointer: ${file}`);
@@ -1308,7 +1486,7 @@ function parseStoredRun(value: unknown, file: string, expectedRunId?: string): S
 function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun {
   if (
     !isRecord(value) ||
-    (value.schemaVersion !== LEGACY_SCHEMA_VERSION && value.schemaVersion !== SCHEMA_VERSION) ||
+    ![LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION].includes(value.schemaVersion as 1 | 2 | 3) ||
     !Number.isSafeInteger(value.attemptSequence) ||
     (value.attemptSequence as number) < 1 ||
     !Number.isInteger(value.revision) ||
@@ -1331,9 +1509,10 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
 
   const revision = value.revision as number;
   const status = parseStoredStatus(value.status, file);
-  const plan = parseStoredPlan(value.plan, file);
+  const schemaVersion = value.schemaVersion as ParsedLatestAttemptPointer['schemaVersion'];
+  const plan = parseStoredPlan(value.plan, file, schemaVersion);
   if (value.schemaVersion === SCHEMA_VERSION && !Object.hasOwn(value, 'finalizationIntent')) {
-    throw new AnalyzeRunJournalCorruptError(`Schema-v2 run is missing finalization intent state: ${file}`);
+    throw new AnalyzeRunJournalCorruptError(`Schema-v3 run is missing finalization intent state: ${file}`);
   }
   const finalizationIntent = value.schemaVersion === LEGACY_SCHEMA_VERSION
     ? (() => {
@@ -1369,6 +1548,34 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     Date.parse(terminalAt) < Date.parse(value.startedAt) ||
     (plan.state === 'sealed' && Date.parse(terminalAt) < Date.parse(plan.sealedAt))
   );
+  const checkpointCount = plan.state === 'sealed'
+    ? plan.work.filter((work) => work.state === 'succeeded-checkpointed').length
+    : 0;
+  const checkpointLifecycle = plan.state === 'sealed'
+    && plan.work.every((work) => work.state === 'pending' || work.state === 'succeeded-checkpointed');
+  const checkpointUpdatedAt = plan.state === 'sealed'
+    ? plan.work.reduce(
+        (latest, work) => work.state === 'succeeded-checkpointed'
+          && Date.parse(work.checkpoint.checkpointedAt) > Date.parse(latest)
+          ? work.checkpoint.checkpointedAt
+          : latest,
+        plan.sealedAt,
+      )
+    : value.startedAt;
+  const checkpointTimestampsAreReachable = plan.state !== 'sealed'
+    || plan.work.every((work) => work.state !== 'succeeded-checkpointed'
+      || Date.parse(work.checkpoint.checkpointedAt) >= Date.parse(plan.sealedAt));
+  const terminalPredatesCheckpoint = terminalAt !== null
+    && Date.parse(terminalAt) < Date.parse(checkpointUpdatedAt);
+  const allCheckpointed = plan.state === 'sealed'
+    && plan.work.every((work) => work.state === 'succeeded-checkpointed');
+  const allLegacySucceeded = plan.state === 'sealed'
+    && plan.work.every((work) => work.state === 'succeeded-uncheckpointed');
+  const finalizingRevision = allCheckpointed
+    ? 3 + checkpointCount
+    : schemaVersion === LEGACY_SCHEMA_VERSION
+      ? 2
+      : 3;
   const lifecycleIsReachable = plan.state === 'unsealed'
     ? (
       finalizationIntent === null && (
@@ -1385,29 +1592,29 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
       Date.parse(plan.sealedAt) >= Date.parse(value.startedAt) && (
         (
           status.state === 'running' &&
-          finalizationIntent === null &&
-          [1, 2].includes(revision) &&
-          value.updatedAt === plan.sealedAt &&
-          plan.work.every((work) => work.state === 'pending')
+          finalizationIntent === null && (
+            (revision === 1 && value.updatedAt === plan.sealedAt && plan.work.every((work) => work.state === 'pending'))
+            || (checkpointLifecycle && revision === 2 + checkpointCount && value.updatedAt === checkpointUpdatedAt)
+          )
         ) ||
         (
           status.state === 'blocked' &&
           finalizationIntent === null &&
-          [2, 3].includes(revision) &&
+          (revision === 2 || revision === 3 + checkpointCount) &&
           status.blockedAt === value.updatedAt &&
-          plan.work.every((work) => work.state === 'pending')
+          checkpointLifecycle
         ) ||
         (
           status.state === 'failed' &&
           (
             (
               finalizationIntent === null &&
-              [2, 3].includes(revision) &&
+              (revision === 2 || revision === 3 + checkpointCount) &&
               status.finalizingAt === null &&
-              plan.work.every((work) => work.state === 'pending')
+              checkpointLifecycle
             ) ||
             (
-              revision === (finalizationIntent === null ? 4 : 5) &&
+              revision === finalizingRevision + (finalizationIntent === null ? 1 : 2) &&
               status.finalizingAt !== null &&
               Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
               Date.parse(status.failedAt) >= Date.parse(status.finalizingAt) &&
@@ -1416,47 +1623,57 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
                   Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt)
                   && Date.parse(status.failedAt) >= Date.parse(finalizationIntent.preparedAt)
                 )) &&
-              plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
+              (allCheckpointed || allLegacySucceeded)
             )
           ) &&
           status.failedAt === value.updatedAt
         ) ||
         (
           status.state === 'finalizing' &&
-          revision === (finalizationIntent === null ? 3 : 4) &&
+          revision === finalizingRevision + (finalizationIntent === null ? 0 : 1) &&
           (finalizationIntent === null
             ? status.finalizingAt === value.updatedAt
             : finalizationIntent.preparedAt === value.updatedAt
               && Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt)) &&
-          plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
+          (allCheckpointed || allLegacySucceeded)
         ) || (
           status.state === 'completed' &&
-          revision === 5 &&
+          revision === finalizingRevision + 2 &&
           finalizationIntent !== null &&
           status.completedAt === value.updatedAt &&
           Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
           Date.parse(finalizationIntent.preparedAt) >= Date.parse(status.finalizingAt) &&
           Date.parse(status.completedAt) >= Date.parse(finalizationIntent.preparedAt) &&
-          plan.work.every((work) => work.state === 'succeeded-uncheckpointed')
+          (allCheckpointed || allLegacySucceeded)
         )
       )
     );
-  if (!lifecycleIsReachable || terminalTimestampIsImpossible) {
+  if (
+    !lifecycleIsReachable
+    || terminalTimestampIsImpossible
+    || !checkpointTimestampsAreReachable
+    || terminalPredatesCheckpoint
+  ) {
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
-    Schema v2 retains revision 2 for durable execution admission. Terminal execution states and
-    unprepared finalization use revision 3; preparing finalization advances to revision 4. A
-    finalization failure advances to revision 4 when unprepared or revision 5 when prepared, while
-    certified completion advances a prepared run to revision 5. The admission tombstone prevents
-    a consumed plan from issuing another receipt. Future work-result commands must migrate or
-    extend the durable schema with these invariants.
+    The exact revision matrix above intentionally describes only the current commands:
+    begin, seal-plan, durable execution admission, successful-result checkpoint,
+    block, fail, begin-finalize, prepare-finalization, and certified completion.
   */
+
+  const normalizedRevision = schemaVersion === LEGACY_SCHEMA_VERSION && (
+    status.state === 'finalizing'
+    || status.state === 'completed'
+    || (status.state === 'failed' && status.finalizingAt !== null)
+  )
+    ? revision + 1
+    : revision;
 
   return {
     schemaVersion: SCHEMA_VERSION,
     attemptSequence: value.attemptSequence as number,
-    revision,
+    revision: normalizedRevision,
     runId: validateRunId(value.runId),
     candidateAnalysisId: requireNonEmpty(value.candidateAnalysisId, 'candidateAnalysisId'),
     status,
@@ -1558,7 +1775,94 @@ function parseStoredStatus(value: Record<string, unknown>, file: string): Stored
   };
 }
 
-function parseStoredPlan(value: Record<string, unknown>, file: string): StoredAnalyzeRun['plan'] {
+function validateWorkCheckpoint(command: CheckpointAnalyzeRunWorkCommand): AnalyzeRunWorkCheckpoint {
+  const result = jsonStableCopy(command.result, 'checkpoint result');
+  return {
+    checkpointedAt: validateCanonicalCheckpointTimestamp(command.checkpointedAt),
+    attemptId: requireNonEmpty(command.attemptId, 'attemptId'),
+    resultContractId: requireNonEmpty(command.resultContractId, 'resultContractId'),
+    resultFingerprint: fingerprint(result),
+    result,
+    usage: command.usage === null ? null : validateCheckpointUsage(command.usage),
+  };
+}
+
+function validateCanonicalCheckpointTimestamp(value: unknown): string {
+  let timestamp: string;
+  try {
+    timestamp = validateTimestamp(value, 'checkpointedAt');
+  } catch (error) {
+    throw new InvalidAnalyzeRunTransitionError(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  if (new Date(timestamp).toISOString() !== timestamp) {
+    throw new InvalidAnalyzeRunTransitionError('checkpointedAt must be a canonical UTC timestamp');
+  }
+  return timestamp;
+}
+
+function parseWorkCheckpoint(value: unknown, file: string): AnalyzeRunWorkCheckpoint {
+  if (!isRecord(value)) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run checkpoint: ${file}`);
+  }
+  let parsed: ReturnType<typeof validateWorkCheckpoint>;
+  try {
+    parsed = validateWorkCheckpoint({
+      workId: 'stored',
+      inputFingerprint: `sha256:${'0'.repeat(64)}`,
+      checkpointedAt: value.checkpointedAt as string,
+      attemptId: value.attemptId as string,
+      resultContractId: value.resultContractId as string,
+      result: value.result,
+      usage: value.usage as AnalyzeLlmExecutionUsage | null,
+    });
+  } catch {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run checkpoint: ${file}`);
+  }
+  if (value.resultFingerprint !== parsed.resultFingerprint) {
+    throw new AnalyzeRunJournalCorruptError(`Analyze-run checkpoint fingerprint mismatch: ${file}`);
+  }
+  return parsed;
+}
+
+function validateCheckpointUsage(value: AnalyzeLlmExecutionUsage): AnalyzeLlmExecutionUsage {
+  if (!isRecord(value)) throw new InvalidAnalyzeRunTransitionError('Invalid checkpoint usage');
+  const integerKeys = [
+    'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'durationMs',
+  ] as const;
+  if (
+    typeof value.provider !== 'string' || value.provider.length === 0
+    || (value.requestedModel !== null && (typeof value.requestedModel !== 'string' || value.requestedModel.length === 0))
+    || (value.resolvedModel !== null && (typeof value.resolvedModel !== 'string' || value.resolvedModel.length === 0))
+    || typeof value.callType !== 'string' || value.callType.length === 0
+    || integerKeys.some((key) => !Number.isSafeInteger(value[key]) || value[key] < 0)
+    || value.totalTokens !== value.inputTokens + value.outputTokens
+    || (value.costUsd !== null && (typeof value.costUsd !== 'string' || value.costUsd.length === 0 || !Number.isFinite(Number(value.costUsd)) || Number(value.costUsd) < 0))
+  ) {
+    throw new InvalidAnalyzeRunTransitionError('Invalid checkpoint usage');
+  }
+  return { ...value };
+}
+
+function jsonStableCopy(value: unknown, label: string): unknown {
+  let copy: unknown;
+  try {
+    copy = JSON.parse(JSON.stringify(value));
+  } catch (error) {
+    throw new InvalidAnalyzeRunTransitionError(`${label} is not JSON-stable: ${String(error)}`);
+  }
+  if (!isDeepStrictEqual(copy, value)) {
+    throw new InvalidAnalyzeRunTransitionError(`${label} is not JSON-stable`);
+  }
+  return copy;
+}
+
+function parseStoredPlan(
+  value: Record<string, unknown>,
+  file: string,
+  schemaVersion: ParsedLatestAttemptPointer['schemaVersion'],
+): StoredAnalyzeRun['plan'] {
   if (value.state === 'unsealed') return { state: 'unsealed' };
   if (value.state !== 'sealed' || typeof value.sealedAt !== 'string' || !Array.isArray(value.work)) {
     throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run plan: ${file}`);
@@ -1569,15 +1873,23 @@ function parseStoredPlan(value: Record<string, unknown>, file: string): StoredAn
       !isRecord(item) ||
       typeof item.workId !== 'string' ||
       typeof item.inputFingerprint !== 'string' ||
-      (state !== 'pending' && state !== 'succeeded-uncheckpointed')
+      (state !== 'pending' && state !== 'succeeded-uncheckpointed' && state !== 'succeeded-checkpointed')
     ) {
       throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run work record: ${file}`);
     }
-    return {
+    const base = {
       workId: requireNonEmpty(item.workId, 'workId'),
       inputFingerprint: validateFingerprint(item.inputFingerprint),
-      state,
     };
+    if (state === 'succeeded-checkpointed') {
+      if (schemaVersion !== SCHEMA_VERSION) {
+        throw new AnalyzeRunJournalCorruptError(
+          `Schema-v${schemaVersion} run contains schema-v${SCHEMA_VERSION} checkpoint state: ${file}`,
+        );
+      }
+      return { ...base, state, checkpoint: parseWorkCheckpoint(item.checkpoint, file) };
+    }
+    return { ...base, state };
   });
   if (new Set(work.map((item) => item.workId)).size !== work.length) {
     throw new AnalyzeRunJournalCorruptError(`Duplicate work IDs in analyze-run journal: ${file}`);

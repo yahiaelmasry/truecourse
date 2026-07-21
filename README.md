@@ -79,17 +79,19 @@ files are local and gitignored: a running, blocked, or failed attempt never
 replaces the completed findings in `LATEST.json`. If a crash loses the pointer
 update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
-`packages/core/src/lib/analyze-run-journal.ts`. Schema v2 records pending work,
-reset/failure information, durable execution admission, and an exact prepared
-finalization intent containing the completed-baseline promotion and secondary
-projection inputs. The intent is written to the attempted-run journal before
-completed artifacts are mutated and remains separate from `LATEST.json`.
+`packages/core/src/lib/analyze-run-journal.ts`. Schema v3 records pending work,
+reset/failure information, durable execution admission, authenticated
+successful-work checkpoints, and an exact prepared finalization intent
+containing the completed-baseline promotion and secondary projection inputs.
+The intent is written to the attempted-run journal before completed artifacts
+are mutated and remains separate from `LATEST.json`.
 Prepared finalization replays completed-baseline promotion, idempotent history/
 diff/registry projections, and journal completion in that order. An exact retry
 repairs any interrupted step without replacing a newer completed descendant.
-Successful LLM response reuse is not enabled yet. Schema-v1 journals and their
-reserved finalizing states remain readable and migrate safely to v2 when the
-preparation command is used.
+The checkpoint storage seam is available at this stage, but the production
+certified executor does not write checkpoints yet and successful LLM response
+reuse is not enabled. Schema-v1 and schema-v2 journals remain readable and
+migrate safely to v3 when a current lifecycle command writes them.
 
 The first production-wiring slice journals full analyses only when their LLM
 plan contains certified aggregate architecture work and no code-batch or

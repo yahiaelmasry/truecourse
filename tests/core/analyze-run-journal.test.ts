@@ -18,7 +18,11 @@ import {
   sealAnalyzeRunPlan,
   setAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
-import { readPreparedAnalyzeRunFinalization } from '../../packages/core/src/lib/analyze-run-finalization-recovery.js';
+import {
+  certifyPreparedAnalyzeRunFinalization,
+  completePreparedAnalyzeRunFinalization,
+  readPreparedAnalyzeRunFinalization,
+} from '../../packages/core/src/lib/analyze-run-finalization-recovery.js';
 import { buildAnalysisFilename } from '../../packages/core/src/lib/analysis-store.js';
 import type {
   AnalysisSnapshot,
@@ -320,7 +324,7 @@ describe('analyze run journal', () => {
     });
 
     expect(begun).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 0,
       runId: 'run-2026-07-19',
       candidateAnalysisId: 'analysis-2026-07-19',
@@ -480,7 +484,7 @@ describe('analyze run journal', () => {
       ...payload,
     });
     expect(prepared).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 4,
       state: 'finalizing',
       finalization: {
@@ -846,6 +850,7 @@ describe('analyze run journal', () => {
     const pointerFile = path.join(runsDir, 'LATEST_ATTEMPT.json');
     const legacy = JSON.parse(fs.readFileSync(runFile, 'utf8')) as Record<string, unknown>;
     legacy.schemaVersion = 1;
+    legacy.revision = 2;
     delete legacy.finalizationIntent;
     fs.writeFileSync(runFile, JSON.stringify(legacy), 'utf8');
     fs.writeFileSync(pointerFile, JSON.stringify({
@@ -855,13 +860,13 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 3,
       state: 'finalizing',
       finalization: { persistence: 'unprepared', preparedAt: null },
     });
     expect(JSON.parse(fs.readFileSync(pointerFile, 'utf8'))).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       runId: 'legacy-finalizing-run',
     });
     await expect(prepareAnalyzeRunFinalization(repoPath, {
@@ -869,15 +874,76 @@ describe('analyze run journal', () => {
       preparedAt: '2026-07-19T01:35:03.000Z',
       ...finalizationPayload('legacy-finalizing-analysis'),
     })).resolves.toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 4,
       finalization: { persistence: 'prepared' },
     });
     expect(JSON.parse(fs.readFileSync(runFile, 'utf8'))).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       revision: 4,
       finalizationIntent: { preparedAt: '2026-07-19T01:35:03.000Z' },
     });
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-run' }))
+      .resolves.toMatchObject({ revision: 4, state: 'finalizing' });
+    const certifiedPrepared = await certifyPreparedAnalyzeRunFinalization(
+      repoPath,
+      'legacy-finalizing-run',
+    );
+    if (certifiedPrepared?.state !== 'prepared') throw new Error('expected prepared migration');
+    await expect(completePreparedAnalyzeRunFinalization(repoPath, {
+      runId: 'legacy-finalizing-run',
+      completedAt: '2026-07-19T01:35:04.000Z',
+      completion: certifiedPrepared.completion,
+    })).resolves.toMatchObject({ revision: 5, state: 'completed' });
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-run' }))
+      .resolves.toMatchObject({ revision: 5, state: 'completed' });
+  });
+
+  it('migrates a schema-v1 finalizing failure to a readable schema-v3 revision', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'legacy-finalizing-failure',
+      candidateAnalysisId: 'legacy-finalizing-failure-analysis',
+      startedAt: '2026-07-19T01:36:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'abc456',
+      completedBaselineId: null,
+    });
+    const execution = await certifySuccessfulExecution(
+      repoPath,
+      'legacy-finalizing-failure',
+      '2026-07-19T01:36:01.000Z',
+    );
+    await beginFinalizeAnalyzeRun(repoPath, {
+      runId: 'legacy-finalizing-failure',
+      finalizingAt: '2026-07-19T01:36:02.000Z',
+    }, execution.completion);
+    const runFile = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'legacy-finalizing-failure.json',
+    );
+    const legacy = JSON.parse(fs.readFileSync(runFile, 'utf8')) as Record<string, unknown>;
+    legacy.schemaVersion = 1;
+    legacy.revision = 2;
+    delete legacy.finalizationIntent;
+    fs.writeFileSync(runFile, JSON.stringify(legacy), 'utf8');
+    resetAnalyzeRunStorage();
+
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'legacy-finalizing-failure',
+      failedAt: '2026-07-19T01:36:03.000Z',
+      error: { code: 'FINALIZE_FAILED', message: 'Legacy finalization failed.' },
+    })).resolves.toMatchObject({ schemaVersion: 3, revision: 4, state: 'failed' });
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-failure' }))
+      .resolves.toMatchObject({ schemaVersion: 3, revision: 4, state: 'failed' });
   });
 
   it('requires a completion receipt bound to the exact run and sealed plan', async () => {
@@ -1562,7 +1628,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, command)).resolves.toEqual(begun);
     expect(JSON.parse(fs.readFileSync(latestAttemptPath, 'utf8'))).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       runId: command.runId,
     });
   });
@@ -1588,7 +1654,7 @@ describe('analyze run journal', () => {
     })).rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
     expect(fs.existsSync(path.join(runsPath, 'must-not-mask-third-run.json'))).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(runsPath, 'LATEST_ATTEMPT.json'), 'utf8'))).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       runId: 'missing-second-run',
     });
   });
@@ -1654,7 +1720,7 @@ describe('analyze run journal', () => {
       'runs',
       'LATEST_ATTEMPT.json',
     ), 'utf8'))).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       runId: second.runId,
     });
 
