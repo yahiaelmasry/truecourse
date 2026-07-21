@@ -16,9 +16,9 @@ import { log } from '../lib/logger.js';
 import { setLastAnalyzed } from '../config/registry.js';
 import type { RegistryEntry } from '../config/registry.js';
 import {
-  appendHistory,
   buildAnalysisFilename,
   deleteDiff,
+  ensureHistoryEntry,
   writeDiff,
   promoteCompletedAnalysisBaseline,
 } from '../lib/analysis-store.js';
@@ -56,7 +56,7 @@ export async function persistFullAnalysis(
 ): Promise<PersistFullResult> {
   const filename = buildAnalysisFilename(core.analysisId, core.now);
 
-  const snapshot: AnalysisSnapshot = {
+  const snapshot = persistedJson<AnalysisSnapshot>({
     id: core.analysisId,
     createdAt: core.now,
     branch: core.branch,
@@ -71,14 +71,14 @@ export async function persistFullAnalysis(
       previousAnalysisId: core.previousAnalysisId,
     },
     usage: core.usage,
-  };
+  }, 'Analysis snapshot');
 
-  const latest = buildLatestSnapshot(
+  const latest = persistedJson(buildLatestSnapshot(
     snapshot,
     filename,
     core.pipelineResult.unchanged,
     core.pipelineResult.added,
-  );
+  ), 'LATEST snapshot');
 
   const { bySeverity, total } = summarizeActiveViolations(latest.violations);
 
@@ -92,7 +92,7 @@ export async function persistFullAnalysis(
       `Completed analysis baseline changed before promotion (current: ${promotion.currentBaselineId ?? 'none'})`,
     );
   }
-  await appendHistory(project.path, buildHistoryEntry(snapshot, filename, core.pipelineResult));
+  await ensureHistoryEntry(project.path, buildHistoryEntry(snapshot, filename, core.pipelineResult));
 
   // Baseline moved — any prior diff is obsolete.
   await deleteDiff(project.path);
@@ -107,6 +107,19 @@ export async function persistFullAnalysis(
     durationMs: Date.now() - startedAt,
     violationsSummary: { total, bySeverity },
   };
+}
+
+/** Match the JSON persistence contract while keeping store validation strict. */
+function persistedJson<T>(value: T, label: string): T {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new Error('value is not serializable');
+    return JSON.parse(serialized) as T;
+  } catch (error) {
+    throw new Error(
+      `${label} could not be converted to its persisted JSON form: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ function coreResult(): AnalyzeCoreResult {
     branch: 'main',
     commitHash: 'candidate123',
     architecture: 'monolith',
-    metadata: null,
+    metadata: { stable: 'metadata', omittedByJson: undefined },
     graph: graph(),
     changedFiles: [],
     pipelineResult: {
@@ -111,7 +111,16 @@ describe('full analysis persistence', () => {
     const result = await persistFullAnalysis(project, core, Date.now());
 
     await expect(readAnalysis(repoPath, result.filename)).resolves.toMatchObject({ id: core.analysisId });
-    await expect(readLatest(repoPath)).resolves.toMatchObject({ analysis: { id: core.analysisId } });
+    await expect(readLatest(repoPath)).resolves.toMatchObject({
+      analysis: { id: core.analysisId, metadata: { stable: 'metadata' } },
+    });
+    await expect(readHistory(repoPath)).resolves.toMatchObject({
+      analyses: [expect.objectContaining({ id: core.analysisId })],
+    });
+
+    await expect(persistFullAnalysis(project, core, Date.now())).resolves.toMatchObject({
+      analysisId: core.analysisId,
+    });
     await expect(readHistory(repoPath)).resolves.toMatchObject({
       analyses: [expect.objectContaining({ id: core.analysisId })],
     });
