@@ -213,6 +213,21 @@ describe('completed-analysis projection coordinator', () => {
     });
   });
 
+  it('normalizes a hosted repository-key alias to the registry slug', async () => {
+    const current = snapshot('hosted-analysis', '2026-05-02T00:00:00.000Z', null);
+    await promote(current, null);
+
+    await expect(underLifecycleLock(() => projectCompletedAnalysis(repoPath, {
+      projectSlug: repoPath,
+      promotedSnapshot: current,
+      historyEntry: historyFor(current),
+    }))).resolves.toMatchObject({
+      activeAnalysisId: current.id,
+      registry: 'updated',
+    });
+    expect((await getProjectBySlug(projectSlug))?.lastAnalyzed).toBe(current.createdAt);
+  });
+
   it.each(['after-history', 'after-diff', 'after-registry'] as const)(
     'recovers exactly after an injected %s stop',
     async (faultPoint) => {

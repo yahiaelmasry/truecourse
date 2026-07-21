@@ -30,7 +30,11 @@ import { analyzeInProcess } from '../../packages/core/src/commands/analyze-in-pr
 import { analyzeCoreAndFinalize } from '../../packages/core/src/commands/analyze-core';
 import { readLatest, clearLatestCache } from '../../packages/core/src/lib/analysis-store';
 import { acquireAnalyzeLock, releaseAnalyzeLock } from '../../packages/core/src/lib/atomic-write';
-import type { RegistryEntry } from '../../packages/core/src/config/registry';
+import {
+  registerProject,
+  resetRegistryStore,
+  type RegistryEntry,
+} from '../../packages/core/src/config/registry';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_SRC = path.resolve(__dirname, '../fixtures/sample-js-project-negative');
@@ -50,8 +54,13 @@ describe('analyzeInProcess with codeDir — code ≠ storage key (the EE flow)',
   let codeDir: string; // the "clone" — where the code is
   let keyDir: string; // the storage key — an opaque repo identity, here a path
   let project: RegistryEntry;
+  let truecourseHome: string;
+  const originalHome = process.env.TRUECOURSE_HOME;
 
-  beforeAll(() => {
+  beforeAll(async () => {
+    truecourseHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-codedir-home-'));
+    process.env.TRUECOURSE_HOME = truecourseHome;
+    resetRegistryStore();
     codeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-codedir-code-'));
     copyDir(FIXTURE_SRC, codeDir);
     const env = {
@@ -66,14 +75,17 @@ describe('analyzeInProcess with codeDir — code ≠ storage key (the EE flow)',
     execSync('git -c commit.gpgsign=false commit -q -m init', { cwd: codeDir, env });
 
     keyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-codedir-key-'));
-    // Storage identity ≠ code. Manual entry (no registry side effects needed).
-    project = { slug: 'codedir-test', name: 'codedir', path: keyDir };
+    // Storage identity ≠ code, but it remains a registered project.
+    project = await registerProject(keyDir, 'codedir');
     clearLatestCache();
   });
 
   afterAll(() => {
     clearLatestCache();
-    for (const d of [codeDir, keyDir]) fs.rmSync(d, { recursive: true, force: true });
+    resetRegistryStore();
+    if (originalHome === undefined) delete process.env.TRUECOURSE_HOME;
+    else process.env.TRUECOURSE_HOME = originalHome;
+    for (const d of [codeDir, keyDir, truecourseHome]) fs.rmSync(d, { recursive: true, force: true });
   });
 
   it('reads code from codeDir but stores the analysis under project.path', async () => {

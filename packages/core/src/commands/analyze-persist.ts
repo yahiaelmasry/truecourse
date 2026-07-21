@@ -13,15 +13,13 @@
 
 import path from 'node:path';
 import { log } from '../lib/logger.js';
-import { setLastAnalyzed } from '../config/registry.js';
 import type { RegistryEntry } from '../config/registry.js';
 import {
   buildAnalysisFilename,
-  deleteDiff,
-  ensureHistoryEntry,
   writeDiff,
   promoteCompletedAnalysisBaseline,
 } from '../lib/analysis-store.js';
+import { projectCompletedAnalysis } from '../lib/completed-analysis-projection.js';
 import { makeViolationDenormalizer } from '../lib/completed-analysis-promotion.js';
 import type {
   AnalysisSnapshot,
@@ -92,11 +90,11 @@ export async function persistFullAnalysis(
       `Completed analysis baseline changed before promotion (current: ${promotion.currentBaselineId ?? 'none'})`,
     );
   }
-  await ensureHistoryEntry(project.path, buildHistoryEntry(snapshot, filename, core.pipelineResult));
-
-  // Baseline moved — any prior diff is obsolete.
-  await deleteDiff(project.path);
-  await setLastAnalyzed(project.slug, core.now);
+  await projectCompletedAnalysis(project.path, {
+    projectSlug: project.slug,
+    promotedSnapshot: snapshot,
+    historyEntry: buildHistoryEntry(snapshot, filename, core.pipelineResult),
+  });
 
   return {
     analysisId: core.analysisId,

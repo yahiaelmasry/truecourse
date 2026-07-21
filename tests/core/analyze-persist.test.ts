@@ -4,18 +4,28 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { persistFullAnalysis } from '../../packages/core/src/commands/analyze-persist.js';
 import type { AnalyzeCoreResult } from '../../packages/core/src/commands/analyze-core.js';
-import { resetRegistryStore, type RegistryEntry } from '../../packages/core/src/config/registry.js';
+import {
+  getProjectBySlug,
+  registerProject,
+  resetRegistryStore,
+} from '../../packages/core/src/config/registry.js';
 import {
   buildAnalysisFilename,
   clearLatestCache,
   readAnalysis,
+  readDiff,
   readHistory,
   readLatest,
   resetAnalysisStore,
   writeAnalysis,
+  writeDiff,
   writeLatest,
 } from '../../packages/core/src/lib/analysis-store.js';
-import type { AnalysisSnapshot, LatestSnapshot } from '../../packages/core/src/types/snapshot.js';
+import type {
+  AnalysisSnapshot,
+  DiffSnapshot,
+  LatestSnapshot,
+} from '../../packages/core/src/types/snapshot.js';
 
 const repositories: string[] = [];
 const originalHome = process.env.TRUECOURSE_HOME;
@@ -105,7 +115,7 @@ describe('full analysis persistence', () => {
   it('promotes a first completed analysis before updating its secondary projections', async () => {
     const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-analyze-persist-'));
     repositories.push(repoPath);
-    const project: RegistryEntry = { slug: 'first-analysis', name: 'First analysis', path: repoPath };
+    const project = await registerProject(repoPath, 'First analysis');
     const core = coreResult();
 
     const result = await persistFullAnalysis(project, core, Date.now());
@@ -117,6 +127,15 @@ describe('full analysis persistence', () => {
     await expect(readHistory(repoPath)).resolves.toMatchObject({
       analyses: [expect.objectContaining({ id: core.analysisId })],
     });
+    await expect(getProjectBySlug(project.slug)).resolves.toMatchObject({
+      lastAnalyzed: core.now,
+    });
+
+    const currentDiff = {
+      id: 'current-diff',
+      baseAnalysisId: core.analysisId,
+    } as DiffSnapshot;
+    await writeDiff(repoPath, currentDiff);
 
     await expect(persistFullAnalysis(project, core, Date.now())).resolves.toMatchObject({
       analysisId: core.analysisId,
@@ -124,12 +143,13 @@ describe('full analysis persistence', () => {
     await expect(readHistory(repoPath)).resolves.toMatchObject({
       analyses: [expect.objectContaining({ id: core.analysisId })],
     });
+    await expect(readDiff(repoPath)).resolves.toEqual(currentDiff);
   });
 
   it('does not replace a completed baseline that changed after analysis started', async () => {
     const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-analyze-persist-'));
     repositories.push(repoPath);
-    const project: RegistryEntry = { slug: 'stale-analysis', name: 'Stale analysis', path: repoPath };
+    const project = await registerProject(repoPath, 'Stale analysis');
     const baseline = completedBaseline();
     await writeAnalysis(repoPath, baseline.snapshot);
     await writeLatest(repoPath, baseline.latest);

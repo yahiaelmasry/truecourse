@@ -212,8 +212,12 @@ export async function projectCompletedAnalysis(
   if (!registry.ensureLastAnalyzed) {
     throw new Error('Active registry store does not support monotonic projection');
   }
-  const project = await registry.getProjectBySlug(intent.projectSlug);
-  if (!project || project.path !== repoKey) {
+  const project = await registry.getProjectByPath(repoKey);
+  if (
+    !project
+    || project.path !== repoKey
+    || (intent.projectSlug !== project.slug && intent.projectSlug !== project.path)
+  ) {
     throw new Error('Projection project does not match the repository key');
   }
   if (project.lastAnalyzed) {
@@ -224,7 +228,7 @@ export async function projectCompletedAnalysis(
   await options.faultInjector?.('after-history');
   const diff = await reconcileDiffWithLatest(repoKey);
   await options.faultInjector?.('after-diff');
-  const registryResult = await ensureLastAnalyzed(intent.projectSlug, latest!.analysis.createdAt);
+  const registryResult = await ensureLastAnalyzed(project.slug, latest!.analysis.createdAt);
   await options.faultInjector?.('after-registry');
 
   return {
