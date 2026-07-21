@@ -32,6 +32,7 @@ import {
   inspectAnalyzeRunWorkCheckpointCertification,
   type AnalyzeRunWorkCheckpointCertification,
 } from './analyze-run-work-checkpoint-certification.js';
+import { installAnalyzeRunResumeCandidateReader } from './analyze-run-resume-candidate.js';
 import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execution-evidence.js';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
@@ -330,6 +331,8 @@ export interface AnalyzeRunStorage {
   createLatest(repoKey: string, run: NewStoredAnalyzeRun): Promise<StoredAnalyzeRun>;
   read(repoKey: string, runId: string): Promise<StoredAnalyzeRun | null>;
   readLatest(repoKey: string): Promise<StoredAnalyzeRun | null>;
+  /** Read-only latest lookup. It must not repair or publish a pointer. */
+  inspectLatest(repoKey: string): Promise<StoredAnalyzeRun | null>;
   compareAndSwap(
     repoKey: string,
     runId: string,
@@ -402,6 +405,12 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
     });
   }
 
+  async inspectLatest(repoPath: string): Promise<StoredAnalyzeRun | null> {
+    const canonicalPath = canonicalRepoPath(repoPath);
+    const runs = readAllRuns(canonicalPath);
+    return runs.length === 0 ? null : latestStoredRun(runs);
+  }
+
   async compareAndSwap(
     repoPath: string,
     runId: string,
@@ -449,6 +458,57 @@ export function setAnalyzeRunStorage(storage: AnalyzeRunStorage): void {
 export function resetAnalyzeRunStorage(): void {
   activeStorage = new FileAnalyzeRunStorage();
 }
+
+installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
+  const storage = activeStorage;
+  const durableRepoKey = activationScopeKey(repoKey, storage);
+  const current = await storage.read(durableRepoKey, validateRunId(runId));
+  assertAnalyzeRunStorage(storage);
+  if (!current) return null;
+  const latest = await storage.inspectLatest(durableRepoKey);
+  assertAnalyzeRunStorage(storage);
+  const plan = current.plan.state === 'unsealed'
+    ? 'unsealed' as const
+    : Object.freeze({
+        sealedAt: current.plan.sealedAt,
+        work: Object.freeze(current.plan.work.map((item) => Object.freeze(
+          item.state === 'succeeded-checkpointed'
+            ? {
+                workId: item.workId,
+                inputFingerprint: item.inputFingerprint,
+                state: item.state,
+                checkpoint: structuredClone(item.checkpoint),
+              }
+            : {
+                workId: item.workId,
+                inputFingerprint: item.inputFingerprint,
+                state: item.state,
+              },
+        ))),
+      });
+  return Object.freeze({
+    storageIdentity: storage,
+    isLatestAttempt: latest?.runId === current.runId,
+    attemptSequence: current.attemptSequence,
+    latestAttemptSequence: latest?.attemptSequence ?? 0,
+    revision: current.revision,
+    runId: current.runId,
+    candidateAnalysisId: current.candidateAnalysisId,
+    state: current.status.state,
+    startedAt: current.startedAt,
+    source: current.source,
+    branch: current.branch,
+    commitHash: current.commitHash,
+    completedBaselineId: current.completedBaselineId,
+    blocked: current.status.state === 'blocked'
+      ? Object.freeze({
+          resetHint: current.status.resetHint,
+          blockedAt: current.status.blockedAt,
+        })
+      : null,
+    plan,
+  });
+});
 
 installPreparedAnalyzeRunFinalizationReader(async (repoKey, runId) => {
   const storage = activeStorage;

@@ -205,6 +205,10 @@ describe('analyze run journal', () => {
         expect(receivedRepoKey).toBe(repoKey);
         return stored;
       },
+      async inspectLatest(receivedRepoKey) {
+        expect(receivedRepoKey).toBe(repoKey);
+        return stored;
+      },
       async compareAndSwap(receivedRepoKey, runId, expectedRevision, next) {
         expect(receivedRepoKey).toBe(repoKey);
         expect(stored).toMatchObject({ runId, revision: expectedRevision });
@@ -257,6 +261,7 @@ describe('analyze run journal', () => {
       },
       async read() { return storedB; },
       async readLatest() { return storedB; },
+      async inspectLatest() { return storedB; },
       async compareAndSwap(_key, _runId, _revision, next) {
         writesB += 1;
         storedB = next;
@@ -275,6 +280,7 @@ describe('analyze run journal', () => {
         return storedA;
       },
       async readLatest() { return storedA; },
+      async inspectLatest() { return storedA; },
       async compareAndSwap(_key, _runId, _revision, next) {
         writesA += 1;
         storedA = next;
@@ -605,6 +611,7 @@ describe('analyze run journal', () => {
       },
       async read(_key, runId) { return stored?.runId === runId ? stored : null; },
       async readLatest() { return stored; },
+      async inspectLatest() { return stored; },
       async compareAndSwap(_key, _runId, expectedRevision, next) {
         if (stored?.revision !== expectedRevision) {
           throw new AnalyzeRunRevisionConflictError(

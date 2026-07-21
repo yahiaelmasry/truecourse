@@ -909,6 +909,7 @@ describe('certified analyze LLM run', () => {
         return stored?.runId === runId ? stored : null;
       },
       async readLatest() { return stored; },
+      async inspectLatest() { return stored; },
       async compareAndSwap(_receivedRepoKey, _runId, expectedRevision, next) {
         if (expectedRevision === 1) {
           markAdmissionStarted();

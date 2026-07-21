@@ -154,6 +154,9 @@ function referenceJournalAdapter(
       onRead?.();
       return stored;
     },
+    async inspectLatest() {
+      return readStored();
+    },
     async compareAndSwap(_repoKey, _runId, expectedRevision, next) {
       const stored = readStored();
       if (stored?.revision !== expectedRevision) throw new Error('unexpected revision conflict');

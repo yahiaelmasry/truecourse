@@ -15,6 +15,7 @@ import {
   type AnalyzeRunPlanActivation,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import { certifyAnalyzeRunWorkCheckpoint } from '../../packages/core/src/lib/analyze-run-work-checkpoint-certification.js';
+import { readAnalyzeRunResumeCandidate } from '../../packages/core/src/lib/analyze-run-resume-candidate.js';
 
 const fingerprints = [
   `sha256:${'1'.repeat(64)}`,
@@ -130,6 +131,49 @@ describe('durable analyze-run work checkpoints', () => {
         resultContractId: 'analyze.code@1',
         result: { violations: [{ title: 'finding-1' }] },
         usage: { provider: 'claude-code', totalTokens: 120 },
+      },
+    });
+  });
+
+  it('reads a detached latest candidate without repairing the latest pointer', async () => {
+    const { execution } = await admit(async (writer) => {
+      await checkpoint(writer, 0);
+      throw stopAfterCheckpoint;
+    });
+    await expect(execution).rejects.toBe(stopAfterCheckpoint);
+    const pointer = path.join(path.dirname(runFile()), 'LATEST_ATTEMPT.json');
+    fs.rmSync(pointer);
+
+    const candidate = await readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run');
+    expect(candidate).toMatchObject({
+      isLatestAttempt: true,
+      revision: 3,
+      state: 'running',
+      plan: {
+        work: [
+          {
+            state: 'succeeded-checkpointed',
+            checkpoint: { result: { violations: [{ title: 'finding-1' }] } },
+          },
+          { state: 'pending' },
+        ],
+      },
+    });
+    expect(fs.existsSync(pointer)).toBe(false);
+
+    const storedResult = candidate?.plan === 'unsealed'
+      ? null
+      : candidate?.plan.work[0]?.state === 'succeeded-checkpointed'
+        ? candidate.plan.work[0].checkpoint.result as { violations: { title: string }[] }
+        : null;
+    storedResult!.violations[0]!.title = 'mutated outside the journal';
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).resolves.toMatchObject({
+      plan: {
+        work: [
+          { checkpoint: { result: { violations: [{ title: 'finding-1' }] } } },
+          { state: 'pending' },
+        ],
       },
     });
   });
