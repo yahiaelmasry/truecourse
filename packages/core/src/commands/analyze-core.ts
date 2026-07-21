@@ -30,6 +30,11 @@ import { getDefaultTransport, type LlmTransport } from '@truecourse/shared/llm';
 import { toUsageRecords } from '../services/usage.service.js';
 import { readLatest } from '../lib/analysis-store.js';
 import { withAnalyzeLifecycleLock } from '../lib/analyze-lifecycle-lock.js';
+import {
+  dispatchAnalyzeRun,
+  readAnalyzeRun,
+  type AnalyzeRunSource,
+} from '../lib/analyze-run-journal.js';
 import type { Graph, LatestSnapshot, UsageRecord, ViolationRecord } from '../types/snapshot.js';
 import type { StepTracker } from '../progress.js';
 
@@ -138,6 +143,10 @@ export interface AnalyzeCoreOptions {
    */
   selectedModel?: string;
   signal?: AbortSignal;
+  /** Adapter identity used by the durable attempted-run journal. */
+  source?: AnalyzeRunSource;
+  /** @internal Full wrapper owns the matching prepared-finalization callback. */
+  journalFullRun?: boolean;
 }
 
 export interface AnalyzeCoreResult {
@@ -243,6 +252,7 @@ async function computeAnalyzeCore(
   // ------------------------------------------------------------
   let didStash = false;
   let stashGit: Awaited<ReturnType<typeof getGit>> | undefined;
+  let certifiedRunId: string | undefined;
   if (!isDiff && !skipGit && !options.skipStash) {
     try {
       stashGit = await getGit(codeDir);
@@ -408,6 +418,22 @@ async function computeAnalyzeCore(
       disabledRules: projectConfig.disabledRules,
       provider,
       signal,
+      certifiedLlmRun: options.journalFullRun
+        && !isDiff
+        && options.source
+        && (!latestBaseline || latestBaseline.analysis.branch === branch)
+        ? {
+            repositoryKey: project.path,
+            repositoryRoot: codeDir,
+            runId: randomUUID(),
+            candidateAnalysisId: analysisId,
+            startedAt: now,
+            source: options.source,
+            branch,
+            commitHash,
+            completedBaselineId: latestBaseline?.analysis.id ?? null,
+          }
+        : undefined,
       onLlmEstimate: options.onLlmEstimate
         ? async (estimate) => {
             const proceed = await options.onLlmEstimate!(estimate);
@@ -416,6 +442,7 @@ async function computeAnalyzeCore(
           }
         : undefined,
     });
+    certifiedRunId = pipelineResult.certifiedLlmExecution?.runId;
 
     // Apply LLM-generated service descriptions to the graph in-place.
     if (pipelineResult.serviceDescriptions.length > 0) {
@@ -469,6 +496,25 @@ async function computeAnalyzeCore(
       previousAnalysisId,
       analysisResult: result,
     };
+  } catch (error) {
+    if (certifiedRunId) {
+      const attempted = await readAnalyzeRun(
+        project.path,
+        { runId: certifiedRunId },
+      ).catch(() => null);
+      if (attempted?.state === 'running') {
+        await dispatchAnalyzeRun(project.path, {
+          kind: 'fail',
+          runId: certifiedRunId,
+          failedAt: new Date(Math.max(Date.now(), Date.parse(now))).toISOString(),
+          error: {
+            code: 'ANALYZE_CORE_FAILED',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    }
+    throw error;
   } finally {
     if (didStash && stashGit) {
       options.tracker?.detail('parse', 'Restoring pending changes...');

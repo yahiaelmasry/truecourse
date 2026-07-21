@@ -91,11 +91,12 @@ Successful LLM response reuse is not enabled yet. Schema-v1 journals and their
 reserved finalizing states remain readable and migrate safely to v2 when the
 preparation command is used.
 
-The run-journal and prepared-finalization protocol is infrastructure at this
-stage; production `truecourse analyze` orchestration does not invoke it yet.
-Production attempts therefore still use the provider-wide session-limit
-circuit without writing an attempted-run journal. A following production-
-wiring contribution adopts this protocol for its first eligible work family.
+The first production-wiring slice journals full analyses only when their LLM
+plan contains certified aggregate architecture work and no code-batch or
+database-schema work. Other full analyses still use the provider-wide session-
+limit circuit and keep the completed `LATEST.json` baseline safe, but their
+attempt is not journaled yet; the CLI error states which case occurred. Later
+provider-family contributions extend the same journal protocol to those plans.
 
 Completed analyses are promoted separately from attempted-run journals. Local
 prepared-promotion markers live under `.truecourse/analyses/.promotions/`
