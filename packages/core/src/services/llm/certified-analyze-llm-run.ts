@@ -1,12 +1,16 @@
 import { CODE_DOMAINS, type RuleDomain } from '@truecourse/shared';
 import { isLlmSessionLimitError } from '@truecourse/shared/llm';
+import { isDeepStrictEqual } from 'node:util';
 import {
   admitAnalyzeRunPlanExecution,
   checkpointAnalyzeRunWork,
+  type AnalyzeRunSource,
   type AnalyzeRunExecutionCompletion,
   type AnalyzeRunCheckpointWriter,
   type AnalyzeRunPlanActivation,
 } from '../../lib/analyze-run-journal.js';
+import { activeCompletedBaselineId, getAnalysisStore } from '../../lib/analysis-store.js';
+import { readAnalyzeRunResumeCandidate } from '../../lib/analyze-run-resume-candidate.js';
 import { certifyAnalyzeRunExecutionCompletion } from '../../lib/analyze-run-execution-completion.js';
 import { certifyAnalyzeRunWorkCheckpoint } from '../../lib/analyze-run-work-checkpoint-certification.js';
 import type { AnalyzeLlmExecutionUsage } from './analyze-llm-execution-evidence.js';
@@ -34,6 +38,7 @@ import {
   type PlannedServiceViolationWork,
 } from './service-work-planner.js';
 import type { LlmWorkExecutionIntent } from './work-identity.js';
+import { fingerprint } from './work-identity.js';
 
 export type AnalyzeLlmWorkFamily = 'code' | 'database' | 'service' | 'module';
 export type AnalyzeLlmWorkMode = 'normal' | 'lifecycle';
@@ -77,6 +82,11 @@ export interface AnalyzeLlmPlanManifest {
 
 export interface AnalyzeLlmExecutionAdapter {
   readonly execution: Readonly<LlmWorkExecutionIntent>;
+  /** Exact resume-only model pin. Pending execution must enforce this value. */
+  readonly resumeExecution?: Readonly<LlmWorkExecutionIntent & {
+    readonly modelSelection: 'pinned';
+    readonly resolvedModel: string;
+  }>;
   execute(
     work: CertifiedAnalyzeLlmWork,
     options?: AnalyzeLlmExecutionOptions,
@@ -112,11 +122,62 @@ export interface AnalyzeLlmExecutionOutcome {
 
 export interface CertifiedAnalyzeLlmRun {
   readonly manifest: AnalyzeLlmPlanManifest;
+  inspectResumeCompatibility(
+    identity: AnalyzeLlmResumeIdentity,
+  ): Promise<AnalyzeLlmResumeCompatibility>;
   execute(
     activation: AnalyzeRunPlanActivation,
     observer?: AnalyzeLlmWorkProgressObserver,
   ): Promise<CertifiedAnalyzeLlmExecution>;
 }
+
+export interface AnalyzeLlmResumeIdentity {
+  readonly candidateAnalysisId: string;
+  readonly startedAt: string;
+  readonly source: AnalyzeRunSource;
+  readonly branch: string | null;
+  readonly commitHash: string | null;
+  readonly completedBaselineId: string | null;
+}
+
+export type AnalyzeLlmResumeIncompatibility =
+  | 'run-not-found'
+  | 'not-latest-attempt'
+  | 'run-not-blocked'
+  | 'run-changed-during-inspection'
+  | 'run-identity-changed'
+  | 'completed-baseline-changed'
+  | 'completed-baseline-invalid'
+  | 'inspection-storage-changed'
+  | 'work-plan-changed'
+  | 'uncheckpointed-success'
+  | 'checkpoint-contract-changed'
+  | 'checkpoint-result-invalid'
+  | 'checkpoint-execution-changed'
+  | 'checkpoint-model-unverified'
+  | 'duplicate-checkpoint-attempt';
+
+export type AnalyzeLlmResumeCompatibility =
+  | Readonly<{
+      compatible: false;
+      reason: AnalyzeLlmResumeIncompatibility;
+    }>
+  | Readonly<{
+      compatible: true;
+      /** Inspection is advisory; resume activation must atomically revalidate every observation. */
+      requiresActivationRevalidation: true;
+      resetHint: string;
+      counts: Readonly<{ total: number; reused: number; pending: number }>;
+      reusedWorkIds: readonly string[];
+      pendingWorkIds: readonly string[];
+      observed: Readonly<{
+        runRevision: number;
+        attemptSequence: number;
+        latestAttemptSequence: number;
+        completedBaselineFingerprint: string | null;
+        resolvedModel: string;
+      }>;
+    }>;
 
 export interface CertifiedAnalyzeLlmExecution {
   readonly results: readonly {
@@ -274,6 +335,8 @@ export function certifyAnalyzeLlmRun(
 
   return Object.freeze({
     manifest,
+    inspectResumeCompatibility: (identity: AnalyzeLlmResumeIdentity) =>
+      inspectResumeCompatibility(identity),
     async execute(
       activation: AnalyzeRunPlanActivation,
       observer?: AnalyzeLlmWorkProgressObserver,
@@ -308,6 +371,172 @@ export function certifyAnalyzeLlmRun(
       });
     },
   });
+
+  async function inspectResumeCompatibility(
+    identity: AnalyzeLlmResumeIdentity,
+  ): Promise<AnalyzeLlmResumeCompatibility> {
+    const candidate = await readAnalyzeRunResumeCandidate(journalKey, runId);
+    if (!candidate) return incompatible('run-not-found');
+    if (!candidate.isLatestAttempt) return incompatible('not-latest-attempt');
+    if (candidate.state !== 'blocked' || candidate.blocked === null || candidate.plan === 'unsealed') {
+      return incompatible('run-not-blocked');
+    }
+    if (!sameResumeIdentity(candidate, identity)) return incompatible('run-identity-changed');
+
+    const analysisStore = getAnalysisStore();
+    const completed = await analysisStore.readLatest(journalKey);
+    if (getAnalysisStore() !== analysisStore) {
+      return incompatible('inspection-storage-changed');
+    }
+    let completedBaselineId: string | null;
+    let completedBaselineFingerprint: string | null;
+    try {
+      completedBaselineId = completed === null ? null : activeCompletedBaselineId(completed);
+      completedBaselineFingerprint = completed === null ? null : fingerprint(completed);
+    } catch {
+      return incompatible('completed-baseline-invalid');
+    }
+    if (completedBaselineId !== candidate.completedBaselineId) {
+      return incompatible('completed-baseline-changed');
+    }
+
+    let currentExecution: Readonly<LlmWorkExecutionIntent>;
+    try {
+      currentExecution = validateExecution(adapter.execution);
+    } catch {
+      return incompatible('checkpoint-execution-changed');
+    }
+    if (
+      currentExecution.provider !== execution.provider
+      || currentExecution.requestedModel !== execution.requestedModel
+    ) {
+      return incompatible('checkpoint-execution-changed');
+    }
+    const resumeExecution = adapter.resumeExecution;
+    if (
+      !resumeExecution
+      || resumeExecution.modelSelection !== 'pinned'
+      || resumeExecution.provider !== execution.provider
+      || resumeExecution.requestedModel !== execution.requestedModel
+      || typeof resumeExecution.resolvedModel !== 'string'
+      || resumeExecution.resolvedModel.trim().length === 0
+    ) {
+      return incompatible('checkpoint-model-unverified');
+    }
+    const resolvedModel = resumeExecution.resolvedModel;
+
+    const currentManifest = manifest.work.map(({ workId, inputFingerprint }) => ({
+      workId,
+      inputFingerprint,
+    }));
+    const storedManifest = candidate.plan.work.map(({ workId, inputFingerprint }) => ({
+      workId,
+      inputFingerprint,
+    }));
+    if (!isDeepStrictEqual(storedManifest, currentManifest)) {
+      return incompatible('work-plan-changed');
+    }
+
+    const attempts = new Set<string>();
+    const reused: { work: CertifiedAnalyzeLlmWork; result: unknown }[] = [];
+    const pending: CertifiedAnalyzeLlmWork[] = [];
+    for (let index = 0; index < certifiedWork.length; index += 1) {
+      const item = certifiedWork[index]!;
+      const stored = candidate.plan.work[index]!;
+      if (stored.state === 'pending') {
+        pending.push(item);
+        continue;
+      }
+      if (stored.state === 'succeeded-uncheckpointed') {
+        return incompatible('uncheckpointed-success');
+      }
+      const checkpoint = stored.checkpoint;
+      if (
+        checkpoint.resultContractId !== item.planned.request.resultContractId
+        || checkpoint.resultFingerprint !== fingerprint(checkpoint.result)
+      ) {
+        return incompatible('checkpoint-contract-changed');
+      }
+      if (attempts.has(checkpoint.attemptId)) {
+        return incompatible('duplicate-checkpoint-attempt');
+      }
+      attempts.add(checkpoint.attemptId);
+      const usage = checkpoint.usage;
+      if (
+        usage === null
+        || usage.provider !== execution.provider
+        || usage.requestedModel !== execution.requestedModel
+        || usage.callType !== item.family
+        || usage.totalTokens !== usage.inputTokens + usage.outputTokens
+      ) {
+        return incompatible('checkpoint-execution-changed');
+      }
+      if (
+        usage.resolvedModel === null
+        || usage.resolvedModel.trim().length === 0
+        || usage.resolvedModel !== resolvedModel
+      ) {
+        return incompatible('checkpoint-model-unverified');
+      }
+      let result: unknown;
+      try {
+        result = item.planned.request.parse(checkpoint.result);
+      } catch {
+        return incompatible('checkpoint-result-invalid');
+      }
+      reused.push(Object.freeze({ work: item, result }));
+    }
+
+    const candidateAfter = await readAnalyzeRunResumeCandidate(journalKey, runId);
+    if (
+      !candidateAfter
+      || candidateAfter.storageIdentity !== candidate.storageIdentity
+      || candidateAfter.revision !== candidate.revision
+      || candidateAfter.attemptSequence !== candidate.attemptSequence
+      || candidateAfter.latestAttemptSequence !== candidate.latestAttemptSequence
+      || !candidateAfter.isLatestAttempt
+    ) {
+      return incompatible('run-changed-during-inspection');
+    }
+    if (getAnalysisStore() !== analysisStore) {
+      return incompatible('inspection-storage-changed');
+    }
+    const completedAfter = await analysisStore.readLatest(journalKey);
+    if (getAnalysisStore() !== analysisStore) {
+      return incompatible('inspection-storage-changed');
+    }
+    let completedBaselineFingerprintAfter: string | null;
+    try {
+      if (completedAfter !== null) activeCompletedBaselineId(completedAfter);
+      completedBaselineFingerprintAfter = completedAfter === null
+        ? null
+        : fingerprint(completedAfter);
+    } catch {
+      return incompatible('completed-baseline-invalid');
+    }
+    if (completedBaselineFingerprintAfter !== completedBaselineFingerprint) {
+      return incompatible('completed-baseline-changed');
+    }
+    return Object.freeze({
+      compatible: true,
+      requiresActivationRevalidation: true,
+      resetHint: candidate.blocked.resetHint,
+      counts: Object.freeze({
+        total: certifiedWork.length,
+        reused: reused.length,
+        pending: pending.length,
+      }),
+      reusedWorkIds: Object.freeze(reused.map(({ work: item }) => item.workId)),
+      pendingWorkIds: Object.freeze(pending.map((item) => item.workId)),
+      observed: Object.freeze({
+        runRevision: candidate.revision,
+        attemptSequence: candidate.attemptSequence,
+        latestAttemptSequence: candidate.latestAttemptSequence,
+        completedBaselineFingerprint,
+        resolvedModel,
+      }),
+    });
+  }
 
   async function executeCertifiedWork(
     observer?: AnalyzeLlmWorkProgressObserver,
@@ -366,6 +595,38 @@ export function certifyAnalyzeLlmRun(
         result: unknown;
       }>).value);
   }
+}
+
+function incompatible(reason: AnalyzeLlmResumeIncompatibility): AnalyzeLlmResumeCompatibility {
+  return Object.freeze({ compatible: false, reason });
+}
+
+function sameResumeIdentity(
+  candidate: Readonly<{
+    candidateAnalysisId: string;
+    startedAt: string;
+    source: AnalyzeRunSource;
+    branch: string | null;
+    commitHash: string | null;
+    completedBaselineId: string | null;
+  }>,
+  identity: AnalyzeLlmResumeIdentity,
+): boolean {
+  return isDeepStrictEqual({
+    candidateAnalysisId: candidate.candidateAnalysisId,
+    startedAt: candidate.startedAt,
+    source: candidate.source,
+    branch: candidate.branch,
+    commitHash: candidate.commitHash,
+    completedBaselineId: candidate.completedBaselineId,
+  }, {
+    candidateAnalysisId: identity.candidateAnalysisId,
+    startedAt: identity.startedAt,
+    source: identity.source,
+    branch: identity.branch,
+    commitHash: identity.commitHash,
+    completedBaselineId: identity.completedBaselineId,
+  });
 }
 
 async function notifyProgressObserver(
