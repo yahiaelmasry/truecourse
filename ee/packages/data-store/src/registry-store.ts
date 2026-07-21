@@ -9,7 +9,7 @@
  * passes; the slug is derived with the shared `slugify`.
  */
 
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull, lt, or } from 'drizzle-orm';
 import { registry, type EeDb } from '@truecourse/ee-db';
 import {
   slugify,
@@ -123,11 +123,25 @@ export class PgRegistryStore implements RegistryStore {
       if (current.lastAnalyzed === isoTimestamp) return 'present';
       if (current.lastAnalyzed > isoTimestamp) return 'superseded';
     }
-    await this.db
+    const updated = await this.db
       .update(registry)
       .set({ lastAnalyzed: isoTimestamp })
-      .where(eq(registry.slug, slug));
-    return 'updated';
+      .where(and(
+        eq(registry.slug, slug),
+        or(isNull(registry.lastAnalyzed), lt(registry.lastAnalyzed, isoTimestamp)),
+      ))
+      .returning({ lastAnalyzed: registry.lastAnalyzed });
+    if (updated.length > 0) return 'updated';
+
+    const settled = await this.getProjectBySlug(slug);
+    if (!settled) throw new Error('Cannot project lastAnalyzed for an untracked project');
+    if (!settled.lastAnalyzed) {
+      throw new Error('Concurrent lastAnalyzed projection did not settle to a durable timestamp');
+    }
+    validateLastAnalyzedTimestamp(settled.lastAnalyzed, 'Stored lastAnalyzed');
+    if (settled.lastAnalyzed === isoTimestamp) return 'present';
+    if (settled.lastAnalyzed > isoTimestamp) return 'superseded';
+    throw new Error('Concurrent lastAnalyzed projection regressed below the requested timestamp');
   }
 
   async setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void> {

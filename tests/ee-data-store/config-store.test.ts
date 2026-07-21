@@ -156,4 +156,17 @@ describe('PgRegistryStore (pglite)', () => {
     )).rejects.toThrow('Stored lastAnalyzed must be a canonical ISO timestamp');
     expect((await store.getProjectBySlug('myrepo'))?.lastAnalyzed).toBe('malformed');
   });
+
+  it('keeps the newest lastAnalyzed value under competing projections', async () => {
+    await store.registerProject('/a/myrepo');
+    const newer = '2026-05-02T00:00:00.000Z';
+    const older = '2026-05-01T00:00:00.000Z';
+
+    await Promise.all([
+      store.ensureLastAnalyzed('myrepo', newer),
+      store.ensureLastAnalyzed('myrepo', older),
+    ]);
+
+    expect((await store.getProjectBySlug('myrepo'))?.lastAnalyzed).toBe(newer);
+  });
 });
