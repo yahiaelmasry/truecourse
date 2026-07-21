@@ -118,6 +118,34 @@ describe('planned violation result materialization', () => {
     expectTypeOf<InvalidServiceDatabasePair>().toEqualTypeOf<never>();
   });
 
+  it('rejects a certified mode that disagrees with the request contract', () => {
+    const work = certified(
+      'service',
+      'architecture',
+      'lifecycle',
+      planServiceViolationWork(serviceContext, 'normal', execution),
+    );
+
+    expect(() => materializePlannedViolationResult(
+      { work, result: { violations: [], serviceDescriptions: [] } },
+      { createId: () => 'unused', createdAt: () => '2026-07-19T12:00:00.000Z' },
+    )).toThrow(/mode lifecycle does not match analyze\.service@1/i);
+  });
+
+  it('rejects a request contract owned by a different work family', () => {
+    const work = certified(
+      'service',
+      'architecture',
+      'normal',
+      planDatabaseViolationWork(databaseContext, 'normal', execution),
+    );
+
+    expect(() => materializePlannedViolationResult(
+      { work, result: { violations: [] } },
+      { createId: () => 'unused', createdAt: () => '2026-07-19T12:00:00.000Z' },
+    )).toThrow(/service work cannot materialize result contract analyze\.database@1/i);
+  });
+
   it('maps all eight certified family/mode contracts without replanning', () => {
     let nextId = 0;
     const options = {
