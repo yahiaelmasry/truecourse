@@ -12,6 +12,13 @@ export interface CompletedAnalysisLineageCertification {
   generations: number;
 }
 
+export class PromotedAnalysisNotInLineageError extends Error {
+  constructor() {
+    super('Promoted snapshot is not in the active completed-analysis lineage');
+    this.name = 'PromotedAnalysisNotInLineageError';
+  }
+}
+
 function isCanonicalTimestamp(value: unknown): value is string {
   return typeof value === 'string'
     && !Number.isNaN(Date.parse(value))
@@ -120,7 +127,7 @@ export function certifyCompletedAnalysisLineageSnapshots(
 
     const previousId = snapshot.violations.previousAnalysisId;
     if (previousId === null) {
-      throw new Error('Promoted snapshot is not in the active completed-analysis lineage');
+      throw new PromotedAnalysisNotInLineageError();
     }
     stored = exactCandidate(candidatesById.get(previousId) ?? []);
     validateStoredSnapshot(previousId, stored, buildFilename);

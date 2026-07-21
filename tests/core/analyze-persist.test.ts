@@ -16,6 +16,7 @@ import {
   readDiff,
   readHistory,
   readLatest,
+  removeFromHistory,
   resetAnalysisStore,
   writeAnalysis,
   writeDiff,
@@ -161,5 +162,46 @@ describe('full analysis persistence', () => {
     await expect(readLatest(repoPath)).resolves.toEqual(baseline.latest);
     await expect(readAnalysis(repoPath, candidateFilename)).resolves.toBeNull();
     await expect(readHistory(repoPath)).resolves.toEqual({ analyses: [] });
+  });
+
+  it('repairs a committed ancestor after a newer analysis becomes active', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-analyze-persist-'));
+    repositories.push(repoPath);
+    const project = await registerProject(repoPath, 'Delayed projection');
+    const first = coreResult();
+    await persistFullAnalysis(project, first, Date.now());
+
+    const firstLatest = await readLatest(repoPath);
+    const second = coreResult();
+    second.analysisId = 'newer-analysis';
+    second.now = '2026-07-20T12:00:00.000Z';
+    second.commitHash = 'newer456';
+    second.latestBaseline = firstLatest;
+    second.previousAnalysisId = first.analysisId;
+    await persistFullAnalysis(project, second, Date.now());
+
+    await removeFromHistory(repoPath, first.analysisId);
+    const currentDiff = {
+      id: 'newer-diff',
+      baseAnalysisId: second.analysisId,
+    } as DiffSnapshot;
+    await writeDiff(repoPath, currentDiff);
+
+    await expect(persistFullAnalysis(project, first, Date.now())).resolves.toMatchObject({
+      analysisId: first.analysisId,
+    });
+    await expect(readLatest(repoPath)).resolves.toMatchObject({
+      analysis: { id: second.analysisId },
+    });
+    await expect(readHistory(repoPath)).resolves.toMatchObject({
+      analyses: [
+        expect.objectContaining({ id: first.analysisId }),
+        expect.objectContaining({ id: second.analysisId }),
+      ],
+    });
+    await expect(readDiff(repoPath)).resolves.toEqual(currentDiff);
+    await expect(getProjectBySlug(project.slug)).resolves.toMatchObject({
+      lastAnalyzed: second.now,
+    });
   });
 });

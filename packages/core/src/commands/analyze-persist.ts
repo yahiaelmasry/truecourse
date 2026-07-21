@@ -21,6 +21,7 @@ import {
 } from '../lib/analysis-store.js';
 import { projectCompletedAnalysis } from '../lib/completed-analysis-projection.js';
 import { makeViolationDenormalizer } from '../lib/completed-analysis-promotion.js';
+import { PromotedAnalysisNotInLineageError } from '../lib/completed-analysis-lineage.js';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
@@ -79,6 +80,11 @@ export async function persistFullAnalysis(
   ), 'LATEST snapshot');
 
   const { bySeverity, total } = summarizeActiveViolations(latest.violations);
+  const projection = {
+    projectSlug: project.slug,
+    promotedSnapshot: snapshot,
+    historyEntry: buildHistoryEntry(snapshot, filename, core.pipelineResult),
+  };
 
   const promotion = await promoteCompletedAnalysisBaseline(project.path, {
     expectedBaseline: core.latestBaseline,
@@ -86,15 +92,17 @@ export async function persistFullAnalysis(
     latest,
   });
   if (promotion.state === 'conflict') {
-    throw new Error(
-      `Completed analysis baseline changed before promotion (current: ${promotion.currentBaselineId ?? 'none'})`,
-    );
+    try {
+      await projectCompletedAnalysis(project.path, projection);
+    } catch (error) {
+      if (!(error instanceof PromotedAnalysisNotInLineageError)) throw error;
+      throw new Error(
+        `Completed analysis baseline changed before promotion (current: ${promotion.currentBaselineId ?? 'none'})`,
+      );
+    }
+  } else {
+    await projectCompletedAnalysis(project.path, projection);
   }
-  await projectCompletedAnalysis(project.path, {
-    projectSlug: project.slug,
-    promotedSnapshot: snapshot,
-    historyEntry: buildHistoryEntry(snapshot, filename, core.pipelineResult),
-  });
 
   return {
     analysisId: core.analysisId,
