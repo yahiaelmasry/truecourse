@@ -156,7 +156,7 @@ describe('analyze run journal', () => {
 
     expect(sealed).toMatchObject({
       runId: 'hosted-run',
-      revision: 1,
+      revision: 2,
       plan: 'sealed',
       counts: { total: 1, pending: 1 },
     });
@@ -340,7 +340,7 @@ describe('analyze run journal', () => {
     }, execution.completion);
 
     expect(finalizing).toMatchObject({
-      revision: 2,
+      revision: 3,
       state: 'finalizing',
       candidateAnalysisId: 'candidate-analysis',
       completedBaselineId: 'previous-completed-analysis',
@@ -407,14 +407,14 @@ describe('analyze run journal', () => {
     }, execution.completion)).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      revision: 1,
+      revision: 2,
       state: 'running',
       counts: { pending: 1, succeeded: 0 },
     });
     await expect(beginFinalizeAnalyzeRun(repoPath, {
       runId: 'exact-finalize-run',
       finalizingAt: '2026-07-19T01:40:02.000Z',
-    }, execution.completion)).resolves.toMatchObject({ revision: 2, state: 'finalizing' });
+    }, execution.completion)).resolves.toMatchObject({ revision: 3, state: 'finalizing' });
   });
 
   it('records a finalization failure without forgetting successful uncheckpointed calls', async () => {
@@ -446,7 +446,7 @@ describe('analyze run journal', () => {
     });
 
     expect(failed).toMatchObject({
-      revision: 3,
+      revision: 4,
       state: 'failed',
       completedBaselineId: 'safe-baseline',
       counts: { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 },
@@ -494,7 +494,7 @@ describe('analyze run journal', () => {
       outcome.status === 'rejected' && outcome.reason instanceof AnalyzeRunRevisionConflictError,
     )).toHaveLength(1);
     const latest = await readAnalyzeRun(repoPath, 'latest-attempt');
-    expect(latest).toMatchObject({ revision: 2 });
+    expect(latest).toMatchObject({ revision: 3 });
     expect(latest?.counts).toEqual(
       latest?.state === 'finalizing'
         ? { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 }
@@ -955,7 +955,7 @@ describe('analyze run journal', () => {
 
     fs.writeFileSync(file, JSON.stringify({
       ...finalizing,
-      revision: 3,
+      revision: 4,
     }));
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
