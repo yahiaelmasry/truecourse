@@ -5,6 +5,7 @@ import {
   type DatabaseViolationContext,
   type ModuleViolationContext,
   type ViolationsResult,
+  type AllViolationsResult,
   type AllViolationsLifecycleResult,
   type ExistingViolation,
 } from './llm/provider.js';
@@ -157,12 +158,6 @@ export async function generateViolations(
 ): Promise<ViolationsResult> {
   const provider = externalProvider ?? createLLMProvider();
 
-  // Valid ID sets for post-call validation
-  const validServiceIds = new Set(input.services.map((s) => s.id));
-  const validDatabaseIds = new Set((input.databases || []).map((d) => d.id));
-  const validModuleIds = new Set((input.modules || []).map((m) => m.id));
-  const validMethodIds = new Set((input.methods || []).filter((m) => m.id).map((m) => m.id!));
-
   const {
     service: serviceContext,
     database: dbContext,
@@ -178,6 +173,21 @@ export async function generateViolations(
     onCallStart,
     onCallDone,
   });
+
+  return mergeViolationLlmResults(input, results);
+}
+
+/** Merge provider family results while rejecting graph IDs outside this analysis. */
+export function mergeViolationLlmResults(
+  input: ViolationGenerationInput,
+  results: AllViolationsResult,
+): ViolationsResult {
+  const validServiceIds = new Set(input.services.map((service) => service.id));
+  const validDatabaseIds = new Set((input.databases || []).map((database) => database.id));
+  const validModuleIds = new Set((input.modules || []).map((module) => module.id));
+  const validMethodIds = new Set(
+    (input.methods || []).flatMap((method) => method.id ? [method.id] : []),
+  );
 
   // --- Merge results ---
   const allViolations: Violation[] = [];

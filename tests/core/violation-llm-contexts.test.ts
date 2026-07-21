@@ -3,6 +3,7 @@ import {
   buildViolationLlmContexts,
   generateViolations,
   generateViolationsWithLifecycle,
+  mergeViolationLlmResults,
   type ViolationGenerationInput,
 } from '../../packages/core/src/services/violation.service.js';
 import type {
@@ -162,5 +163,100 @@ describe('violation LLM context construction', () => {
     expect(lifecycleInput).toEqual(expect.objectContaining(
       buildViolationLlmContexts(generationInput, 'lifecycle'),
     ));
+  });
+});
+
+describe('violation LLM result merging', () => {
+  it('combines family results and preserves valid graph targets', () => {
+    const result = mergeViolationLlmResults(input(), {
+      service: {
+        violations: [{
+          type: 'service',
+          title: 'Service finding',
+          content: 'Service content',
+          severity: 'high',
+          targetServiceId: 'service-orders',
+        }],
+        serviceDescriptions: [
+          { id: 'service-orders', description: 'Orders service' },
+        ],
+      },
+      database: {
+        violations: [{
+          type: 'database',
+          title: 'Database finding',
+          content: 'Database content',
+          severity: 'medium',
+          targetDatabaseId: 'database-orders',
+        }],
+      },
+      module: {
+        violations: [{
+          type: 'module',
+          title: 'Module finding',
+          content: 'Module content',
+          severity: 'low',
+          targetServiceId: 'service-orders',
+          targetModuleId: 'module-handler',
+          targetMethodId: 'method-create',
+        }],
+      },
+    });
+
+    expect(result.violations).toHaveLength(3);
+    expect(result.violations[0]).toMatchObject({ targetServiceId: 'service-orders' });
+    expect(result.violations[1]).toMatchObject({ targetDatabaseId: 'database-orders' });
+    expect(result.violations[2]).toMatchObject({
+      targetServiceId: 'service-orders',
+      targetModuleId: 'module-handler',
+      targetMethodId: 'method-create',
+    });
+    expect(result.serviceDescriptions).toEqual([
+      { id: 'service-orders', description: 'Orders service' },
+    ]);
+  });
+
+  it('clears provider targets and descriptions outside the analyzed graph', () => {
+    const result = mergeViolationLlmResults(input(), {
+      service: {
+        violations: [{
+          type: 'service',
+          title: 'Unknown service',
+          content: 'Unknown target',
+          severity: 'high',
+          targetServiceId: 'service-foreign',
+        }],
+        serviceDescriptions: [
+          { id: 'service-foreign', description: 'Foreign service' },
+        ],
+      },
+      database: {
+        violations: [{
+          type: 'database',
+          title: 'Unknown database',
+          content: 'Unknown target',
+          severity: 'medium',
+          targetDatabaseId: 'database-foreign',
+        }],
+      },
+      module: {
+        violations: [{
+          type: 'module',
+          title: 'Unknown module',
+          content: 'Unknown targets',
+          severity: 'low',
+          targetServiceId: 'service-foreign',
+          targetModuleId: 'module-foreign',
+          targetMethodId: 'method-foreign',
+        }],
+      },
+    });
+
+    expect(result.violations[0].targetServiceId).toBeUndefined();
+    expect(result.violations[1].targetDatabaseId).toBeUndefined();
+    expect(result.violations[2].targetServiceId).toBeUndefined();
+    expect(result.violations[2].targetModuleId).toBeUndefined();
+    expect(result.violations[2].targetMethodId).toBeUndefined();
+    expect(result.serviceDescriptions).toEqual([]);
   });
 });
