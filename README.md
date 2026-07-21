@@ -80,8 +80,9 @@ replaces the completed findings in `LATEST.json`. If a crash loses the pointer
 update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
 `packages/core/src/lib/analyze-run-journal.ts`; this initial schema records
-pending work and reset/failure information but deliberately does not reuse
-successful LLM responses yet.
+pending work and reset/failure information and reserves its initial execution-
+admission revisions for the next lifecycle slice. It deliberately does not
+reuse successful LLM responses yet.
 
 **First time, on `main`:**
 

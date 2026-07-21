@@ -378,7 +378,7 @@ describe('analyze run journal', () => {
       work: [{ workId: 'analyze:v1:database', inputFingerprint: `sha256:${'8'.repeat(64)}` }],
     });
     const sealed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
-    fs.writeFileSync(file, JSON.stringify({ ...sealed, revision: 2 }));
+    fs.writeFileSync(file, JSON.stringify({ ...sealed, revision: 3 }));
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
       AnalyzeRunJournalCorruptError,
@@ -450,7 +450,7 @@ describe('analyze run journal', () => {
       'impossible-sealed-failure-revision-run.json',
     );
     const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
-    stored.revision = 3;
+    stored.revision = 4;
     fs.writeFileSync(file, JSON.stringify(stored));
     resetAnalyzeRunStorage();
 

@@ -693,18 +693,19 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     )
     : (
       Date.parse(plan.sealedAt) >= Date.parse(value.startedAt) && (
-        (status.state === 'running' && revision === 1 && value.updatedAt === plan.sealedAt) ||
-        (status.state === 'blocked' && revision === 2 && status.blockedAt === value.updatedAt) ||
-        (status.state === 'failed' && revision === 2 && status.failedAt === value.updatedAt)
+        (status.state === 'running' && [1, 2].includes(revision) && value.updatedAt === plan.sealedAt) ||
+        (status.state === 'blocked' && [2, 3].includes(revision) && status.blockedAt === value.updatedAt) ||
+        (status.state === 'failed' && [2, 3].includes(revision) && status.failedAt === value.updatedAt)
       )
     );
   if (!lifecycleIsReachable || terminalTimestampIsImpossible) {
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
-    The exact revision matrix above intentionally describes only schema v1's current commands:
-    begin, seal-plan, block, and fail. Future work-result/finalization commands must migrate or
-    extend the durable schema together with these invariants.
+    Schema v1 reserves revision 2 for running/sealed execution admission and revision 3 for its
+    terminal transitions so a later writer can add admission without making its journals unreadable
+    by this initial reader. Future work-result/finalization commands must migrate or extend the
+    durable schema together with these invariants.
   */
 
   return {
