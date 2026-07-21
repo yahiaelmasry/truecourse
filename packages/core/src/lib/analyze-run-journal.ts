@@ -37,7 +37,8 @@ import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execu
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 4 as const;
+const SCHEMA_VERSION = 5 as const;
+const EXECUTION_ATTEMPT_SCHEMA_VERSION = 4 as const;
 const CHECKPOINT_SCHEMA_VERSION = 3 as const;
 const LEGACY_SCHEMA_VERSION = 1 as const;
 const PREVIOUS_SCHEMA_VERSION = 2 as const;
@@ -46,10 +47,11 @@ const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
 
 function isSupportedSchemaVersion(
   value: unknown,
-): value is 1 | 2 | 3 | 4 {
+): value is 1 | 2 | 3 | 4 | 5 {
   return value === LEGACY_SCHEMA_VERSION
     || value === PREVIOUS_SCHEMA_VERSION
     || value === CHECKPOINT_SCHEMA_VERSION
+    || value === EXECUTION_ATTEMPT_SCHEMA_VERSION
     || value === SCHEMA_VERSION;
 }
 
@@ -175,6 +177,27 @@ export interface PrepareAnalyzeRunFinalizationCommand {
   projection: CompletedAnalysisProjectionIntent;
 }
 
+export interface AnalyzeRunResumeExecutionPin {
+  provider: string;
+  requestedModel: string | null;
+  resolvedModel: string;
+}
+
+export interface AnalyzeRunExecutionAttempt {
+  number: number;
+  activatedAt: string;
+  resume: null | {
+    admission: 'activated' | 'executing';
+    admittedAt: string | null;
+    resumedFrom: {
+      reason: 'provider-session-limit';
+      resetHint: string;
+      blockedAt: string;
+    };
+    executionPin: AnalyzeRunResumeExecutionPin;
+  };
+}
+
 interface StoredAnalyzeRunFinalizationIntent {
   preparedAt: string;
   promotion: CompletedAnalysisPromotion;
@@ -202,10 +225,7 @@ export interface AnalyzeRunView {
   branch: string | null;
   commitHash: string | null;
   completedBaselineId: string | null;
-  executionAttempt: {
-    number: number;
-    activatedAt: string;
-  };
+  executionAttempt: AnalyzeRunExecutionAttempt;
   plan: 'unsealed' | 'sealed';
   counts: null | {
     total: number;
@@ -282,10 +302,7 @@ export interface StoredAnalyzeRun {
   branch: string | null;
   commitHash: string | null;
   completedBaselineId: string | null;
-  executionAttempt: {
-    number: number;
-    activatedAt: string;
-  };
+  executionAttempt: AnalyzeRunExecutionAttempt;
   finalizationIntent: StoredAnalyzeRunFinalizationIntent | null;
   plan:
     | { state: 'unsealed' }
@@ -304,6 +321,7 @@ interface ParsedLatestAttemptPointer {
     | typeof LEGACY_SCHEMA_VERSION
     | typeof PREVIOUS_SCHEMA_VERSION
     | typeof CHECKPOINT_SCHEMA_VERSION
+    | typeof EXECUTION_ATTEMPT_SCHEMA_VERSION
     | typeof SCHEMA_VERSION;
   runId: string;
 }
@@ -522,6 +540,7 @@ installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
     branch: current.branch,
     commitHash: current.commitHash,
     completedBaselineId: current.completedBaselineId,
+    executionAttempt: structuredClone(current.executionAttempt),
     blocked: current.status.state === 'blocked'
       ? Object.freeze({
           resetHint: current.status.resetHint,
@@ -717,6 +736,7 @@ export async function dispatchAnalyzeRun(
     executionAttempt: {
       number: 1,
       activatedAt: validateTimestamp(command.startedAt, 'startedAt'),
+      resume: null,
     },
     finalizationIntent: null,
     plan: { state: 'unsealed' },
@@ -1038,7 +1058,7 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
     branch: run.branch,
     commitHash: run.commitHash,
     completedBaselineId: run.completedBaselineId,
-    executionAttempt: { ...run.executionAttempt },
+    executionAttempt: structuredClone(run.executionAttempt),
     plan: run.plan.state,
     counts,
     blocked: run.status.state === 'blocked'
@@ -1587,7 +1607,11 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const schemaVersion = value.schemaVersion as ParsedLatestAttemptPointer['schemaVersion'];
   const plan = parseStoredPlan(value.plan, file, schemaVersion);
   if (
-    (value.schemaVersion === CHECKPOINT_SCHEMA_VERSION || value.schemaVersion === SCHEMA_VERSION)
+    (
+      value.schemaVersion === CHECKPOINT_SCHEMA_VERSION
+      || value.schemaVersion === EXECUTION_ATTEMPT_SCHEMA_VERSION
+      || value.schemaVersion === SCHEMA_VERSION
+    )
     && !Object.hasOwn(value, 'finalizationIntent')
   ) {
     throw new AnalyzeRunJournalCorruptError(
@@ -1605,13 +1629,15 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const startedAt = validateTimestamp(value.startedAt, 'startedAt');
   const executionAttempt = value.schemaVersion === SCHEMA_VERSION
     ? parseStoredExecutionAttempt(value.executionAttempt, file)
-    : { number: 1, activatedAt: startedAt };
+    : value.schemaVersion === EXECUTION_ATTEMPT_SCHEMA_VERSION
+      ? parseStoredSchemaV4ExecutionAttempt(value.executionAttempt, file)
+      : { number: 1, activatedAt: startedAt, resume: null };
   if (Date.parse(executionAttempt.activatedAt) < Date.parse(startedAt)) {
     throw new AnalyzeRunJournalCorruptError(`Analyze execution attempt predates its run: ${file}`);
   }
-  if (executionAttempt.number !== 1 || executionAttempt.activatedAt !== startedAt) {
+  if (executionAttempt.number === 1 && executionAttempt.activatedAt !== startedAt) {
     throw new AnalyzeRunJournalCorruptError(
-      `Analyze execution attempt is unreachable in schema v4: ${file}`,
+      `Initial analyze execution attempt does not match its run start: ${file}`,
     );
   }
   if (finalizationIntent !== null) {
@@ -1662,13 +1688,9 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     && Date.parse(terminalAt) < Date.parse(checkpointUpdatedAt);
   const allCheckpointed = plan.state === 'sealed'
     && plan.work.every((work) => work.state === 'succeeded-checkpointed');
-  const allLegacySucceeded = plan.state === 'sealed'
+  const allLegacySucceeded = executionAttempt.number === 1
+    && plan.state === 'sealed'
     && plan.work.every((work) => work.state === 'succeeded-uncheckpointed');
-  const finalizingRevision = allCheckpointed
-    ? 3 + checkpointCount
-    : schemaVersion === LEGACY_SCHEMA_VERSION
-      ? 2
-      : 3;
   const preAdmissionSchema3Revision = schemaVersion === CHECKPOINT_SCHEMA_VERSION
     && plan.state === 'sealed'
     && checkpointLifecycle
@@ -1696,12 +1718,49 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         && status.finalizingAt !== null
         && revision === 3 + checkpointCount + (finalizationIntent === null ? 0 : 1)
       )
-    );
+  );
   const lifecycleRevision = preAdmissionSchema3Revision ? revision + 1 : revision;
+  const resumeAdmission = executionAttempt.resume?.admission ?? null;
+  const resumedCheckpointTimestampsAreReachable = executionAttempt.number === 1
+    || plan.state !== 'sealed'
+    || plan.work.every((work) => {
+      if (work.state !== 'succeeded-checkpointed') return true;
+      const checkpointedAt = Date.parse(work.checkpoint.checkpointedAt);
+      const priorBlockAt = Date.parse(executionAttempt.resume!.resumedFrom.blockedAt);
+      if (checkpointedAt <= priorBlockAt) return true;
+      return resumeAdmission === 'executing'
+        && checkpointedAt >= Date.parse(executionAttempt.resume!.admittedAt!);
+    });
+  const initialRunningRevision = 2 + checkpointCount;
+  const resumedActivationRevision = 1 + (3 * (executionAttempt.number - 1)) + checkpointCount;
+  const runningRevision = executionAttempt.number === 1
+    ? initialRunningRevision
+    : resumedActivationRevision + (resumeAdmission === 'executing' ? 1 : 0);
+  const finalizingRevision = allCheckpointed
+    ? runningRevision + 1
+    : schemaVersion === LEGACY_SCHEMA_VERSION
+      ? 2
+      : 3;
+  const runningUpdatedAt = executionAttempt.number === 1
+    ? checkpointUpdatedAt
+    : resumeAdmission === 'activated'
+      ? executionAttempt.activatedAt
+      : Date.parse(checkpointUpdatedAt) > Date.parse(executionAttempt.resume!.admittedAt!)
+        ? checkpointUpdatedAt
+        : executionAttempt.resume!.admittedAt!;
+  const executionCanBeTerminal = executionAttempt.number === 1
+    || resumeAdmission === 'executing';
+  const terminalFollowsAdmission = terminalAt === null
+    || executionAttempt.number === 1
+    || Date.parse(terminalAt) >= Date.parse(executionAttempt.resume!.admittedAt!);
+  const nonFinalTerminalRevisionIsReachable = executionAttempt.number === 1
+    ? lifecycleRevision === 2 || lifecycleRevision === initialRunningRevision + 1
+    : lifecycleRevision === runningRevision + 1;
   const lifecycleIsReachable = plan.state === 'unsealed'
     ? (
       executionAttempt.number === 1
       && executionAttempt.activatedAt === value.startedAt
+      && executionAttempt.resume === null
       && finalizationIntent === null && (
       (status.state === 'running' && lifecycleRevision === 0 && value.updatedAt === value.startedAt) ||
       (
@@ -1717,23 +1776,35 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         (
           status.state === 'running' &&
           finalizationIntent === null && (
-            (lifecycleRevision === 1 && value.updatedAt === plan.sealedAt && plan.work.every((work) => work.state === 'pending'))
-            || (checkpointLifecycle && lifecycleRevision === 2 + checkpointCount && value.updatedAt === checkpointUpdatedAt)
+            (
+              executionAttempt.number === 1
+              && executionAttempt.resume === null
+              && lifecycleRevision === 1
+              && value.updatedAt === plan.sealedAt
+              && plan.work.every((work) => work.state === 'pending')
+            )
+            || (
+              checkpointLifecycle
+              && lifecycleRevision === runningRevision
+              && value.updatedAt === runningUpdatedAt
+            )
           )
         ) ||
         (
           status.state === 'blocked' &&
+          executionCanBeTerminal &&
           finalizationIntent === null &&
-          (lifecycleRevision === 2 || lifecycleRevision === 3 + checkpointCount) &&
+          nonFinalTerminalRevisionIsReachable &&
           status.blockedAt === value.updatedAt &&
           checkpointLifecycle
         ) ||
         (
           status.state === 'failed' &&
+          executionCanBeTerminal &&
           (
             (
               finalizationIntent === null &&
-              (lifecycleRevision === 2 || lifecycleRevision === 3 + checkpointCount) &&
+              nonFinalTerminalRevisionIsReachable &&
               status.finalizingAt === null &&
               checkpointLifecycle
             ) ||
@@ -1754,6 +1825,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         ) ||
         (
           status.state === 'finalizing' &&
+          executionCanBeTerminal &&
           lifecycleRevision === finalizingRevision + (finalizationIntent === null ? 0 : 1) &&
           (finalizationIntent === null
             ? status.finalizingAt === value.updatedAt
@@ -1762,6 +1834,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
           (allCheckpointed || allLegacySucceeded)
         ) || (
           status.state === 'completed' &&
+          executionCanBeTerminal &&
           lifecycleRevision === finalizingRevision + 2 &&
           finalizationIntent !== null &&
           status.completedAt === value.updatedAt &&
@@ -1776,14 +1849,17 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     !lifecycleIsReachable
     || terminalTimestampIsImpossible
     || !checkpointTimestampsAreReachable
+    || !resumedCheckpointTimestampsAreReachable
     || terminalPredatesCheckpoint
+    || !terminalFollowsAdmission
   ) {
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
     The exact revision matrix above intentionally describes only the current commands:
-    begin, seal-plan, durable execution admission, successful-result checkpoint,
-    block, fail, begin-finalize, prepare-finalization, and certified completion.
+    begin, seal-plan, durable initial execution admission, successful-result checkpoint,
+    block, reserved resume activation/admission, fail, begin-finalize,
+    prepare-finalization, and certified completion.
   */
 
   const normalizedRevision = schemaVersion === LEGACY_SCHEMA_VERSION && (
@@ -1912,9 +1988,88 @@ function parseStoredExecutionAttempt(
   ) {
     throw new AnalyzeRunJournalCorruptError(`Invalid analyze execution attempt: ${file}`);
   }
+  const number = value.number as number;
+  const activatedAt = validateTimestamp(value.activatedAt, 'executionAttempt.activatedAt');
+  if (number === 1) {
+    if (value.resume !== null) {
+      throw new AnalyzeRunJournalCorruptError(`Initial analyze attempt contains resume state: ${file}`);
+    }
+    return { number, activatedAt, resume: null };
+  }
+  if (
+    !isRecord(value.resume)
+    || (value.resume.admission !== 'activated' && value.resume.admission !== 'executing')
+    || !isRecord(value.resume.resumedFrom)
+    || value.resume.resumedFrom.reason !== 'provider-session-limit'
+    || !isRecord(value.resume.executionPin)
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze resume admission state: ${file}`);
+  }
+  const admittedAt = value.resume.admittedAt === null
+    ? null
+    : validateTimestamp(value.resume.admittedAt, 'executionAttempt.resume.admittedAt');
+  if (
+    (value.resume.admission === 'activated' && admittedAt !== null)
+    || (value.resume.admission === 'executing' && admittedAt === null)
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze resume admission timestamp: ${file}`);
+  }
+  const blockedAt = validateTimestamp(
+    value.resume.resumedFrom.blockedAt,
+    'executionAttempt.resume.resumedFrom.blockedAt',
+  );
+  const executionPin: AnalyzeRunResumeExecutionPin = {
+    provider: requireNonEmpty(value.resume.executionPin.provider, 'executionPin.provider'),
+    requestedModel: validateNullableString(
+      value.resume.executionPin.requestedModel,
+      'executionPin.requestedModel',
+    ),
+    resolvedModel: requireNonEmpty(
+      value.resume.executionPin.resolvedModel,
+      'executionPin.resolvedModel',
+    ),
+  };
+  if (executionPin.resolvedModel.trim() !== executionPin.resolvedModel) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid resolved resume model: ${file}`);
+  }
+  if (
+    Date.parse(blockedAt) > Date.parse(activatedAt)
+    || (admittedAt !== null && Date.parse(admittedAt) < Date.parse(activatedAt))
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Impossible analyze resume chronology: ${file}`);
+  }
   return {
-    number: value.number as number,
+    number,
+    activatedAt,
+    resume: {
+      admission: value.resume.admission,
+      admittedAt,
+      resumedFrom: {
+        reason: 'provider-session-limit',
+        resetHint: requireNonEmpty(value.resume.resumedFrom.resetHint, 'resetHint'),
+        blockedAt,
+      },
+      executionPin,
+    },
+  };
+}
+
+function parseStoredSchemaV4ExecutionAttempt(
+  value: unknown,
+  file: string,
+): StoredAnalyzeRun['executionAttempt'] {
+  if (
+    !isRecord(value)
+    || value.number !== 1
+    || typeof value.activatedAt !== 'string'
+    || Object.hasOwn(value, 'resume')
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid schema-v4 execution attempt: ${file}`);
+  }
+  return {
+    number: 1,
     activatedAt: validateTimestamp(value.activatedAt, 'executionAttempt.activatedAt'),
+    resume: null,
   };
 }
 

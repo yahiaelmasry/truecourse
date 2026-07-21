@@ -36,6 +36,24 @@ export interface AnalyzeRunResumeCandidate {
   readonly branch: string | null;
   readonly commitHash: string | null;
   readonly completedBaselineId: string | null;
+  readonly executionAttempt: Readonly<{
+    number: number;
+    activatedAt: string;
+    resume: null | Readonly<{
+      admission: 'activated' | 'executing';
+      admittedAt: string | null;
+      resumedFrom: Readonly<{
+        reason: 'provider-session-limit';
+        resetHint: string;
+        blockedAt: string;
+      }>;
+      executionPin: Readonly<{
+        provider: string;
+        requestedModel: string | null;
+        resolvedModel: string;
+      }>;
+    }>;
+  }>;
   readonly blocked: null | Readonly<{
     resetHint: string;
     blockedAt: string;
