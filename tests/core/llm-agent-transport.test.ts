@@ -10,6 +10,9 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 /** Minimal concrete provider exposing the protected spawn+parse for testing. */
 class TestProvider extends BaseCLIProvider {
+  get providerId(): string {
+    return 'test-provider';
+  }
   get binaryName(): string {
     return 'claude';
   }

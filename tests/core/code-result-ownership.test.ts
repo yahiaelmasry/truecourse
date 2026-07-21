@@ -4,6 +4,9 @@ import { BaseCLIProvider } from '../../packages/core/src/services/llm/cli-provid
 import type { CodeViolationContext } from '../../packages/core/src/services/llm/provider.js';
 
 class CodeResultProvider extends BaseCLIProvider {
+  get providerId() {
+    return 'test-provider';
+  }
   get binaryName() {
     return 'claude';
   }
