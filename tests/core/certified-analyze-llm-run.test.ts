@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { LlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   AnalyzeLlmPlanError,
@@ -471,6 +471,17 @@ describe('certified analyze LLM run', () => {
     expect(settled.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
     expect(adapter.calls).toHaveLength(1);
 
+    const recovered = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: structuredClone(codeContext) }],
+    }, adapter);
+    expect(recovered.manifest.work).toEqual(certified.manifest.work);
+    await expect(sealAnalyzeRunPlan(journalRepository, sealCommand))
+      .rejects.toThrow(/already admitted/i);
+    expect(adapter.calls).toHaveLength(1);
+
     await expect(sealAnalyzeRunPlan(journalRepository, {
       ...sealCommand,
       work: [{
@@ -690,10 +701,7 @@ describe('certified analyze LLM run', () => {
     const activation = await activate(certified, 'drain-peers');
     let returned = false;
     const executionPromise = certified.execute(activation).finally(() => { returned = true; });
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(calls).toHaveLength(2);
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
     expect(returned).toBe(false);
     releaseCode();
     await expect(executionPromise).rejects.toBe(providerFailure);

@@ -241,6 +241,8 @@ export function certifyAnalyzeLlmRun(
         manifest.work,
         () => {
           assertExecutionMatches(execution, adapter.execution);
+        },
+        () => {
           executed = true;
           return executeCertifiedWork();
         },

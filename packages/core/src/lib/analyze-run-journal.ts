@@ -396,6 +396,11 @@ export async function sealAnalyzeRunPlan(
         `Analyze run ${runId} already has a different sealed manifest`,
       );
     }
+    if (stored.revision !== 1) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} sealed execution was already admitted`,
+      );
+    }
   } else {
     await sealPlan(durableRepoKey, command, storage);
     assertAnalyzeRunStorage(storage);
@@ -457,6 +462,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
   repoKey: string,
   runId: string,
   work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
+  validate: () => void,
   admit: () => Promise<T>,
 ): Promise<AnalyzeRunPlanAdmission<T>> {
   if ((typeof receipt !== 'object' && typeof receipt !== 'function') || receipt === null) {
@@ -485,14 +491,28 @@ export async function admitAnalyzeRunPlanExecution<T>(
   if (analyzeRunPlanActivations.get(receipt) !== activation || activation.claimed) {
     return { admitted: false };
   }
+  validate();
   activation.claimed = true;
   try {
+    const admitted: StoredAnalyzeRun = {
+      ...stored,
+      revision: stored.revision + 1,
+    };
+    await storage.compareAndSwap(
+      activation.repoKey,
+      activation.runId,
+      stored.revision,
+      admitted,
+    );
+    assertAnalyzeRunStorage(storage);
     const execution = admit();
     analyzeRunPlanActivations.delete(receipt);
     analyzeRunPlanActivationReceipts.get(storage)?.delete(activation.cacheKey);
     return { admitted: true, execution };
   } catch (error) {
-    activation.claimed = false;
+    const current = await storage.read(activation.repoKey, activation.runId);
+    assertAnalyzeRunStorage(storage);
+    if (current?.revision === activation.revision) activation.claimed = false;
     throw error;
   }
 }
@@ -886,10 +906,10 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     throw new AnalyzeRunJournalCorruptError(`Impossible analyze-run lifecycle state: ${file}`);
   }
   /*
-    Schema v1 reserves revision 2 for running/sealed execution admission and revision 3 for its
-    terminal transitions so a later writer can add admission without making its journals unreadable
-    by this initial reader. Future work-result/finalization commands must migrate or extend the
-    durable schema together with these invariants.
+    Schema v1 reserves and now uses revision 2 for running/sealed execution admission and revision 3
+    for its terminal transitions. The running/sealed revision 2 tombstone prevents a consumed plan
+    from issuing another receipt. Future work-result/finalization commands must migrate or extend
+    the durable schema together with these invariants.
   */
 
   return {
