@@ -330,7 +330,7 @@ describe('analyze run journal', () => {
     });
 
     expect(begun).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 0,
       runId: 'run-2026-07-19',
       candidateAnalysisId: 'analysis-2026-07-19',
@@ -341,6 +341,10 @@ describe('analyze run journal', () => {
       branch: 'main',
       commitHash: 'abc123',
       completedBaselineId: 'completed-analysis-1',
+      executionAttempt: {
+        number: 1,
+        activatedAt: '2026-07-19T00:00:00.000Z',
+      },
       plan: 'unsealed',
       counts: null,
       blocked: null,
@@ -396,6 +400,48 @@ describe('analyze run journal', () => {
 
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(sealed);
+  });
+
+  it('preserves valid offset timestamp text across v4 reads and legacy normalization', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'offset-timestamp-run',
+      candidateAnalysisId: 'offset-timestamp-analysis',
+      startedAt: '2026-07-19T02:00:00+02:00',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'offset-commit',
+      completedBaselineId: null,
+    });
+    const sealed = await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'offset-timestamp-run',
+      sealedAt: '2026-07-19T02:00:01+02:00',
+      work: [{ workId: 'analyze:v1:offset', inputFingerprint: `sha256:${'e'.repeat(64)}` }],
+    });
+    expect(sealed.updatedAt).toBe('2026-07-19T02:00:01+02:00');
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId: 'offset-timestamp-run' }))
+      .resolves.toEqual(sealed);
+
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'offset-timestamp-run.json',
+    );
+    const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    legacy.schemaVersion = 3;
+    delete legacy.executionAttempt;
+    fs.writeFileSync(file, JSON.stringify(legacy));
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId: 'offset-timestamp-run' }))
+      .resolves.toMatchObject({
+        schemaVersion: 4,
+        updatedAt: '2026-07-19T02:00:01+02:00',
+        executionAttempt: { number: 1, activatedAt: '2026-07-19T02:00:00+02:00' },
+      });
   });
 
   it('durably records certified finalizing work without changing the completed baseline', async () => {
@@ -490,7 +536,7 @@ describe('analyze run journal', () => {
       ...payload,
     });
     expect(prepared).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 5,
       state: 'finalizing',
       finalization: {
@@ -872,13 +918,13 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 3,
       state: 'finalizing',
       finalization: { persistence: 'unprepared', preparedAt: null },
     });
     expect(JSON.parse(fs.readFileSync(pointerFile, 'utf8'))).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       runId: 'legacy-finalizing-run',
     });
     await expect(prepareAnalyzeRunFinalization(repoPath, {
@@ -886,12 +932,12 @@ describe('analyze run journal', () => {
       preparedAt: '2026-07-19T01:35:03.000Z',
       ...finalizationPayload('legacy-finalizing-analysis'),
     })).resolves.toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 4,
       finalization: { persistence: 'prepared' },
     });
     expect(JSON.parse(fs.readFileSync(runFile, 'utf8'))).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 4,
       finalizationIntent: { preparedAt: '2026-07-19T01:35:03.000Z' },
     });
@@ -913,7 +959,7 @@ describe('analyze run journal', () => {
       .resolves.toMatchObject({ revision: 5, state: 'completed' });
   });
 
-  it('migrates a schema-v1 finalizing failure to a readable schema-v3 revision', async () => {
+  it('migrates a schema-v1 finalizing failure to a readable schema-v4 revision', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'legacy-finalizing-failure',
@@ -957,10 +1003,172 @@ describe('analyze run journal', () => {
       runId: 'legacy-finalizing-failure',
       failedAt: '2026-07-19T01:36:03.000Z',
       error: { code: 'FINALIZE_FAILED', message: 'Legacy finalization failed.' },
-    })).resolves.toMatchObject({ schemaVersion: 3, revision: 4, state: 'failed' });
+    })).resolves.toMatchObject({ schemaVersion: 4, revision: 4, state: 'failed' });
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-failure' }))
-      .resolves.toMatchObject({ schemaVersion: 3, revision: 4, state: 'failed' });
+      .resolves.toMatchObject({ schemaVersion: 4, revision: 4, state: 'failed' });
+  });
+
+  it.each([[1, 2], [2, 2], [3, 3]] as const)(
+    'normalizes a schema-v%s blocked attempt to execution attempt one without rewriting its run file',
+    async (schemaVersion, normalizedRevision) => {
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId: 'legacy-blocked-attempt',
+        candidateAnalysisId: 'legacy-blocked-analysis',
+        startedAt: '2026-07-19T01:36:00.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: 'legacy-blocked-commit',
+        completedBaselineId: null,
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'seal-plan',
+        runId: 'legacy-blocked-attempt',
+        sealedAt: '2026-07-19T01:36:01.000Z',
+        work: [{ workId: 'analyze:v1:legacy', inputFingerprint: `sha256:${'d'.repeat(64)}` }],
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'block',
+        runId: 'legacy-blocked-attempt',
+        blockedAt: '2026-07-19T01:36:02.000Z',
+        resetHint: '7pm',
+      });
+      const file = path.join(
+        repoPath,
+        '.truecourse',
+        'analyses',
+        'runs',
+        'legacy-blocked-attempt.json',
+      );
+      const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+      legacy.schemaVersion = schemaVersion;
+      delete legacy.executionAttempt;
+      if (schemaVersion === 1) delete legacy.finalizationIntent;
+      fs.writeFileSync(file, JSON.stringify(legacy));
+      const bytesBefore = fs.readFileSync(file);
+      resetAnalyzeRunStorage();
+
+      await expect(readAnalyzeRun(repoPath, { runId: 'legacy-blocked-attempt' }))
+        .resolves.toMatchObject({
+          schemaVersion: 4,
+          revision: normalizedRevision,
+          state: 'blocked',
+          executionAttempt: { number: 1, activatedAt: '2026-07-19T01:36:00.000Z' },
+        });
+      expect(fs.readFileSync(file)).toEqual(bytesBefore);
+    },
+  );
+
+  it.each([
+    ['blocked', 3, 4],
+    ['finalizing', 3, 4],
+    ['prepared', 4, 5],
+    ['completed', 5, 6],
+  ] as const)(
+    'normalizes the pre-admission schema-v3 %s lineage to the admitted schema-v4 revision',
+    async (state, legacyRevision, normalizedRevision) => {
+      const candidateAnalysisId = `schema-v3-${state}-analysis`;
+      const runId = `schema-v3-${state}`;
+      const startedAt = '2026-07-19T01:38:00.000Z';
+      const sealedAt = '2026-07-19T01:38:01.000Z';
+      const finalizingAt = '2026-07-19T01:38:02.000Z';
+      const preparedAt = '2026-07-19T01:38:03.000Z';
+      const completedAt = '2026-07-19T01:38:04.000Z';
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId,
+        candidateAnalysisId,
+        startedAt,
+        source: 'cli',
+        branch: 'main',
+        commitHash: 'abc456',
+        completedBaselineId: null,
+      });
+      const execution = await certifySuccessfulExecution(repoPath, runId, sealedAt);
+      await beginFinalizeAnalyzeRun(repoPath, { runId, finalizingAt }, execution.completion);
+      await prepareAnalyzeRunFinalization(repoPath, {
+        runId,
+        preparedAt,
+        ...finalizationPayload(candidateAnalysisId),
+      });
+      const prepared = await certifyPreparedAnalyzeRunFinalization(repoPath, runId);
+      if (prepared?.state !== 'prepared') throw new Error('expected prepared schema-v3 fixture');
+      await completePreparedAnalyzeRunFinalization(repoPath, {
+        runId,
+        completedAt,
+        completion: prepared.completion,
+      });
+      const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+      const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+      legacy.schemaVersion = 3;
+      legacy.revision = legacyRevision;
+      delete legacy.executionAttempt;
+      if (state === 'blocked') {
+        legacy.status = {
+          state: 'blocked',
+          reason: 'provider-session-limit',
+          resetHint: '7pm',
+          blockedAt: finalizingAt,
+        };
+        legacy.updatedAt = finalizingAt;
+        legacy.finalizationIntent = null;
+      } else if (state === 'finalizing') {
+        legacy.status = { state: 'finalizing', finalizingAt };
+        legacy.updatedAt = finalizingAt;
+        legacy.finalizationIntent = null;
+      } else if (state === 'prepared') {
+        legacy.status = { state: 'finalizing', finalizingAt };
+        legacy.updatedAt = preparedAt;
+      }
+      fs.writeFileSync(file, JSON.stringify(legacy));
+      const bytesBefore = fs.readFileSync(file);
+      resetAnalyzeRunStorage();
+
+      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+        schemaVersion: 4,
+        revision: normalizedRevision,
+        state: state === 'prepared' ? 'finalizing' : state,
+        executionAttempt: { number: 1, activatedAt: startedAt },
+      });
+      expect(fs.readFileSync(file)).toEqual(bytesBefore);
+    },
+  );
+
+  it('rejects a sealed schema-v4 run that claims an execution attempt no command can create', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'unreachable-attempt',
+      candidateAnalysisId: 'unreachable-attempt-analysis',
+      startedAt: '2026-07-19T01:37:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'unreachable-attempt-commit',
+      completedBaselineId: null,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'unreachable-attempt',
+      sealedAt: '2026-07-19T01:37:01.000Z',
+      work: [{ workId: 'analyze:v1:unreachable', inputFingerprint: `sha256:${'c'.repeat(64)}` }],
+    });
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'unreachable-attempt.json',
+    );
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    stored.executionAttempt = {
+      number: 2,
+      activatedAt: '2026-07-19T01:37:02.000Z',
+    };
+    fs.writeFileSync(file, JSON.stringify(stored));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, { runId: 'unreachable-attempt' }))
+      .rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
   });
 
   it('requires a completion receipt bound to the exact run and sealed plan', async () => {
@@ -1645,7 +1853,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, command)).resolves.toEqual(begun);
     expect(JSON.parse(fs.readFileSync(latestAttemptPath, 'utf8'))).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       runId: command.runId,
     });
   });
@@ -1671,7 +1879,7 @@ describe('analyze run journal', () => {
     })).rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
     expect(fs.existsSync(path.join(runsPath, 'must-not-mask-third-run.json'))).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(runsPath, 'LATEST_ATTEMPT.json'), 'utf8'))).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       runId: 'missing-second-run',
     });
   });
@@ -1737,7 +1945,7 @@ describe('analyze run journal', () => {
       'runs',
       'LATEST_ATTEMPT.json',
     ), 'utf8'))).toEqual({
-      schemaVersion: 3,
+      schemaVersion: 4,
       runId: second.runId,
     });
 

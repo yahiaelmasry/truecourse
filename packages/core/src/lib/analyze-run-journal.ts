@@ -37,11 +37,21 @@ import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execu
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 3 as const;
+const SCHEMA_VERSION = 4 as const;
+const CHECKPOINT_SCHEMA_VERSION = 3 as const;
 const LEGACY_SCHEMA_VERSION = 1 as const;
 const PREVIOUS_SCHEMA_VERSION = 2 as const;
 const RUNS_DIR = path.join('.truecourse', 'analyses', 'runs');
 const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
+
+function isSupportedSchemaVersion(
+  value: unknown,
+): value is 1 | 2 | 3 | 4 {
+  return value === LEGACY_SCHEMA_VERSION
+    || value === PREVIOUS_SCHEMA_VERSION
+    || value === CHECKPOINT_SCHEMA_VERSION
+    || value === SCHEMA_VERSION;
+}
 
 export type AnalyzeRunSource = 'cli' | 'dashboard' | 'hosted';
 
@@ -192,6 +202,10 @@ export interface AnalyzeRunView {
   branch: string | null;
   commitHash: string | null;
   completedBaselineId: string | null;
+  executionAttempt: {
+    number: number;
+    activatedAt: string;
+  };
   plan: 'unsealed' | 'sealed';
   counts: null | {
     total: number;
@@ -268,6 +282,10 @@ export interface StoredAnalyzeRun {
   branch: string | null;
   commitHash: string | null;
   completedBaselineId: string | null;
+  executionAttempt: {
+    number: number;
+    activatedAt: string;
+  };
   finalizationIntent: StoredAnalyzeRunFinalizationIntent | null;
   plan:
     | { state: 'unsealed' }
@@ -282,7 +300,11 @@ interface LatestAttemptPointer {
 }
 
 interface ParsedLatestAttemptPointer {
-  schemaVersion: typeof LEGACY_SCHEMA_VERSION | typeof PREVIOUS_SCHEMA_VERSION | typeof SCHEMA_VERSION;
+  schemaVersion:
+    | typeof LEGACY_SCHEMA_VERSION
+    | typeof PREVIOUS_SCHEMA_VERSION
+    | typeof CHECKPOINT_SCHEMA_VERSION
+    | typeof SCHEMA_VERSION;
   runId: string;
 }
 
@@ -692,6 +714,10 @@ export async function dispatchAnalyzeRun(
     branch: validateNullableString(command.branch, 'branch'),
     commitHash: validateNullableString(command.commitHash, 'commitHash'),
     completedBaselineId: validateNullableString(command.completedBaselineId, 'completedBaselineId'),
+    executionAttempt: {
+      number: 1,
+      activatedAt: validateTimestamp(command.startedAt, 'startedAt'),
+    },
     finalizationIntent: null,
     plan: { state: 'unsealed' },
   };
@@ -1012,6 +1038,7 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
     branch: run.branch,
     commitHash: run.commitHash,
     completedBaselineId: run.completedBaselineId,
+    executionAttempt: { ...run.executionAttempt },
     plan: run.plan.state,
     counts,
     blocked: run.status.state === 'blocked'
@@ -1503,7 +1530,7 @@ function parseLatestPointer(value: unknown, file: string): ParsedLatestAttemptPo
   try {
     if (
       !isRecord(value)
-      || ![LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION].includes(value.schemaVersion as 1 | 2 | 3)
+      || !isSupportedSchemaVersion(value.schemaVersion)
       || typeof value.runId !== 'string'
     ) {
       throw new AnalyzeRunJournalCorruptError(`Invalid latest analyze-run pointer: ${file}`);
@@ -1534,7 +1561,7 @@ function parseStoredRun(value: unknown, file: string, expectedRunId?: string): S
 function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun {
   if (
     !isRecord(value) ||
-    ![LEGACY_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION].includes(value.schemaVersion as 1 | 2 | 3) ||
+    !isSupportedSchemaVersion(value.schemaVersion) ||
     !Number.isSafeInteger(value.attemptSequence) ||
     (value.attemptSequence as number) < 1 ||
     !Number.isInteger(value.revision) ||
@@ -1559,8 +1586,13 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const status = parseStoredStatus(value.status, file);
   const schemaVersion = value.schemaVersion as ParsedLatestAttemptPointer['schemaVersion'];
   const plan = parseStoredPlan(value.plan, file, schemaVersion);
-  if (value.schemaVersion === SCHEMA_VERSION && !Object.hasOwn(value, 'finalizationIntent')) {
-    throw new AnalyzeRunJournalCorruptError(`Schema-v3 run is missing finalization intent state: ${file}`);
+  if (
+    (value.schemaVersion === CHECKPOINT_SCHEMA_VERSION || value.schemaVersion === SCHEMA_VERSION)
+    && !Object.hasOwn(value, 'finalizationIntent')
+  ) {
+    throw new AnalyzeRunJournalCorruptError(
+      `Schema-v${value.schemaVersion} run is missing finalization intent state: ${file}`,
+    );
   }
   const finalizationIntent = value.schemaVersion === LEGACY_SCHEMA_VERSION
     ? (() => {
@@ -1570,6 +1602,18 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         return null;
       })()
     : parseStoredFinalizationIntent(value.finalizationIntent, file);
+  const startedAt = validateTimestamp(value.startedAt, 'startedAt');
+  const executionAttempt = value.schemaVersion === SCHEMA_VERSION
+    ? parseStoredExecutionAttempt(value.executionAttempt, file)
+    : { number: 1, activatedAt: startedAt };
+  if (Date.parse(executionAttempt.activatedAt) < Date.parse(startedAt)) {
+    throw new AnalyzeRunJournalCorruptError(`Analyze execution attempt predates its run: ${file}`);
+  }
+  if (executionAttempt.number !== 1 || executionAttempt.activatedAt !== startedAt) {
+    throw new AnalyzeRunJournalCorruptError(
+      `Analyze execution attempt is unreachable in schema v4: ${file}`,
+    );
+  }
   if (finalizationIntent !== null) {
     const expectedBaselineId = finalizationIntent.promotion.expectedBaseline?.analysis.id ?? null;
     if (
@@ -1594,6 +1638,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         : null;
   const terminalTimestampIsImpossible = terminalAt !== null && (
     Date.parse(terminalAt) < Date.parse(value.startedAt) ||
+    Date.parse(terminalAt) < Date.parse(executionAttempt.activatedAt) ||
     (plan.state === 'sealed' && Date.parse(terminalAt) < Date.parse(plan.sealedAt))
   );
   const checkpointCount = plan.state === 'sealed'
@@ -1604,7 +1649,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const checkpointUpdatedAt = plan.state === 'sealed'
     ? plan.work.reduce(
         (latest, work) => work.state === 'succeeded-checkpointed'
-          && Date.parse(work.checkpoint.checkpointedAt) > Date.parse(latest)
+          && Date.parse(work.checkpoint.checkpointedAt) >= Date.parse(latest)
           ? work.checkpoint.checkpointedAt
           : latest,
         plan.sealedAt,
@@ -1624,14 +1669,45 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     : schemaVersion === LEGACY_SCHEMA_VERSION
       ? 2
       : 3;
+  const preAdmissionSchema3Revision = schemaVersion === CHECKPOINT_SCHEMA_VERSION
+    && plan.state === 'sealed'
+    && checkpointLifecycle
+    && (
+      (status.state === 'running' && checkpointCount > 0 && revision === 1 + checkpointCount)
+      || (status.state === 'blocked' && revision === 2 + checkpointCount)
+      || (
+        status.state === 'failed'
+        && status.finalizingAt === null
+        && revision === 2 + checkpointCount
+      )
+      || (
+        allCheckpointed
+        && status.state === 'finalizing'
+        && revision === 2 + checkpointCount + (finalizationIntent === null ? 0 : 1)
+      )
+      || (
+        allCheckpointed
+        && status.state === 'completed'
+        && revision === 4 + checkpointCount
+      )
+      || (
+        allCheckpointed
+        && status.state === 'failed'
+        && status.finalizingAt !== null
+        && revision === 3 + checkpointCount + (finalizationIntent === null ? 0 : 1)
+      )
+    );
+  const lifecycleRevision = preAdmissionSchema3Revision ? revision + 1 : revision;
   const lifecycleIsReachable = plan.state === 'unsealed'
     ? (
-      finalizationIntent === null && (
-      (status.state === 'running' && revision === 0 && value.updatedAt === value.startedAt) ||
+      executionAttempt.number === 1
+      && executionAttempt.activatedAt === value.startedAt
+      && finalizationIntent === null && (
+      (status.state === 'running' && lifecycleRevision === 0 && value.updatedAt === value.startedAt) ||
       (
         status.state === 'failed' &&
         status.finalizingAt === null &&
-        revision === 1 &&
+        lifecycleRevision === 1 &&
         status.failedAt === value.updatedAt
       )
       )
@@ -1641,14 +1717,14 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         (
           status.state === 'running' &&
           finalizationIntent === null && (
-            (revision === 1 && value.updatedAt === plan.sealedAt && plan.work.every((work) => work.state === 'pending'))
-            || (checkpointLifecycle && revision === 2 + checkpointCount && value.updatedAt === checkpointUpdatedAt)
+            (lifecycleRevision === 1 && value.updatedAt === plan.sealedAt && plan.work.every((work) => work.state === 'pending'))
+            || (checkpointLifecycle && lifecycleRevision === 2 + checkpointCount && value.updatedAt === checkpointUpdatedAt)
           )
         ) ||
         (
           status.state === 'blocked' &&
           finalizationIntent === null &&
-          (revision === 2 || revision === 3 + checkpointCount) &&
+          (lifecycleRevision === 2 || lifecycleRevision === 3 + checkpointCount) &&
           status.blockedAt === value.updatedAt &&
           checkpointLifecycle
         ) ||
@@ -1657,12 +1733,12 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
           (
             (
               finalizationIntent === null &&
-              (revision === 2 || revision === 3 + checkpointCount) &&
+              (lifecycleRevision === 2 || lifecycleRevision === 3 + checkpointCount) &&
               status.finalizingAt === null &&
               checkpointLifecycle
             ) ||
             (
-              revision === finalizingRevision + (finalizationIntent === null ? 1 : 2) &&
+              lifecycleRevision === finalizingRevision + (finalizationIntent === null ? 1 : 2) &&
               status.finalizingAt !== null &&
               Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
               Date.parse(status.failedAt) >= Date.parse(status.finalizingAt) &&
@@ -1678,7 +1754,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         ) ||
         (
           status.state === 'finalizing' &&
-          revision === finalizingRevision + (finalizationIntent === null ? 0 : 1) &&
+          lifecycleRevision === finalizingRevision + (finalizationIntent === null ? 0 : 1) &&
           (finalizationIntent === null
             ? status.finalizingAt === value.updatedAt
             : finalizationIntent.preparedAt === value.updatedAt
@@ -1686,7 +1762,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
           (allCheckpointed || allLegacySucceeded)
         ) || (
           status.state === 'completed' &&
-          revision === finalizingRevision + 2 &&
+          lifecycleRevision === finalizingRevision + 2 &&
           finalizationIntent !== null &&
           status.completedAt === value.updatedAt &&
           Date.parse(status.finalizingAt) >= Date.parse(plan.sealedAt) &&
@@ -1716,7 +1792,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     || (status.state === 'failed' && status.finalizingAt !== null)
   )
     ? revision + 1
-    : revision;
+    : lifecycleRevision;
 
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -1725,12 +1801,13 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     runId: validateRunId(value.runId),
     candidateAnalysisId: requireNonEmpty(value.candidateAnalysisId, 'candidateAnalysisId'),
     status,
-    startedAt: validateTimestamp(value.startedAt, 'startedAt'),
+    startedAt,
     updatedAt: validateTimestamp(value.updatedAt, 'updatedAt'),
     source: validateSource(value.source),
     branch: value.branch,
     commitHash: value.commitHash,
     completedBaselineId: value.completedBaselineId,
+    executionAttempt,
     finalizationIntent,
     plan,
   };
@@ -1820,6 +1897,24 @@ function parseStoredStatus(value: Record<string, unknown>, file: string): Stored
     reason: 'provider-session-limit',
     resetHint: requireNonEmpty(value.resetHint, 'resetHint'),
     blockedAt: validateTimestamp(value.blockedAt, 'blockedAt'),
+  };
+}
+
+function parseStoredExecutionAttempt(
+  value: unknown,
+  file: string,
+): StoredAnalyzeRun['executionAttempt'] {
+  if (
+    !isRecord(value)
+    || !Number.isSafeInteger(value.number)
+    || (value.number as number) < 1
+    || typeof value.activatedAt !== 'string'
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze execution attempt: ${file}`);
+  }
+  return {
+    number: value.number as number,
+    activatedAt: validateTimestamp(value.activatedAt, 'executionAttempt.activatedAt'),
   };
 }
 
@@ -1930,9 +2025,9 @@ function parseStoredPlan(
       inputFingerprint: validateFingerprint(item.inputFingerprint),
     };
     if (state === 'succeeded-checkpointed') {
-      if (schemaVersion !== SCHEMA_VERSION) {
+      if (schemaVersion !== CHECKPOINT_SCHEMA_VERSION && schemaVersion !== SCHEMA_VERSION) {
         throw new AnalyzeRunJournalCorruptError(
-          `Schema-v${schemaVersion} run contains schema-v${SCHEMA_VERSION} checkpoint state: ${file}`,
+          `Schema-v${schemaVersion} run contains checkpoint state: ${file}`,
         );
       }
       return { ...base, state, checkpoint: parseWorkCheckpoint(item.checkpoint, file) };

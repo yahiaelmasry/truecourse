@@ -79,7 +79,8 @@ files are local and gitignored: a running, blocked, or failed attempt never
 replaces the completed findings in `LATEST.json`. If a crash loses the pointer
 update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
-`packages/core/src/lib/analyze-run-journal.ts`. Schema v3 records pending work,
+`packages/core/src/lib/analyze-run-journal.ts`. Schema v4 records the explicit
+execution-attempt number and activation time in addition to pending work,
 reset/failure information, durable execution admission, authenticated
 successful-work checkpoints, and an exact prepared finalization intent
 containing the completed-baseline promotion and secondary projection inputs.
@@ -91,8 +92,11 @@ repairs any interrupted step without replacing a newer completed descendant.
 The certified executor writes each accepted result and its usage evidence to
 the attempted-run journal before reporting that work item successful. Eligible
 journaled architecture runs therefore preserve paid successes, but reuse and
-Resume are not enabled yet. Schema-v1 and schema-v2 journals remain readable
-and migrate safely to v3 when a current lifecycle command writes them.
+Resume are not enabled yet. Schema-v1 through schema-v3 journals remain
+readable and normalize safely to schema v4 when a current lifecycle command
+writes them. Historical schema-v3 runs from before durable execution admission
+are normalized to the admitted revision lineage without rewriting the journal
+during a read-only status or compatibility inspection.
 
 The first production-wiring slice journals full analyses only when their LLM
 plan contains certified aggregate architecture work and no code-batch or
