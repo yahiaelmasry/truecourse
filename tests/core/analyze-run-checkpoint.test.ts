@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { LlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   AnalyzeRunJournalCorruptError,
   InvalidAnalyzeRunTransitionError,
@@ -20,6 +21,10 @@ import {
   type CertifiedAnalyzeLlmWork,
 } from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
 import type { CodeViolationContext } from '../../packages/core/src/services/llm/provider.js';
+import {
+  JournaledAnalyzeSessionLimitError,
+  executeCertifiedViolationPhase,
+} from '../../packages/core/src/services/llm/certified-violation-phase.js';
 
 let repoPath: string;
 let activation: AnalyzeRunPlanActivation;
@@ -238,6 +243,39 @@ describe('analyze run successful-result checkpoints', () => {
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
       revision: 2,
       counts: { pending: 2, succeeded: 0 },
+    });
+  });
+
+  it('blocks after future-dated durable progress without masking the session limit', async () => {
+    const futureAdapter = new CheckpointAdapter();
+    futureAdapter.failure = new LlmSessionLimitError('7pm (Africa/Cairo)');
+    futureAdapter.completionForDomain.set('bugs', '2099-07-19T04:00:02.000Z');
+
+    await expect(executeCertifiedViolationPhase({
+      run: {
+        repositoryKey: repoPath,
+        repositoryRoot: '/repo',
+        runId: 'future-checkpoint-run',
+        candidateAnalysisId: 'future-checkpoint-analysis',
+        startedAt: '2026-07-19T04:10:00.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: 'future-checkpoint-commit',
+        completedBaselineId: 'completed-baseline',
+      },
+      analysisTimestamp: '2026-07-19T04:10:00.000Z',
+      adapter: futureAdapter,
+      code: [
+        { domain: 'bugs', context: codeContext('bugs', 'a') },
+        { domain: 'security', context: codeContext('security', 'b') },
+      ],
+    })).rejects.toBeInstanceOf(JournaledAnalyzeSessionLimitError);
+
+    await expect(readAnalyzeRun(repoPath, { runId: 'future-checkpoint-run' })).resolves.toMatchObject({
+      state: 'blocked',
+      updatedAt: '2099-07-19T04:00:02.000Z',
+      counts: { pending: 1, succeeded: 1 },
+      blocked: { resetHint: '7pm (Africa/Cairo)' },
     });
   });
 

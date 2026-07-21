@@ -86,7 +86,7 @@ export class AnalysisSessionLimitError extends LlmSessionLimitError {
     super(error.resetHint);
     this.name = 'AnalysisSessionLimitError';
     this.message = error instanceof JournaledAnalyzeSessionLimitError
-      ? `${this.message} The interrupted run was saved as the latest attempted run, but LATEST.json was not updated and the previous completed analysis remains unchanged. Successful LLM calls are not checkpointed yet and may be repeated when you rerun.`
+      ? `${this.message} The interrupted run and any successful LLM results were checkpointed as the latest attempted run, but LATEST.json was not updated and the previous completed analysis remains unchanged. Resume and checkpoint reuse are not enabled yet, so starting a new run may repeat those calls.`
       : `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
   }
 }
@@ -113,7 +113,8 @@ export async function analyzeInProcess(
         if (certified) {
           try {
             const plan = buildFullAnalysisFinalizationPlan(project, computed);
-            const finalizingAt = timestampAtOrAfter(computed.now);
+            const executedAttempt = await readAnalyzeRun(project.path, { runId: certified.runId });
+            const finalizingAt = timestampAtOrAfter(executedAttempt?.updatedAt ?? computed.now);
             await beginFinalizeAnalyzeRun(project.path, {
               runId: certified.runId,
               finalizingAt,
@@ -147,7 +148,7 @@ export async function analyzeInProcess(
               await dispatchAnalyzeRun(project.path, {
                 kind: 'fail',
                 runId: certified.runId,
-                failedAt: timestampAtOrAfter(computed.now),
+                failedAt: timestampAtOrAfter(attempted.updatedAt),
                 error: {
                   code: 'ANALYZE_FINALIZATION_FAILED',
                   message: error instanceof Error ? error.message : String(error),

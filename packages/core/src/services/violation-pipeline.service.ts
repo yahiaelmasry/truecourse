@@ -382,7 +382,7 @@ export async function runViolationPipeline(
         await dispatchAnalyzeRun(run.repositoryKey, {
           kind: 'fail',
           runId: run.runId,
-          failedAt: timestampAtOrAfter(run.startedAt),
+          failedAt: timestampAtOrAfter(attempted.updatedAt),
           error: {
             code: 'ANALYZE_PIPELINE_FAILED',
             message: error instanceof Error ? error.message : String(error),
@@ -1651,10 +1651,16 @@ async function runViolationPipelineInternal(
       tracker?.done('architecture', archCount > 0 ? `${archCount} violations` : 'Clean');
     } catch (error) {
       if (certifiedPhase) {
+        const attempted = await readAnalyzeRun(
+          input.certifiedLlmRun!.repositoryKey,
+          { runId: certifiedPhase.runId },
+        );
         await dispatchAnalyzeRun(input.certifiedLlmRun!.repositoryKey, {
           kind: 'fail',
           runId: certifiedPhase.runId,
-          failedAt: timestampAtOrAfter(input.certifiedLlmRun!.startedAt),
+          failedAt: timestampAtOrAfter(
+            attempted?.updatedAt ?? input.certifiedLlmRun!.startedAt,
+          ),
           error: {
             code: 'ANALYZE_LLM_RESULT_FAILED',
             message: error instanceof Error ? error.message : String(error),

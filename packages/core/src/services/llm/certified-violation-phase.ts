@@ -6,6 +6,7 @@ import {
 } from '@truecourse/shared/llm';
 import {
   dispatchAnalyzeRun,
+  readAnalyzeRun,
   sealAnalyzeRunPlan,
   type AnalyzeRunExecutionCompletion,
   type AnalyzeRunSource,
@@ -112,7 +113,8 @@ export async function executeCertifiedViolationPhase(
     });
   } catch (error) {
     if (begun) {
-      const failedAt = timestampAtOrAfter(input.run.startedAt);
+      const latest = await readAnalyzeRun(input.run.repositoryKey, { runId: input.run.runId });
+      const failedAt = timestampAtOrAfter(latest?.updatedAt ?? input.run.startedAt);
       if (isLlmSessionLimitError(error)) {
         await dispatchAnalyzeRun(input.run.repositoryKey, {
           kind: 'block',

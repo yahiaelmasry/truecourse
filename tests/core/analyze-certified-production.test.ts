@@ -27,6 +27,11 @@ import {
   resetAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import { ClaudeCodeProvider } from '../../packages/core/src/services/llm/cli-provider.js';
+import type {
+  AnalyzeLlmExecutionOptions,
+  AnalyzeLlmExecutionOutcome,
+  CertifiedAnalyzeLlmWork,
+} from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
 import { LlmSessionLimitError } from '../../packages/shared/src/llm/transport.js';
 import { writeProjectConfig } from '../../packages/core/src/config/project-config.js';
 
@@ -40,9 +45,38 @@ class EmptyDirectClaudeProvider extends ClaudeCodeProvider {
   }
 }
 
+class FutureCompletedDirectClaudeProvider extends EmptyDirectClaudeProvider {
+  override async execute(
+    work: CertifiedAnalyzeLlmWork,
+    options?: AnalyzeLlmExecutionOptions,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
+    return {
+      ...await super.execute(work, options),
+      completedAt: '2099-07-19T04:00:02.000Z',
+    };
+  }
+}
+
 class LimitedDirectClaudeProvider extends ClaudeCodeProvider {
   protected async spawnCLI(): Promise<string> {
     throw new LlmSessionLimitError('7pm (Africa/Cairo)');
+  }
+}
+
+class PartiallyLimitedDirectClaudeProvider extends ClaudeCodeProvider {
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string },
+  ): Promise<string> {
+    if (options?.stage === 'analyze.module') {
+      throw new LlmSessionLimitError('7pm (Africa/Cairo)');
+    }
+    return JSON.stringify({
+      structured_output: { violations: [], serviceDescriptions: [] },
+      usage: { input_tokens: 100, output_tokens: 20 },
+      total_cost_usd: 0.0123,
+    });
   }
 }
 
@@ -244,7 +278,7 @@ describe('certified full analyze production path', () => {
       error: { code: 'LLM_SESSION_LIMIT', resetHint: '7pm (Africa/Cairo)' },
     });
     expect(outcome.error instanceof Error ? outcome.error.message : '').toMatch(
-      /saved as the latest attempted run.*LATEST\.json was not updated.*successful LLM calls.*may be repeated/is,
+      /successful LLM results were checkpointed.*LATEST\.json was not updated.*starting a new run may repeat/is,
     );
     await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
       state: 'blocked',
@@ -255,6 +289,35 @@ describe('certified full analyze production path', () => {
     expect(digest(latestPath)).toBe(latestBefore);
     expect(digest(historyPath)).toBe(historyBefore);
     expect(await listAnalyses(workDir)).toEqual(analysesBefore);
+  }, 30_000);
+
+  it('keeps a successful sibling checkpoint when another work item reaches the session limit', async () => {
+    const baseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      code: 'LLM_SESSION_LIMIT',
+      resetHint: '7pm (Africa/Cairo)',
+    });
+
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
+      state: 'blocked',
+      counts: { total: 2, pending: 1, succeeded: 1 },
+      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId, status: 'completed' },
+    });
   }, 30_000);
 
   it('does not create an attempted LLM run when the user declines the estimate', async () => {
@@ -439,7 +502,7 @@ describe('certified full analyze production path', () => {
 
     const outcome = await analyzeInProcess(invalidFinalizationProject, {
       source: 'cli',
-      provider: new EmptyDirectClaudeProvider(),
+      provider: new FutureCompletedDirectClaudeProvider(),
       enabledCategoriesOverride: ['architecture'],
       enableLlmRulesOverride: true,
       onLlmEstimate: async () => true,
@@ -455,7 +518,11 @@ describe('certified full analyze production path', () => {
     });
     await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
       state: 'failed',
-      failure: { code: 'ANALYZE_FINALIZATION_FAILED' },
+      updatedAt: '2099-07-19T04:00:02.000Z',
+      failure: {
+        code: 'ANALYZE_FINALIZATION_FAILED',
+        failedAt: '2099-07-19T04:00:02.000Z',
+      },
     });
     expect(fs.readFileSync(latestPath)).toEqual(latestBefore);
     await expect(readLatest(workDir)).resolves.toMatchObject({

@@ -506,7 +506,7 @@ async function computeAnalyzeCore(
         await dispatchAnalyzeRun(project.path, {
           kind: 'fail',
           runId: certifiedRunId,
-          failedAt: new Date(Math.max(Date.now(), Date.parse(now))).toISOString(),
+          failedAt: new Date(Math.max(Date.now(), Date.parse(attempted.updatedAt))).toISOString(),
           error: {
             code: 'ANALYZE_CORE_FAILED',
             message: error instanceof Error ? error.message : String(error),
