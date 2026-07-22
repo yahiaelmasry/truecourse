@@ -176,6 +176,88 @@ describe('certified analyze resume eligibility', () => {
     expect(fs.readFileSync(runFile(), 'utf8')).toBe(before);
   });
 
+  it('certifies and recovers durable activation without calling the provider', async () => {
+    await createBlockedRun();
+    const { rebuilt, calls } = rebuiltRun();
+    const completedPath = latestPath(repoPath);
+    const pointerPath = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'LATEST_ATTEMPT.json',
+    );
+    const completedBefore = fs.readFileSync(completedPath);
+    const pointerBefore = fs.readFileSync(pointerPath);
+
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T04:00:04+02:00');
+
+    expect(activated).toMatchObject({
+      activated: true,
+      counts: { total: 2, reused: 1, pending: 1 },
+      view: {
+        revision: 5,
+        state: 'running',
+        updatedAt: '2026-07-19T02:00:04.000Z',
+        executionAttempt: {
+          number: 2,
+          activatedAt: '2026-07-19T02:00:04.000Z',
+          resume: {
+            admission: 'activated',
+            admittedAt: null,
+            resumedFrom: { resetHint: '7pm', blockedAt: '2026-07-19T02:00:03.000Z' },
+            executionPin: {
+              provider: 'claude-code',
+              requestedModel: 'sonnet',
+              resolvedModel,
+            },
+          },
+        },
+      },
+    });
+    expect(calls()).toBe(0);
+    expect(fs.readFileSync(completedPath)).toEqual(completedBefore);
+    expect(fs.readFileSync(pointerPath)).toEqual(pointerBefore);
+
+    const activatedBytes = fs.readFileSync(runFile());
+    resetAnalyzeRunStorage();
+    const recovered = rebuiltRun();
+    await expect(recovered.rebuilt.inspectResumeCompatibility(identity)).resolves.toMatchObject({
+      compatible: true,
+      counts: { total: 2, reused: 1, pending: 1 },
+    });
+    await expect(recovered.rebuilt.activateResume(identity, '2026-07-19T03:00:00.000Z'))
+      .resolves.toMatchObject({ activated: true, view: { revision: 5 } });
+    expect(recovered.calls()).toBe(0);
+    expect(fs.readFileSync(runFile())).toEqual(activatedBytes);
+  });
+
+  it('does not activate when provider intent changes after compatibility inspection', async () => {
+    await createBlockedRun();
+    let executionReads = 0;
+    let providerCalls = 0;
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      get execution() {
+        executionReads += 1;
+        return executionReads < 3
+          ? { provider: 'claude-code', requestedModel: 'sonnet' }
+          : { provider: 'claude-code', requestedModel: 'opus' };
+      },
+      resumeExecution: pinnedResumeExecution(),
+      async execute(work) {
+        providerCalls += 1;
+        return successfulOutcome(work);
+      },
+    };
+    const rebuilt = certifyAnalyzeLlmRun(planInput(), adapter);
+    const before = fs.readFileSync(runFile());
+
+    await expect(rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z'))
+      .resolves.toEqual({ activated: false, reason: 'activated-execution-changed' });
+    expect(providerCalls).toBe(0);
+    expect(fs.readFileSync(runFile())).toEqual(before);
+  });
+
   it.each([
     ['candidateAnalysisId', 'other-candidate'],
     ['startedAt', '2026-07-19T02:00:00.001Z'],
