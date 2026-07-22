@@ -11,6 +11,7 @@ import {
   type AnalyzeRunExecutionCompletion,
   type AnalyzeRunSource,
 } from '../../lib/analyze-run-journal.js';
+import type { AnalyzeRunAmbiguousRearmConsent } from '../../lib/analyze-run-ambiguous-rearm.js';
 import {
   certifyAnalyzeLlmRun,
   type AnalyzeLlmExecutionAdapter,
@@ -70,6 +71,10 @@ export interface CertifiedViolationResumePhaseInput extends Omit<CertifiedViolat
 
 export interface CertifiedViolationResumePhaseResult extends CertifiedViolationPhaseResult {
   usage: readonly UsageRecord[];
+}
+
+export interface CertifiedViolationAmbiguousRearmPhaseInput extends CertifiedViolationResumePhaseInput {
+  consent: AnalyzeRunAmbiguousRearmConsent | undefined;
 }
 
 export class CertifiedViolationResumeUnavailableError extends Error {
@@ -142,19 +147,44 @@ export async function executeCertifiedViolationPhase(
 export async function resumeCertifiedViolationPhase(
   input: CertifiedViolationResumePhaseInput,
 ): Promise<CertifiedViolationResumePhaseResult> {
+  return executeCertifiedViolationRecoveryPhase(input, (certified) =>
+    certified.activateResume({
+      candidateAnalysisId: input.run.candidateAnalysisId,
+      startedAt: input.run.startedAt,
+      source: input.run.source,
+      branch: input.run.branch,
+      commitHash: input.run.commitHash,
+      completedBaselineId: input.run.completedBaselineId,
+    }, input.activatedAt));
+}
+
+/** Explicitly rearm an ambiguous attempt, then execute its certified pending work. */
+export async function rearmCertifiedViolationPhase(
+  input: CertifiedViolationAmbiguousRearmPhaseInput,
+): Promise<CertifiedViolationResumePhaseResult> {
+  return executeCertifiedViolationRecoveryPhase(input, (certified) =>
+    certified.activateAmbiguousRearm({
+      candidateAnalysisId: input.run.candidateAnalysisId,
+      startedAt: input.run.startedAt,
+      source: input.run.source,
+      branch: input.run.branch,
+      commitHash: input.run.commitHash,
+      completedBaselineId: input.run.completedBaselineId,
+    }, input.consent, input.activatedAt));
+}
+
+async function executeCertifiedViolationRecoveryPhase(
+  input: CertifiedViolationResumePhaseInput,
+  activate: (
+    certified: ReturnType<typeof certifyViolationPhase>,
+  ) => ReturnType<ReturnType<typeof certifyViolationPhase>['activateResume']>,
+): Promise<CertifiedViolationResumePhaseResult> {
   // Compatibility inspection chooses a concrete pinned adapter when durable
   // checkpoint evidence exists. With zero checkpoints it deliberately keeps
   // the requested-model adapter so executeResume can establish and checkpoint
   // the first concrete model before pinning the remaining work.
   const certified = certifyViolationPhase(input, input.adapter);
-  const activated = await certified.activateResume({
-    candidateAnalysisId: input.run.candidateAnalysisId,
-    startedAt: input.run.startedAt,
-    source: input.run.source,
-    branch: input.run.branch,
-    commitHash: input.run.commitHash,
-    completedBaselineId: input.run.completedBaselineId,
-  }, input.activatedAt);
+  const activated = await activate(certified);
   if (!activated.activated) {
     throw new CertifiedViolationResumeUnavailableError(activated.reason);
   }

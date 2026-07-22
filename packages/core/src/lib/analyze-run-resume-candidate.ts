@@ -1,4 +1,5 @@
 import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execution-evidence.js';
+import type { AnalyzeRunAmbiguousRearmOffer } from './analyze-run-ambiguous-rearm.js';
 
 export interface AnalyzeRunResumeCheckpointCandidate {
   readonly checkpointedAt: string;
@@ -61,6 +62,7 @@ export interface AnalyzeRunResumeCandidate {
     resetHint: string;
     blockedAt: string;
   }>;
+  readonly rearm: AnalyzeRunAmbiguousRearmOffer | null;
   readonly plan: 'unsealed' | Readonly<{
     sealedAt: string;
     execution: null | Readonly<{

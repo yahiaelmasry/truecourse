@@ -2,6 +2,7 @@ import { CODE_DOMAINS, type RuleDomain } from '@truecourse/shared';
 import { isLlmSessionLimitError } from '@truecourse/shared/llm';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  activateAnalyzeRunAmbiguousRearm,
   activateAnalyzeRunResume,
   admitAnalyzeRunPlanExecution,
   admitAnalyzeRunResumeExecution,
@@ -15,6 +16,12 @@ import {
   type AnalyzeRunResumeExecutionPin,
   type AnalyzeRunResumePlanActivation,
 } from '../../lib/analyze-run-journal.js';
+import {
+  inspectAnalyzeRunAmbiguousRearmConsent,
+  type AnalyzeRunAmbiguousRearmConsent,
+  type AnalyzeRunAmbiguousRearmConsentMismatch,
+} from '../../lib/analyze-run-ambiguous-rearm.js';
+import { certifyAnalyzeRunAmbiguousRearmActivation } from '../../lib/analyze-run-ambiguous-rearm-activation-certification.js';
 import { activeCompletedBaselineId, getAnalysisStore } from '../../lib/analysis-store.js';
 import { readAnalyzeRunResumeCandidate } from '../../lib/analyze-run-resume-candidate.js';
 import { certifyAnalyzeRunExecutionCompletion } from '../../lib/analyze-run-execution-completion.js';
@@ -138,6 +145,11 @@ export interface CertifiedAnalyzeLlmRun {
     identity: AnalyzeLlmResumeIdentity,
     activatedAt: string,
   ): Promise<AnalyzeLlmResumeActivationResult>;
+  activateAmbiguousRearm(
+    identity: AnalyzeLlmResumeIdentity,
+    consent: AnalyzeRunAmbiguousRearmConsent | undefined,
+    activatedAt: string,
+  ): Promise<AnalyzeLlmResumeActivationResult>;
   executeResume(
     activation: AnalyzeRunResumePlanActivation,
     admittedAt: string,
@@ -180,7 +192,11 @@ export type AnalyzeLlmResumeIncompatibility =
   | 'checkpoint-model-unverified'
   | 'duplicate-checkpoint-attempt'
   | 'activated-execution-changed'
-  | 'resume-execution-ambiguous';
+  | 'resume-execution-ambiguous'
+  | 'ambiguous-rearm-unavailable'
+  | 'ambiguous-rearm-consent-required'
+  | 'ambiguous-rearm-risk-not-accepted'
+  | 'ambiguous-rearm-evidence-changed';
 
 export type AnalyzeLlmResumeCompatibility =
   | Readonly<{
@@ -217,8 +233,30 @@ export type AnalyzeLlmResumeActivationResult =
       activation: AnalyzeRunResumePlanActivation;
     }>;
 
+type AnalyzeLlmRecoveryCompatibility =
+  | Readonly<{
+      compatible: false;
+      reason: AnalyzeLlmResumeIncompatibility;
+    }>
+  | Readonly<{
+      compatible: true;
+      requiresActivationRevalidation: true;
+      counts: Readonly<{ total: number; reused: number; pending: number }>;
+      reusedWorkIds: readonly string[];
+      pendingWorkIds: readonly string[];
+      observed: Readonly<{
+        runRevision: number;
+        attemptSequence: number;
+        latestAttemptSequence: number;
+        completedBaselineFingerprint: string | null;
+        modelSelection: 'requested' | 'resolved';
+        resolvedModel: string | null;
+      }>;
+    }>;
+
 interface AnalyzeLlmResumeInspection {
-  readonly compatibility: AnalyzeLlmResumeCompatibility;
+  readonly compatibility: AnalyzeLlmRecoveryCompatibility;
+  readonly resetHint: string | null;
   readonly durableActivatedAt: string | null;
   readonly executionAdapter: AnalyzeLlmExecutionAdapter | null;
   readonly reused: readonly Readonly<{
@@ -404,9 +442,9 @@ export function certifyAnalyzeLlmRun(
   return Object.freeze({
     manifest,
     inspectResumeCompatibility: async (identity: AnalyzeLlmResumeIdentity) =>
-      (await inspectResumePlan(identity)).compatibility,
+      toResumeCompatibility(await inspectRecoveryPlan(identity, 'provider-session-limit')),
     async activateResume(identity: AnalyzeLlmResumeIdentity, activatedAt: string) {
-      const inspection = await inspectResumePlan(identity);
+      const inspection = await inspectRecoveryPlan(identity, 'provider-session-limit');
       const compatibility = inspection.compatibility;
       if (!compatibility.compatible) {
         return Object.freeze({ activated: false as const, reason: compatibility.reason });
@@ -440,6 +478,78 @@ export function certifyAnalyzeLlmRun(
           completedBaselineFingerprint: compatibility.observed.completedBaselineFingerprint,
         },
       }));
+      resumeExecutions.set(activated.activation, Object.freeze({
+        reused: inspection.reused,
+        pending: inspection.pending,
+        executionPin,
+        executionAdapter: inspection.executionAdapter,
+      }));
+      return Object.freeze({
+        activated: true as const,
+        view: activated.view,
+        counts: compatibility.counts,
+        activation: activated.activation,
+      });
+    },
+    async activateAmbiguousRearm(
+      identity: AnalyzeLlmResumeIdentity,
+      consent: AnalyzeRunAmbiguousRearmConsent | undefined,
+      activatedAt: string,
+    ) {
+      const inspection = await inspectRecoveryPlan(identity, 'ambiguous-rearm', consent);
+      const compatibility = inspection.compatibility;
+      if (!compatibility.compatible) {
+        return Object.freeze({ activated: false as const, reason: compatibility.reason });
+      }
+      const executionPin = resumeExecutionPin(execution, compatibility.observed);
+      if (
+        !inspection.executionAdapter
+        || !resumeExecutionPinMatches(inspection.executionAdapter, execution, executionPin)
+      ) {
+        return Object.freeze({
+          activated: false as const,
+          reason: 'activated-execution-changed' as const,
+        });
+      }
+      const activationCommand = {
+        runId,
+        ...identity,
+        activatedAt: inspection.durableActivatedAt ?? activatedAt,
+        work: manifest.work.map(({ workId, inputFingerprint }) => ({
+          workId,
+          inputFingerprint,
+        })),
+        reusedWorkIds: compatibility.reusedWorkIds,
+        pendingWorkIds: compatibility.pendingWorkIds,
+        executionPin,
+        observed: {
+          runRevision: compatibility.observed.runRevision,
+          attemptSequence: compatibility.observed.attemptSequence,
+          latestAttemptSequence: compatibility.observed.latestAttemptSequence,
+          completedBaselineFingerprint: compatibility.observed.completedBaselineFingerprint,
+        },
+      };
+      const activated = inspection.durableActivatedAt !== null
+        ? await activateAnalyzeRunResume(journalKey, certifyAnalyzeRunResumeActivation({
+            kind: 'activate-resume',
+            ...activationCommand,
+          }))
+        : consent === undefined
+          ? null
+          : await activateAnalyzeRunAmbiguousRearm(
+              journalKey,
+              certifyAnalyzeRunAmbiguousRearmActivation({
+                kind: 'activate-ambiguous-rearm',
+                ...activationCommand,
+                consent,
+              }),
+            );
+      if (activated === null) {
+        return Object.freeze({
+          activated: false as const,
+          reason: 'ambiguous-rearm-consent-required' as const,
+        });
+      }
       resumeExecutions.set(activated.activation, Object.freeze({
         reused: inspection.reused,
         pending: inspection.pending,
@@ -565,39 +675,60 @@ export function certifyAnalyzeLlmRun(
     },
   });
 
-  async function inspectResumePlan(
+  async function inspectRecoveryPlan(
     identity: AnalyzeLlmResumeIdentity,
+    activationKind: 'provider-session-limit' | 'ambiguous-rearm',
+    consent?: AnalyzeRunAmbiguousRearmConsent,
   ): Promise<AnalyzeLlmResumeInspection> {
     const candidate = await readAnalyzeRunResumeCandidate(journalKey, runId);
     if (!candidate) return incompatibleInspection('run-not-found');
     if (!candidate.isLatestAttempt) return incompatibleInspection('not-latest-attempt');
     const recoveringActivated = candidate.state === 'running'
       && candidate.executionAttempt.number > 1
-      && candidate.executionAttempt.resume?.activation === 'provider-session-limit'
+      && candidate.executionAttempt.resume?.activation === activationKind
       && candidate.executionAttempt.resume?.admission === 'activated';
     const recoveringCompletedExecution = candidate.state === 'running'
       && candidate.executionAttempt.number > 1
-      && candidate.executionAttempt.resume?.activation === 'provider-session-limit'
+      && candidate.executionAttempt.resume?.activation === activationKind
       && candidate.executionAttempt.resume?.admission === 'executing'
       && candidate.plan !== 'unsealed'
       && candidate.plan.work.every((work) => work.state === 'succeeded-checkpointed');
-    if (
-      candidate.state === 'running'
-      && candidate.executionAttempt.number > 1
-      && candidate.executionAttempt.resume?.admission === 'executing'
-      && !recoveringCompletedExecution
-    ) {
-      return incompatibleInspection('resume-execution-ambiguous');
-    }
-    if (
-      (
-        (candidate.state !== 'blocked' || candidate.blocked === null)
-        && !recoveringActivated
+    if (activationKind === 'ambiguous-rearm') {
+      if (
+        candidate.plan === 'unsealed'
+        || (
+          candidate.rearm === null
+          && !recoveringActivated
+          && !recoveringCompletedExecution
+        )
+      ) {
+        return incompatibleInspection('ambiguous-rearm-unavailable');
+      }
+      if (!recoveringActivated && !recoveringCompletedExecution) {
+        const consentMismatch = inspectAnalyzeRunAmbiguousRearmConsent(candidate.rearm, consent);
+        if (consentMismatch !== null) {
+          return incompatibleInspection(ambiguousConsentReason(consentMismatch));
+        }
+      }
+    } else {
+      if (
+        candidate.state === 'running'
+        && candidate.executionAttempt.number > 1
+        && candidate.executionAttempt.resume?.admission === 'executing'
         && !recoveringCompletedExecution
-      )
-      || candidate.plan === 'unsealed'
-    ) {
-      return incompatibleInspection('run-not-blocked');
+      ) {
+        return incompatibleInspection('resume-execution-ambiguous');
+      }
+      if (
+        (
+          (candidate.state !== 'blocked' || candidate.blocked === null)
+          && !recoveringActivated
+          && !recoveringCompletedExecution
+        )
+        || candidate.plan === 'unsealed'
+      ) {
+        return incompatibleInspection('run-not-blocked');
+      }
     }
     if (!sameResumeIdentity(candidate, identity)) return incompatibleInspection('run-identity-changed');
 
@@ -727,8 +858,35 @@ export function certifyAnalyzeLlmRun(
         modelSelection: 'resolved' as const,
         resolvedModel: checkpointResolvedModel,
       });
+    } else if (activationKind === 'ambiguous-rearm' && candidate.executionAttempt.number > 1) {
+      if (!durablePin) return incompatibleInspection('checkpoint-model-unverified');
+      if (durablePin.modelSelection === 'resolved') {
+        const candidateAdapter = pinnedResumeExecutionMatches(
+          adapter,
+          execution,
+          durablePin.resolvedModel,
+        )
+          ? adapter
+          : adapter.createPinnedResumeAdapter?.(durablePin.resolvedModel);
+        if (
+          !candidateAdapter
+          || !pinnedResumeExecutionMatches(candidateAdapter, execution, durablePin.resolvedModel)
+        ) {
+          return incompatibleInspection('checkpoint-model-unverified');
+        }
+        resumeAdapter = candidateAdapter;
+      } else if (
+        execution.requestedModel === null
+        || typeof adapter.createPinnedResumeAdapter !== 'function'
+      ) {
+        return incompatibleInspection('checkpoint-model-unverified');
+      }
+      executionPin = Object.freeze({ ...durablePin });
     } else {
-      if (typeof adapter.createPinnedResumeAdapter !== 'function') {
+      if (
+        (activationKind === 'ambiguous-rearm' && execution.requestedModel === null)
+        || typeof adapter.createPinnedResumeAdapter !== 'function'
+      ) {
         return incompatibleInspection('checkpoint-model-unverified');
       }
       executionPin = Object.freeze({
@@ -776,12 +934,14 @@ export function certifyAnalyzeLlmRun(
       return incompatibleInspection('completed-baseline-changed');
     }
     const resetHint = candidate.blocked?.resetHint
-      ?? candidate.executionAttempt.resume?.resumedFrom?.resetHint;
-    if (resetHint === undefined) return incompatibleInspection('run-not-blocked');
+      ?? candidate.executionAttempt.resume?.resumedFrom?.resetHint
+      ?? null;
+    if (activationKind === 'provider-session-limit' && resetHint === null) {
+      return incompatibleInspection('run-not-blocked');
+    }
     const compatibility = Object.freeze({
       compatible: true,
       requiresActivationRevalidation: true,
-      resetHint,
       counts: Object.freeze({
         total: certifiedWork.length,
         reused: reused.length,
@@ -800,6 +960,7 @@ export function certifyAnalyzeLlmRun(
     });
     return Object.freeze({
       compatibility,
+      resetHint,
       durableActivatedAt: recoveringActivated || recoveringCompletedExecution
         ? candidate.executionAttempt.activatedAt
         : null,
@@ -927,6 +1088,27 @@ function incompatible(reason: AnalyzeLlmResumeIncompatibility): AnalyzeLlmResume
   return Object.freeze({ compatible: false, reason });
 }
 
+function toResumeCompatibility(
+  inspection: AnalyzeLlmResumeInspection,
+): AnalyzeLlmResumeCompatibility {
+  if (!inspection.compatibility.compatible) return inspection.compatibility;
+  if (inspection.resetHint === null) return incompatible('run-not-blocked');
+  return Object.freeze({
+    ...inspection.compatibility,
+    resetHint: inspection.resetHint,
+  });
+}
+
+function ambiguousConsentReason(
+  mismatch: AnalyzeRunAmbiguousRearmConsentMismatch,
+): AnalyzeLlmResumeIncompatibility {
+  switch (mismatch) {
+    case 'consent-required': return 'ambiguous-rearm-consent-required';
+    case 'risk-not-accepted': return 'ambiguous-rearm-risk-not-accepted';
+    case 'evidence-changed': return 'ambiguous-rearm-evidence-changed';
+  }
+}
+
 function buildResumeUsageLedger(
   orderedWork: readonly CertifiedAnalyzeLlmWork[],
   checkpoints: readonly AnalyzeRunCheckpointEvidence[],
@@ -974,6 +1156,7 @@ function incompatibleInspection(
 ): AnalyzeLlmResumeInspection {
   return Object.freeze({
     compatibility: incompatible(reason),
+    resetHint: null,
     durableActivatedAt: null,
     executionAdapter: null,
     reused: Object.freeze([]),

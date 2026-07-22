@@ -36,6 +36,7 @@ import type {
 } from '../../packages/core/src/services/llm/provider.js';
 import type { LatestSnapshot } from '../../packages/core/src/types/snapshot.js';
 import { fingerprint } from '../../packages/core/src/lib/canonical-json.js';
+import type { AnalyzeRunAmbiguousRearmOffer } from '../../packages/core/src/lib/analyze-run-ambiguous-rearm.js';
 
 const resolvedModel = 'claude-sonnet-4-5-20250929';
 const runId = 'resume-eligibility';
@@ -580,6 +581,51 @@ describe('certified analyze resume eligibility', () => {
       '2026-07-19T02:00:05.000Z',
     )).resolves.toMatchObject({ results: expect.any(Array), usageLedger: expect.any(Array) });
     expect(recoveryCalls).toBe(0);
+  });
+
+  it('preserves ordinary zero-checkpoint Resume when the provider chooses the model', async () => {
+    await createZeroCheckpointBlockedRun(null);
+    const execution = Object.freeze({ provider: 'claude-code', requestedModel: null });
+    let requestedCalls = 0;
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution,
+      createPinnedResumeAdapter(model) {
+        return {
+          execution,
+          resumeExecution: Object.freeze({
+            ...execution,
+            modelSelection: 'pinned' as const,
+            resolvedModel: model,
+          }),
+          async execute(work) {
+            return {
+              ...successfulOutcomeForRequestedModel(work, null),
+              completedAt: '2026-07-19T02:00:07.000Z',
+            };
+          },
+        };
+      },
+      async execute(work) {
+        requestedCalls += 1;
+        return {
+          ...successfulOutcomeForRequestedModel(work, null),
+          completedAt: '2026-07-19T02:00:06.000Z',
+        };
+      },
+    };
+    const rebuilt = certifyAnalyzeLlmRun(planInput(), adapter);
+
+    await expect(rebuilt.inspectResumeCompatibility(identity)).resolves.toMatchObject({
+      compatible: true,
+      observed: { modelSelection: 'requested', resolvedModel: null },
+    });
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected provider-selected-model activation');
+    await expect(rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).resolves.toMatchObject({ results: expect.any(Array), usageLedger: expect.any(Array) });
+    expect(requestedCalls).toBe(1);
   });
 
   it.each([
@@ -1240,6 +1286,121 @@ describe('certified analyze resume eligibility', () => {
     expect(calls()).toBe(0);
     expect(fs.readFileSync(runFile(), 'utf8')).toBe(before);
   });
+
+  it('certifies exact ambiguous consent, reuses checkpoints, and executes only pending work', async () => {
+    const offer = await createAmbiguousRun();
+    const { rebuilt, calls } = rebuiltRun();
+    const activated = await rebuilt.activateAmbiguousRearm(
+      identity,
+      exactAmbiguousConsent(offer),
+      '2026-07-19T02:00:04.000Z',
+    );
+    expect(activated).toMatchObject({
+      activated: true,
+      counts: { total: 2, reused: 1, pending: 1 },
+      view: {
+        executionAttempt: {
+          resume: { activation: 'ambiguous-rearm', admission: 'activated' },
+        },
+      },
+    });
+    if (!activated.activated) throw new Error('expected ambiguous activation');
+
+    const executed = await rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    );
+    expect(calls()).toBe(1);
+    expect(executed.results).toHaveLength(2);
+    expect(executed.usageLedger).toHaveLength(2);
+  });
+
+  it('returns structured failures for missing and inexact ambiguous consent', async () => {
+    const offer = await createAmbiguousRun();
+    const missing = rebuiltRun();
+    await expect(missing.rebuilt.activateAmbiguousRearm(
+      identity,
+      undefined,
+      '2026-07-19T02:00:04.000Z',
+    )).resolves.toEqual({
+      activated: false,
+      reason: 'ambiguous-rearm-consent-required',
+    });
+    expect(missing.calls()).toBe(0);
+
+    const inexact = rebuiltRun();
+    await expect(inexact.rebuilt.activateAmbiguousRearm(
+      identity,
+      {
+        ...exactAmbiguousConsent(offer),
+        acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls + 1,
+      },
+      '2026-07-19T02:00:04.000Z',
+    )).resolves.toEqual({
+      activated: false,
+      reason: 'ambiguous-rearm-risk-not-accepted',
+    });
+    expect(inexact.calls()).toBe(0);
+  });
+
+  it('recovers already-durable ambiguous consent without asking again', async () => {
+    const offer = await createAmbiguousRun();
+    const first = rebuiltRun();
+    const activated = await first.rebuilt.activateAmbiguousRearm(
+      identity,
+      exactAmbiguousConsent(offer),
+      '2026-07-19T02:00:04.000Z',
+    );
+    if (!activated.activated) throw new Error('expected ambiguous activation');
+    const bytes = fs.readFileSync(runFile());
+    resetAnalyzeRunStorage();
+
+    const recovered = rebuiltRun();
+    const retry = await recovered.rebuilt.activateAmbiguousRearm(
+      identity,
+      undefined,
+      '2026-07-19T03:00:00.000Z',
+    );
+    expect(retry).toMatchObject({ activated: true, view: { revision: 4 } });
+    expect(fs.readFileSync(runFile())).toEqual(bytes);
+    expect(recovered.calls()).toBe(0);
+  });
+
+  it('recovers a fully checkpointed ambiguous execution without another provider call', async () => {
+    const offer = await createAmbiguousRun();
+    const first = rebuiltRun();
+    const activated = await first.rebuilt.activateAmbiguousRearm(
+      identity,
+      exactAmbiguousConsent(offer),
+      '2026-07-19T02:00:04.000Z',
+    );
+    if (!activated.activated) throw new Error('expected ambiguous activation');
+    await first.rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    );
+    const bytes = fs.readFileSync(runFile());
+    resetAnalyzeRunStorage();
+
+    const recovered = rebuiltRun();
+    const retry = await recovered.rebuilt.activateAmbiguousRearm(
+      identity,
+      undefined,
+      '2026-07-19T03:00:00.000Z',
+    );
+    expect(retry).toMatchObject({
+      activated: true,
+      counts: { total: 2, reused: 2, pending: 0 },
+    });
+    expect(fs.readFileSync(runFile())).toEqual(bytes);
+    if (!retry.activated) throw new Error('expected completed recovery');
+    const execution = await recovered.rebuilt.executeResume(
+      retry.activation,
+      '2026-07-19T03:00:01.000Z',
+    );
+    expect(execution.results).toHaveLength(2);
+    expect(recovered.calls()).toBe(0);
+  });
 });
 
 function planInput(overrides: Partial<CodeViolationContext> = {}) {
@@ -1318,10 +1479,10 @@ async function createBlockedArchitectureRun(analysisInputFingerprint: string): P
   });
 }
 
-async function createZeroCheckpointBlockedRun(): Promise<void> {
+async function createZeroCheckpointBlockedRun(requestedModel: string | null = 'sonnet'): Promise<void> {
   const sessionLimit = new LlmSessionLimitError('7pm');
   const certified = certifyAnalyzeLlmRun(planInput(), {
-    execution: Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' }),
+    execution: Object.freeze({ provider: 'claude-code', requestedModel }),
     async execute() { throw sessionLimit; },
   });
   await dispatchAnalyzeRun(repoPath, {
@@ -1336,7 +1497,7 @@ async function createZeroCheckpointBlockedRun(): Promise<void> {
   });
   const activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
-    execution: { provider: 'claude-code', requestedModel: 'sonnet' },
+    execution: { provider: 'claude-code', requestedModel },
     runId,
     sealedAt: '2026-07-19T02:00:01.000Z',
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -1413,6 +1574,32 @@ async function createBlockedRun(
   };
 }
 
+async function createAmbiguousRun(): Promise<AnalyzeRunAmbiguousRearmOffer> {
+  await createBlockedRun();
+  const stored = readStoredRun();
+  const checkpointedAt = stored.plan.work
+    .filter((item: Record<string, unknown>) => item.state === 'succeeded-checkpointed')
+    .map((item: Record<string, any>) => item.checkpoint.checkpointedAt)
+    .sort()
+    .at(-1);
+  stored.revision -= 1;
+  stored.updatedAt = checkpointedAt;
+  stored.status = { state: 'running' };
+  writeStoredRun(stored);
+  resetAnalyzeRunStorage();
+  const current = await readAnalyzeRun(repoPath, 'latest-attempt');
+  if (current?.rearm == null) throw new Error('expected ambiguous rearm offer');
+  return current.rearm;
+}
+
+function exactAmbiguousConsent(offer: AnalyzeRunAmbiguousRearmOffer) {
+  return {
+    evidence: offer.evidence,
+    acceptedRisk: 'repeat-up-to-pending-provider-calls' as const,
+    acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls,
+  };
+}
+
 function rebuiltRun(
   overrides: Partial<CodeViolationContext> = {},
   resumeModel: string | null = resolvedModel,
@@ -1467,6 +1654,17 @@ function successfulOutcome(work: CertifiedAnalyzeLlmWork): AnalyzeLlmExecutionOu
       costUsd: '0.012',
       durationMs: 300,
     },
+  };
+}
+
+function successfulOutcomeForRequestedModel(
+  work: CertifiedAnalyzeLlmWork,
+  requestedModel: string | null,
+): AnalyzeLlmExecutionOutcome {
+  const outcome = successfulOutcome(work);
+  return {
+    ...outcome,
+    usage: outcome.usage === null ? null : { ...outcome.usage, requestedModel },
   };
 }
 

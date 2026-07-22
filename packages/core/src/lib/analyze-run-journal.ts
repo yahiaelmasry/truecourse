@@ -739,6 +739,7 @@ installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
   if (!current) return null;
   const latest = await storage.inspectLatest(durableRepoKey);
   assertAnalyzeRunStorage(storage);
+  const isLatestAttempt = latest?.runId === current.runId;
   const plan = current.plan.state === 'unsealed'
     ? 'unsealed' as const
     : Object.freeze({
@@ -763,7 +764,7 @@ installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
       });
   return Object.freeze({
     storageIdentity: storage,
-    isLatestAttempt: latest?.runId === current.runId,
+    isLatestAttempt,
     attemptSequence: current.attemptSequence,
     latestAttemptSequence: latest?.attemptSequence ?? 0,
     revision: current.revision,
@@ -782,6 +783,7 @@ installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
           blockedAt: current.status.blockedAt,
         })
       : null,
+    rearm: toView(current, isLatestAttempt).rearm,
     plan,
   });
 });

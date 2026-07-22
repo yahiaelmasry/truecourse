@@ -17,9 +17,12 @@ import {
 } from '../../packages/core/src/services/llm/certified-analyze-llm-run.js';
 import {
   JournaledAnalyzeSessionLimitError,
+  rearmCertifiedViolationPhase,
   resumeCertifiedViolationPhase,
+  type CertifiedViolationAmbiguousRearmPhaseInput,
   type CertifiedViolationResumePhaseInput,
 } from '../../packages/core/src/services/llm/certified-violation-phase.js';
+import type { AnalyzeRunAmbiguousRearmOffer } from '../../packages/core/src/lib/analyze-run-ambiguous-rearm.js';
 import type {
   CodeViolationContext,
   ServiceViolationContext,
@@ -382,6 +385,53 @@ describe('certified violation resume phase', () => {
     expect(adapter.pins).toEqual([]);
     expect(adapter.calls).toEqual([]);
   });
+
+  it('rearms an ambiguous attempt with exact consent and executes only pending work', async () => {
+    const offer = await createAmbiguousAttempt();
+    const adapter = new ResumeAdapter();
+
+    const resumed = await rearmCertifiedViolationPhase(rearmInput(adapter, offer));
+
+    expect(adapter.pins).toEqual([resolvedModel]);
+    expect(adapter.calls.map(({ domain }) => domain)).toEqual(['security']);
+    expect(resumed.results.map(({ domain }) => domain)).toEqual(['bugs', 'security']);
+    expect(resumed.usage.map(({ totalTokens }) => totalTokens)).toEqual([120, 80]);
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      state: 'running',
+      executionAttempt: {
+        number: 2,
+        resume: { activation: 'ambiguous-rearm', admission: 'executing' },
+      },
+      counts: { total: 2, succeeded: 2, pending: 0 },
+    });
+  });
+
+  it('recovers a durable ambiguous activation without requiring consent again', async () => {
+    const offer = await createAmbiguousAttempt();
+    const firstAdapter = new ResumeAdapter();
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: repoPath,
+      repositoryRoot: '/repo',
+      code,
+    }, firstAdapter);
+    const activated = await certified.activateAmbiguousRearm(
+      resumeIdentity(),
+      exactAmbiguousConsent(offer),
+      '2026-07-19T04:00:05.000Z',
+    );
+    expect(activated).toMatchObject({ activated: true });
+    resetAnalyzeRunStorage();
+    const recoveredAdapter = new ResumeAdapter();
+
+    const resumed = await rearmCertifiedViolationPhase({
+      ...resumeInput(recoveredAdapter),
+      consent: undefined,
+    });
+
+    expect(recoveredAdapter.calls.map(({ domain }) => domain)).toEqual(['security']);
+    expect(resumed.results).toHaveLength(2);
+  });
 });
 
 function resumeRun(selectedRunId = runId): CertifiedViolationResumePhaseInput['run'] {
@@ -409,6 +459,29 @@ function resumeInput(
     activatedAt: '2026-07-19T04:00:05.000Z',
     admittedAt: '2026-07-19T04:00:06.000Z',
     ...overrides,
+  };
+}
+
+function resumeIdentity() {
+  const { repositoryKey: _repositoryKey, repositoryRoot: _repositoryRoot, runId: _runId, ...identity } = resumeRun();
+  return identity;
+}
+
+function rearmInput(
+  adapter: CertifiedViolationAmbiguousRearmPhaseInput['adapter'],
+  offer: AnalyzeRunAmbiguousRearmOffer,
+): CertifiedViolationAmbiguousRearmPhaseInput {
+  return {
+    ...resumeInput(adapter),
+    consent: exactAmbiguousConsent(offer),
+  };
+}
+
+function exactAmbiguousConsent(offer: AnalyzeRunAmbiguousRearmOffer) {
+  return {
+    evidence: offer.evidence,
+    acceptedRisk: 'repeat-up-to-pending-provider-calls' as const,
+    acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls,
   };
 }
 
@@ -451,6 +524,25 @@ async function createBlockedAttempt(
     blockedAt: '2026-07-19T04:00:04.000Z',
     resetHint: '7pm (Africa/Cairo)',
   });
+}
+
+async function createAmbiguousAttempt(): Promise<AnalyzeRunAmbiguousRearmOffer> {
+  await createBlockedAttempt();
+  const runPath = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+  const stored = JSON.parse(fs.readFileSync(runPath, 'utf8'));
+  const checkpointedAt = stored.plan.work
+    .filter((item: Record<string, unknown>) => item.state === 'succeeded-checkpointed')
+    .map((item: Record<string, any>) => item.checkpoint.checkpointedAt)
+    .sort()
+    .at(-1);
+  stored.revision -= 1;
+  stored.updatedAt = checkpointedAt;
+  stored.status = { state: 'running' };
+  fs.writeFileSync(runPath, `${JSON.stringify(stored, null, 2)}\n`);
+  resetAnalyzeRunStorage();
+  const current = await readAnalyzeRun(repoPath, 'latest-attempt');
+  if (current?.rearm == null) throw new Error('expected ambiguous rearm offer');
+  return current.rearm;
 }
 
 async function createZeroCheckpointBlockedAttempt(
