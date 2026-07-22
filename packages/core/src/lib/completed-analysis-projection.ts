@@ -1,0 +1,281 @@
+import fs from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+import {
+  getRegistryStore,
+  validateLastAnalyzedTimestamp,
+  type EnsureLastAnalyzedResult,
+  type RegistryStore,
+} from '../config/registry.js';
+import type {
+  AnalysisSnapshot,
+  HistoryEntry,
+  UsageRecord,
+  ViolationSeverity,
+} from '../types/snapshot.js';
+import {
+  activeCompletedBaselineId,
+  buildAnalysisFilename,
+  getAnalysisStore,
+  validateHistoryEntryForPersistence,
+  type AnalysisStore,
+  type EnsureHistoryEntryResult,
+  type ReconcileDiffResult,
+} from './analysis-store.js';
+
+export interface CompletedAnalysisProjectionIntent {
+  projectSlug: string;
+  promotedSnapshot: AnalysisSnapshot;
+  historyEntry: HistoryEntry;
+}
+
+export type CompletedAnalysisProjectionFaultPoint =
+  | 'after-history'
+  | 'after-diff'
+  | 'after-registry';
+
+export interface CompletedAnalysisProjectionOptions {
+  faultInjector?: (
+    point: CompletedAnalysisProjectionFaultPoint,
+  ) => void | Promise<void>;
+  /** Internal pinning seam used by the finalization coordinator. */
+  analysisStore?: AnalysisStore;
+  /** Internal pinning seam used by the finalization coordinator. */
+  registryStore?: RegistryStore;
+}
+
+export interface CompletedAnalysisProjectionResult {
+  activeAnalysisId: string;
+  generations: number;
+  history: EnsureHistoryEntryResult;
+  diff: ReconcileDiffResult;
+  registry: EnsureLastAnalyzedResult;
+}
+
+const severities: ViolationSeverity[] = ['info', 'low', 'medium', 'high', 'critical'];
+
+function sameRepositoryKey(left: string, right: string): boolean {
+  if (left === right) return true;
+  try {
+    return fs.realpathSync.native(left) === fs.realpathSync.native(right);
+  } catch {
+    return false;
+  }
+}
+
+function nonnegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function canonicalTimestamp(value: unknown): value is string {
+  return typeof value === 'string'
+    && !Number.isNaN(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+
+function summarizeUsage(usage: readonly UsageRecord[]): HistoryEntry['usage'] {
+  let totalTokens = 0;
+  let durationMs = 0;
+  let totalCost = 0;
+  let hasCost = false;
+  for (const record of usage) {
+    if (
+      record.provider.trim().length === 0
+      || record.callType.trim().length === 0
+      || !canonicalTimestamp(record.createdAt)
+      || !nonnegativeInteger(record.inputTokens)
+      || !nonnegativeInteger(record.outputTokens)
+      || !nonnegativeInteger(record.cacheReadTokens)
+      || !nonnegativeInteger(record.cacheWriteTokens)
+      || !nonnegativeInteger(record.totalTokens)
+      || !nonnegativeInteger(record.durationMs)
+      || (record.costUsd !== null && (
+        record.costUsd.trim().length === 0
+        || !Number.isFinite(Number(record.costUsd))
+        || Number(record.costUsd) < 0
+      ))
+    ) {
+      throw new Error('Promoted snapshot contains invalid usage accounting');
+    }
+    totalTokens += record.totalTokens;
+    durationMs += record.durationMs;
+    if (!Number.isSafeInteger(totalTokens) || !Number.isSafeInteger(durationMs)) {
+      throw new Error('Promoted snapshot contains invalid usage accounting');
+    }
+    if (record.costUsd !== null) {
+      const value = Number(record.costUsd);
+      totalCost += value;
+      if (!Number.isFinite(totalCost)) throw new Error('Promoted snapshot contains invalid usage accounting');
+      hasCost = true;
+    }
+  }
+  return {
+    totalTokens,
+    totalCostUsd: hasCost ? totalCost.toFixed(6) : '0',
+    durationMs,
+    provider: usage[0]?.provider ?? '',
+  };
+}
+
+export function validateCompletedAnalysisProjectionIntent(
+  intent: CompletedAnalysisProjectionIntent,
+): void {
+  let persisted: unknown;
+  try {
+    persisted = JSON.parse(JSON.stringify(intent));
+  } catch {
+    throw new Error('Completed-analysis projection intent must be exactly JSON-round-trippable');
+  }
+  if (!isDeepStrictEqual(persisted, intent)) {
+    throw new Error('Completed-analysis projection intent must be exactly JSON-round-trippable');
+  }
+  if (intent.projectSlug.length === 0) {
+    throw new Error('Completed-analysis projection requires a project slug');
+  }
+
+  const { promotedSnapshot: snapshot, historyEntry: entry } = intent;
+  validateHistoryEntryForPersistence(entry);
+  const counts = entry.counts;
+  const violationCounts = counts?.violations;
+  if (
+    entry.id !== snapshot.id
+    || entry.filename !== buildAnalysisFilename(snapshot.id, snapshot.createdAt)
+    || entry.createdAt !== snapshot.createdAt
+    || entry.branch !== snapshot.branch
+    || entry.commitHash !== snapshot.commitHash
+    || !isDeepStrictEqual(entry.metadata, snapshot.metadata)
+    || counts?.services !== snapshot.graph.services.length
+    || counts?.modules !== snapshot.graph.modules.length
+    || counts?.methods !== snapshot.graph.methods.length
+    || violationCounts?.new !== snapshot.violations.added.length
+    || violationCounts?.resolved !== snapshot.violations.resolved.length
+    || !nonnegativeInteger(violationCounts?.unchanged)
+    || !nonnegativeInteger(violationCounts?.new)
+    || !nonnegativeInteger(violationCounts?.resolved)
+  ) {
+    throw new Error('History entry does not match the promoted snapshot');
+  }
+
+  const bySeverity = violationCounts.bySeverity;
+  const addedBySeverity = Object.fromEntries(
+    severities.map((severity) => [severity, 0]),
+  ) as Record<ViolationSeverity, number>;
+  for (const added of snapshot.violations.added) {
+    if (!severities.includes(added.severity)) {
+      throw new Error('Promoted snapshot contains an invalid violation severity');
+    }
+    addedBySeverity[added.severity] += 1;
+  }
+  if (
+    !isDeepStrictEqual(Object.keys(bySeverity).sort(), [...severities].sort())
+    || severities.some((severity) => !nonnegativeInteger(bySeverity[severity]))
+    || severities.some((severity) => bySeverity[severity] < addedBySeverity[severity])
+    || severities.reduce((sum, severity) => sum + bySeverity[severity], 0)
+      !== violationCounts.new + violationCounts.unchanged
+    || (snapshot.violations.previousAnalysisId === null && violationCounts.unchanged !== 0)
+    || !isDeepStrictEqual(entry.usage, summarizeUsage(snapshot.usage))
+  ) {
+    throw new Error('History entry does not match the promoted snapshot');
+  }
+}
+
+function validateActiveHistoryCounts(
+  intent: CompletedAnalysisProjectionIntent,
+  latest: NonNullable<Awaited<ReturnType<AnalysisStore['readLatest']>>>,
+): void {
+  const bySeverity = Object.fromEntries(
+    severities.map((severity) => [severity, 0]),
+  ) as Record<ViolationSeverity, number>;
+  for (const violation of latest.violations) {
+    if (!severities.includes(violation.severity)) {
+      throw new Error('Active completed baseline contains an invalid violation severity');
+    }
+    bySeverity[violation.severity] += 1;
+  }
+  const expectedUnchanged = latest.violations.length - intent.promotedSnapshot.violations.added.length;
+  if (
+    expectedUnchanged < 0
+    || intent.historyEntry.counts.violations.unchanged !== expectedUnchanged
+    || !isDeepStrictEqual(intent.historyEntry.counts.violations.bySeverity, bySeverity)
+  ) {
+    throw new Error('History entry does not match the active completed baseline');
+  }
+}
+
+/**
+ * Repair completed-analysis projections while the caller holds the repository
+ * lifecycle lock. Every mutation is idempotent; exact retry is the recovery
+ * protocol after any ambiguous stop.
+ */
+export async function projectCompletedAnalysis(
+  repoKey: string,
+  intent: CompletedAnalysisProjectionIntent,
+  options: CompletedAnalysisProjectionOptions = {},
+): Promise<CompletedAnalysisProjectionResult> {
+  if (repoKey.length === 0) throw new Error('Completed-analysis projection requires a repository key');
+  validateCompletedAnalysisProjectionIntent(intent);
+
+  const analysisStore = options.analysisStore ?? getAnalysisStore();
+  const registry = options.registryStore ?? getRegistryStore();
+  const assertStores = (): void => {
+    if (getAnalysisStore() !== analysisStore || getRegistryStore() !== registry) {
+      throw new Error('Completed-analysis projection storage changed during recovery');
+    }
+  };
+  assertStores();
+
+  const lineage = await analysisStore.certifyCompletedAnalysisLineage(
+    repoKey,
+    intent.promotedSnapshot,
+  );
+  assertStores();
+  const latest = await analysisStore.readLatest(repoKey);
+  assertStores();
+  const activeAnalysisId = activeCompletedBaselineId(latest);
+  if (activeAnalysisId !== lineage.activeAnalysisId) {
+    throw new Error('Active completed baseline changed during projection preflight');
+  }
+  if (lineage.generations === 0) validateActiveHistoryCounts(intent, latest!);
+
+  if (!registry.ensureLastAnalyzed) {
+    throw new Error('Active registry store does not support monotonic projection');
+  }
+  let project = await registry.getProjectByPath(repoKey);
+  assertStores();
+  if (!project) {
+    project = await registry.getProjectBySlug(intent.projectSlug);
+    assertStores();
+  }
+  if (
+    !project
+    || !sameRepositoryKey(project.path, repoKey)
+    || (intent.projectSlug !== project.slug && intent.projectSlug !== project.path)
+  ) {
+    throw new Error('Projection project does not match the repository key');
+  }
+  if (project.lastAnalyzed) {
+    validateLastAnalyzedTimestamp(project.lastAnalyzed, 'Stored lastAnalyzed');
+  }
+
+  const history = await analysisStore.ensureHistoryEntry(repoKey, intent.historyEntry);
+  assertStores();
+  await options.faultInjector?.('after-history');
+  assertStores();
+  const diff = await analysisStore.reconcileDiffWithLatest(repoKey);
+  assertStores();
+  await options.faultInjector?.('after-diff');
+  assertStores();
+  const registryResult = await registry.ensureLastAnalyzed(
+    project.slug,
+    latest!.analysis.createdAt,
+  );
+  assertStores();
+  await options.faultInjector?.('after-registry');
+
+  return {
+    activeAnalysisId,
+    generations: lineage.generations,
+    history,
+    diff,
+    registry: registryResult,
+  };
+}

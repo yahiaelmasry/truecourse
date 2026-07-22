@@ -40,9 +40,12 @@ export { parseLlmSessionLimitError };
 export { OUTPUT_ONLY_GUARDRAIL } from './guardrail.js';
 
 export interface LlmRequest {
-  /** Stable id (the runner's natural id, e.g. `contract.extract:<sliceId>`).
-   *  Falls back to a content hash when absent. */
+  /** Exact-input transport/resume key. Falls back to a content hash when absent. */
   id?: string;
+  /** Stable semantic work identity, when the caller has certified one. */
+  workId?: string;
+  /** Complete reuse-relevant input fingerprint for the certified work. */
+  inputFingerprint?: string;
   /** Pipeline stage, e.g. `spec.relevance` / `contract.extract` — informational. */
   stage?: string;
   /** Primary model (cli passes `--model`; agent treats it as a hint). */
@@ -159,6 +162,40 @@ export interface EnvelopeUsage {
   timeToRequestMs?: number;
 }
 
+/** Resolve the concrete model that actually served a Claude JSON envelope. */
+export function resolveEnvelopeModel(
+  _requestedModel: string | null | undefined,
+  envelope: unknown,
+): string | null {
+  if (!envelope || typeof envelope !== 'object') return null;
+  const env = envelope as Record<string, unknown>;
+  const usage = (env.usage ?? {}) as Record<string, unknown>;
+  const rawModelUsage = env.modelUsage ?? usage.modelUsage;
+  if (!rawModelUsage || typeof rawModelUsage !== 'object' || Array.isArray(rawModelUsage)) {
+    return null;
+  }
+  const modelUsage = rawModelUsage as Record<string, unknown>;
+  const keys = Object.keys(modelUsage).filter((key) => key.trim().length > 0);
+  if (keys.length === 0) return null;
+  const activity = (key: string): number => {
+    const entry = modelUsage[key];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return 0;
+    const usage = entry as Record<string, unknown>;
+    return [
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.cacheReadInputTokens,
+      usage.cacheCreationInputTokens,
+    ].reduce<number>((total, value) =>
+      total + (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0), 0);
+  };
+  const activeKeys = keys.filter((key) => activity(key) > 0);
+  // A checkpoint can be resumed safely only when the envelope proves one concrete model.
+  // If multiple models did work, choosing the requested alias or the busiest key would hide
+  // mixed-model execution and make an exact Resume pin impossible to prove.
+  return activeKeys.length === 1 ? activeKeys[0]! : null;
+}
+
 /**
  * Pull token/cost/timing/model usage out of the terminal `result` event (same
  * shape as the buffered `claude -p --output-format json` envelope). The `agent`
@@ -168,24 +205,9 @@ function parseEnvelopeUsage(req: LlmRequest, envelope: unknown): EnvelopeUsage |
   if (!envelope || typeof envelope !== 'object') return null;
   const env = envelope as Record<string, unknown>;
   const usage = (env.usage ?? {}) as Record<string, unknown>;
-  const modelUsage = (env.modelUsage ??
-    (usage.modelUsage as unknown) ??
-    {}) as Record<string, { inputTokens?: number }>;
-  // Resolve the model id: prefer the modelUsage key matching the requested
-  // alias (e.g. 'sonnet' → 'claude-sonnet-4-6'); else the busiest key; else
-  // the alias the caller passed.
-  const keys = Object.keys(modelUsage);
-  let model = req.model ?? '';
-  if (keys.length) {
-    const alias = (req.model ?? '').toLowerCase();
-    const inTok = (k: string): number => modelUsage[k]?.inputTokens ?? 0;
-    const busiest = keys.reduce((a, b) => (inTok(b) > inTok(a) ? b : a));
-    const aliasKey = alias ? keys.find((k) => k.toLowerCase().includes(alias)) : undefined;
-    // Prefer the alias's resolved id, but only when it actually did work: if
-    // --fallback-model served the call, the primary alias key shows ~0 tokens,
-    // so fall back to the busiest key (the model that produced the output).
-    model = aliasKey && inTok(aliasKey) > 0 ? aliasKey : busiest;
-  }
+  // Prefer the requested alias's concrete id when it did work; otherwise use
+  // the busiest key so a fallback model is recorded as the model that served.
+  const model = resolveEnvelopeModel(req.model, env) ?? req.model ?? '';
   const num = (v: unknown): number => (typeof v === 'number' ? v : 0);
   const numU = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
   return {
@@ -730,7 +752,7 @@ export interface AgentTransportOptions {
 
 /**
  * Mailbox protocol under `ioDir`:
- *   requests/<id>.json   { id, stage, model, fallbackModel, responseFormat, schema, system, user }
+ *   requests/<id>.json   { id, workId?, inputFingerprint?, stage, model, fallbackModel, responseFormat, schema, system, user }
  *   responses/<id>.json  { text } | { error }
  * Both files are written atomically (write-tmp + rename) so neither side reads
  * a partial file. Each concurrent transport call owns one id; the runner's own
@@ -757,6 +779,8 @@ export function agentTransport(ioDir: string, opts: AgentTransportOptions = {}):
         JSON.stringify(
           {
             id,
+            workId: req.workId,
+            inputFingerprint: req.inputFingerprint,
             stage: req.stage,
             model: req.model,
             fallbackModel: req.fallbackModel,

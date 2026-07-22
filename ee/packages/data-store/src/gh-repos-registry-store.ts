@@ -17,7 +17,13 @@
 
 import { eq } from 'drizzle-orm';
 import { ghRepos, type EeDb } from '@truecourse/ee-db';
-import { slugify, type RegistryEntry, type RegistryStore } from '@truecourse/core/config/registry';
+import {
+  slugify,
+  validateLastAnalyzedTimestamp,
+  type EnsureLastAnalyzedResult,
+  type RegistryEntry,
+  type RegistryStore,
+} from '@truecourse/core/config/registry';
 
 type GhRepoRow = typeof ghRepos.$inferSelect;
 
@@ -79,7 +85,15 @@ export class GhReposRegistryStore implements RegistryStore {
     /* no-op — last-opened isn't tracked in the gate store */
   }
 
+  async ensureLastAnalyzed(
+    _slug: string,
+    isoTimestamp: string,
+  ): Promise<EnsureLastAnalyzedResult> {
+    validateLastAnalyzedTimestamp(isoTimestamp);
+    return 'untracked';
+  }
+
   async setLastAnalyzed(): Promise<void> {
-    /* no-op — the EE gate doesn't run code analysis */
+    /* no-op — the EE registry derives analysis time from canonical LATEST */
   }
 }

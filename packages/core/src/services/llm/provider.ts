@@ -1,4 +1,4 @@
-import type { Violation } from '@truecourse/shared';
+import type { ContextRequirement, Violation } from '@truecourse/shared';
 import { ClaudeCodeProvider } from './cli-provider.js';
 import {
   getDefaultTransport,
@@ -7,12 +7,15 @@ import {
 } from '@truecourse/shared/llm';
 import type { FlowEnrichmentContext } from './prompts.js';
 import type { UsageData } from '../usage.service.js';
+import type { AnalyzeLlmExecutionAdapter } from './certified-analyze-llm-run.js';
 
 // ---------------------------------------------------------------------------
 // Focused violation context types (one per LLM call)
 // ---------------------------------------------------------------------------
 
 export interface ServiceViolationContext {
+  /** Broader certified-analysis configuration/rule compatibility evidence. */
+  analysisInputFingerprint?: string;
   architecture: string;
   services: {
     id: string;
@@ -53,6 +56,8 @@ export interface DatabaseViolationContext {
 }
 
 export interface ModuleViolationContext {
+  /** Broader certified-analysis configuration/rule compatibility evidence. */
+  analysisInputFingerprint?: string;
   modules: {
     id: string;
     name: string;
@@ -118,10 +123,29 @@ export interface CodeSourceScope {
   ranges: CodeSourceRange[];
 }
 
+export type CodeMetadataField = NonNullable<ContextRequirement['metadataFields']>[number];
+
+export interface CodeContextSource {
+  path: string;
+  selection:
+    | { kind: 'metadata'; fields: CodeMetadataField[] }
+    | { kind: 'full-file' }
+    | {
+        kind: 'targeted';
+        functions: Array<{
+          name: string;
+          startLine: number;
+          endLine: number;
+        }>;
+      };
+}
+
 export interface CodeViolationContext {
   files: { path: string; content: string }[];
   /** Exact source ranges supplied to this work unit and therefore owned by its result. */
   sourceScopes: CodeSourceScope[];
+  /** Exact repository selections used to construct this work unit. */
+  sources?: CodeContextSource[];
   llmRules: { key: string; name: string; severity: string; prompt: string }[];
   /** Context tier — determines which prompt template to use */
   tier?: 'metadata' | 'targeted' | 'full-file';
@@ -304,6 +328,8 @@ export interface LLMProvider {
   flushUsage(): UsageData[];
 }
 
+export type CertifiedAnalyzeLlmProvider = LLMProvider & AnalyzeLlmExecutionAdapter;
+
 // ---------------------------------------------------------------------------
 // Factory — Claude Code CLI is the only supported provider.
 // ---------------------------------------------------------------------------
@@ -320,6 +346,9 @@ export interface LLMProvider {
  * `selectedModel` is the model chosen in the analyze picker. Omit it to leave
  * model selection to Claude Code, as callers did before the picker existed.
  */
-export function createLLMProvider(transport?: LlmTransport, selectedModel?: string): LLMProvider {
+export function createLLMProvider(
+  transport?: LlmTransport,
+  selectedModel?: string | null,
+): CertifiedAnalyzeLlmProvider {
   return new ClaudeCodeProvider(transport ?? getDefaultTransport(), selectedModel);
 }

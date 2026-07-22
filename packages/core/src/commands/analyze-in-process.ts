@@ -5,13 +5,28 @@
  * the internal split becomes core-compute vs mode-specific-persist.
  */
 
-import { removeFromHistory } from '../lib/analysis-store.js';
+import { readLatest, removeFromHistory } from '../lib/analysis-store.js';
 import type { RegistryEntry } from '../config/registry.js';
 import type { LLMProvider } from '../services/llm/provider.js';
 import type { LlmTransport } from '@truecourse/shared/llm';
 import type { StepTracker } from '../progress.js';
-import { analyzeCore, type LlmEstimate } from './analyze-core.js';
-import { persistFullAnalysis, type PersistFullResult } from './analyze-persist.js';
+import { analyzeCoreAndFinalize, type AnalyzeCoreResult, type LlmEstimate } from './analyze-core.js';
+import {
+  buildFullAnalysisFinalizationPlan,
+  persistFullAnalysis,
+  type PersistFullResult,
+} from './analyze-persist.js';
+import {
+  beginFinalizeAnalyzeRun,
+  dispatchAnalyzeRun,
+  prepareAnalyzeRunFinalization,
+  readAnalyzeRun,
+} from '../lib/analyze-run-journal.js';
+import { finalizePreparedAnalyzeRun } from '../lib/analyze-run-finalization.js';
+import {
+  CertifiedViolationResumeUnavailableError,
+  JournaledAnalyzeSessionLimitError,
+} from '../services/llm/certified-violation-phase.js';
 import { config } from '../config/index.js';
 import { log } from '../lib/logger.js';
 import {
@@ -67,13 +82,39 @@ export interface AnalyzeInProcessOptions {
   source?: TelemetrySource;
 }
 
+export interface ResumeAnalyzeInProcessOptions extends Pick<
+  AnalyzeInProcessOptions,
+  'tracker' | 'onProgress' | 'provider' | 'transport' | 'signal'
+> {
+  /** Exact durable attempted run selected by the user. */
+  runId: string;
+}
+
+export type AnalysisResumeUnavailableReason =
+  | CertifiedViolationResumeUnavailableError['reason']
+  | 'finalization-unprepared'
+  | 'run-failed'
+  | 'completed-analysis-not-active';
+
+export class AnalysisResumeUnavailableError extends Error {
+  constructor(
+    readonly reason: AnalysisResumeUnavailableReason,
+    options?: ErrorOptions,
+  ) {
+    super(`Analyze Resume is unavailable: ${reason}`, options);
+    this.name = 'AnalysisResumeUnavailableError';
+  }
+}
+
 export type AnalyzeInProcessResult = PersistFullResult;
 
 export class AnalysisSessionLimitError extends LlmSessionLimitError {
   constructor(error: LlmSessionLimitError) {
     super(error.resetHint);
     this.name = 'AnalysisSessionLimitError';
-    this.message = `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
+    this.message = error instanceof JournaledAnalyzeSessionLimitError
+      ? `${this.message} The interrupted run was saved as the latest attempted run and any successful LLM results were checkpointed, but LATEST.json was not updated and the previous completed analysis remains unchanged. Core API callers can resume this attempted run after the provider limit resets to continue pending work and reuse any verified checkpoints. CLI/dashboard Resume actions are not wired yet; starting a new run may repeat those calls.`
+      : `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
   }
 }
 
@@ -87,14 +128,23 @@ export async function analyzeInProcess(
       options.selectedModel || config.claudeCodeModel || 'default (chosen by Claude Code)'
     }, maxConcurrency: ${config.claudeCodeMaxConcurrency}`,
   );
-  let core: Awaited<ReturnType<typeof analyzeCore>>;
+  let core!: AnalyzeCoreResult;
+  let result: PersistFullResult;
   try {
-    core = await analyzeCore(project, { ...options, mode: 'full' });
+    result = await analyzeCoreAndFinalize(
+      project,
+      { ...options, mode: 'full', journalFullRun: true },
+      async (computed) => {
+        core = computed;
+        const finalized = await finalizeCertifiedAnalysis(project, computed, startedAt);
+        if (finalized) return finalized;
+        return persistFullAnalysis(project, computed, startedAt);
+      },
+    );
   } catch (error) {
     if (isLlmSessionLimitError(error)) throw new AnalysisSessionLimitError(error);
     throw error;
   }
-  const result = await persistFullAnalysis(project, core, startedAt);
 
   if (options.source) {
     await trackEvent('analyze', {
@@ -111,5 +161,175 @@ export async function analyzeInProcess(
   return result;
 }
 
+/** Resume one explicitly selected durable full-analysis attempt. */
+export async function resumeAnalyzeInProcess(
+  project: RegistryEntry,
+  options: ResumeAnalyzeInProcessOptions,
+): Promise<AnalyzeInProcessResult> {
+  const { runId, tracker, onProgress, provider, transport, signal } = options;
+  const startedAt = Date.now();
+  try {
+    return await analyzeCoreAndFinalize(
+      project,
+      {
+        skipStash: true,
+        tracker,
+        onProgress,
+        provider,
+        transport,
+        signal,
+        mode: 'full',
+        resumeFullRunId: runId,
+        enableLlmRulesOverride: true,
+      },
+      async (computed) => {
+        const finalized = await finalizeCertifiedAnalysis(project, computed, startedAt);
+        if (!finalized) {
+          throw new AnalysisResumeUnavailableError('work-plan-changed');
+        }
+        return finalized;
+      },
+      () => recoverPreparedAnalyzeRun(project, runId, startedAt),
+    );
+  } catch (error) {
+    if (isLlmSessionLimitError(error)) throw new AnalysisSessionLimitError(error);
+    if (error instanceof CertifiedViolationResumeUnavailableError) {
+      throw new AnalysisResumeUnavailableError(error.reason, { cause: error });
+    }
+    throw error;
+  }
+}
+
 // Re-export so the route can detect and remove a specific analysis's history entry.
 export { removeFromHistory };
+
+async function finalizeCertifiedAnalysis(
+  project: RegistryEntry,
+  computed: AnalyzeCoreResult,
+  startedAt: number,
+): Promise<PersistFullResult | null> {
+  const certified = computed.pipelineResult.certifiedLlmExecution;
+  if (!certified) return null;
+  try {
+    const plan = buildFullAnalysisFinalizationPlan(project, computed);
+    const executedAttempt = await readAnalyzeRun(project.path, { runId: certified.runId });
+    const finalizingAt = timestampAtOrAfter(executedAttempt?.updatedAt ?? computed.now);
+    await beginFinalizeAnalyzeRun(project.path, {
+      runId: certified.runId,
+      finalizingAt,
+    }, certified.completion);
+    const preparedAt = timestampAtOrAfter(finalizingAt);
+    await prepareAnalyzeRunFinalization(project.path, {
+      runId: certified.runId,
+      preparedAt,
+      promotion: plan.promotion,
+      projection: plan.projection,
+    });
+    await finalizePreparedAnalyzeRun(project.path, {
+      runId: certified.runId,
+      completedAt: timestampAtOrAfter(preparedAt),
+    });
+    return {
+      ...plan.result,
+      durationMs: Date.now() - startedAt,
+    };
+  } catch (error) {
+    const attempted = await readAnalyzeRun(
+      project.path,
+      { runId: certified.runId },
+    ).catch(() => null);
+    const recoverable = attempted?.finalization?.persistence === 'prepared';
+    if (
+      attempted
+      && !recoverable
+      && (attempted.state === 'running' || attempted.state === 'finalizing')
+    ) {
+      await dispatchAnalyzeRun(project.path, {
+        kind: 'fail',
+        runId: certified.runId,
+        failedAt: timestampAtOrAfter(attempted.updatedAt),
+        error: {
+          code: 'ANALYZE_FINALIZATION_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+    throw error;
+  }
+}
+
+async function recoverPreparedAnalyzeRun(
+  project: RegistryEntry,
+  runId: string,
+  startedAt: number,
+): Promise<
+  | Readonly<{ handled: true; result: PersistFullResult }>
+  | Readonly<{ handled: false }>
+> {
+  const attempted = await readAnalyzeRun(project.path, { runId });
+  if (!attempted) throw new AnalysisResumeUnavailableError('run-not-found');
+  const latestAttempt = await readAnalyzeRun(project.path, 'latest-attempt');
+  if (latestAttempt?.runId !== runId) {
+    throw new AnalysisResumeUnavailableError('not-latest-attempt');
+  }
+  if (attempted.state === 'completed') {
+    return {
+      handled: true,
+      result: await completedAnalyzeResult(project.path, attempted.candidateAnalysisId, startedAt),
+    };
+  }
+  if (attempted.state === 'finalizing') {
+    if (attempted.finalization?.persistence !== 'prepared') {
+      throw new AnalysisResumeUnavailableError('finalization-unprepared');
+    }
+    await finalizePreparedAnalyzeRun(project.path, {
+      runId,
+      completedAt: timestampAtOrAfter(attempted.updatedAt),
+    });
+    return {
+      handled: true,
+      result: await completedAnalyzeResult(project.path, attempted.candidateAnalysisId, startedAt),
+    };
+  }
+  if (attempted.state === 'failed') {
+    throw new AnalysisResumeUnavailableError('run-failed');
+  }
+  return { handled: false };
+}
+
+async function completedAnalyzeResult(
+  repositoryKey: string,
+  analysisId: string,
+  startedAt: number,
+): Promise<PersistFullResult> {
+  const latest = await readLatest(repositoryKey);
+  if (!latest || latest.analysis.id !== analysisId) {
+    throw new AnalysisResumeUnavailableError('completed-analysis-not-active');
+  }
+  const bySeverity: Record<string, number> = {};
+  for (const violation of latest.violations) {
+    bySeverity[violation.severity] = (bySeverity[violation.severity] ?? 0) + 1;
+  }
+  const analyzedFiles = latest.analysis.metadata?.analyzedFiles;
+  const fileCount = typeof analyzedFiles === 'number'
+    && Number.isSafeInteger(analyzedFiles)
+    && analyzedFiles >= 0
+    ? analyzedFiles
+    : new Set(latest.graph.modules.map((module) => module.filePath)).size;
+  return {
+    analysisId,
+    filename: latest.head,
+    serviceCount: latest.graph.services.length,
+    fileCount,
+    architecture: latest.analysis.architecture,
+    durationMs: Date.now() - startedAt,
+    violationsSummary: {
+      total: latest.violations.length,
+      bySeverity,
+    },
+  };
+}
+
+function timestampAtOrAfter(notBefore: string): string {
+  return new Date(Math.max(Date.now(), Date.parse(notBefore))).toISOString();
+}

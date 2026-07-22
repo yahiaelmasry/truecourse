@@ -5,6 +5,7 @@ import {
   type DatabaseViolationContext,
   type ModuleViolationContext,
   type ViolationsResult,
+  type AllViolationsResult,
   type AllViolationsLifecycleResult,
   type ExistingViolation,
 } from './llm/provider.js';
@@ -89,6 +90,65 @@ export interface ViolationGenerationInput {
   existingModuleViolations?: ExistingViolation[];
 }
 
+export type ViolationLlmContextMode = 'normal' | 'lifecycle';
+
+export interface ViolationLlmContexts {
+  service: ServiceViolationContext;
+  database: DatabaseViolationContext | undefined;
+  module: ModuleViolationContext | undefined;
+}
+
+/** Build every aggregate LLM context before any provider call is admitted. */
+export function buildViolationLlmContexts(
+  input: ViolationGenerationInput,
+  mode: ViolationLlmContextMode,
+): ViolationLlmContexts {
+  const serviceDtos = input.services.map((service) => ({
+    id: service.id,
+    name: service.name,
+    type: service.type,
+    framework: service.framework,
+    fileCount: service.fileCount,
+    layers: extractLayerNames(service.layerSummary),
+  }));
+  const includeExisting = mode === 'lifecycle';
+  const service: ServiceViolationContext = {
+    architecture: input.architecture,
+    services: serviceDtos,
+    dependencies: input.dependencies.map((dependency) => ({
+      source: dependency.sourceServiceName,
+      target: dependency.targetServiceName,
+      count: dependency.dependencyCount || 0,
+      type: dependency.dependencyType || undefined,
+    })),
+    llmRules: (input.llmRules || []).filter((rule) => rule.category === 'service'),
+    ...(includeExisting ? { existingViolations: input.existingServiceViolations } : {}),
+  };
+  const database = input.databases && input.databases.length > 0
+    ? {
+        databases: input.databases,
+        llmRules: (input.llmRules || []).filter((rule) => rule.category === 'database'),
+        ...(includeExisting ? { existingViolations: input.existingDatabaseViolations } : {}),
+      }
+    : undefined;
+  const serviceNameToId = new Map(serviceDtos.map((candidate) => [candidate.name, candidate.id]));
+  const module = input.modules && input.modules.length > 0
+    ? {
+        modules: input.modules.map((candidate) => ({
+          ...candidate,
+          serviceId: serviceNameToId.get(candidate.serviceName),
+        })),
+        methods: input.methods || [],
+        moduleDependencies: input.moduleDependencies || [],
+        methodDependencies: input.methodDependencies || [],
+        llmRules: (input.llmRules || []).filter((rule) => rule.category === 'module'),
+        ...(includeExisting ? { existingViolations: input.existingModuleViolations } : {}),
+      }
+    : undefined;
+
+  return { service, database, module };
+}
+
 export async function generateViolations(
   input: ViolationGenerationInput,
   onProgress?: (step: string) => void,
@@ -98,59 +158,11 @@ export async function generateViolations(
 ): Promise<ViolationsResult> {
   const provider = externalProvider ?? createLLMProvider();
 
-  // Partition rules by category
-  const archRules = (input.llmRules || []).filter((r) => r.category === 'service');
-  const dbRules = (input.llmRules || []).filter((r) => r.category === 'database');
-  const moduleRules = (input.llmRules || []).filter((r) => r.category === 'module');
-
-  const serviceDtos = input.services.map((s) => ({
-    id: s.id,
-    name: s.name,
-    type: s.type,
-    framework: s.framework,
-    fileCount: s.fileCount,
-    layers: extractLayerNames(s.layerSummary),
-  }));
-
-  const depDtos = input.dependencies.map((d) => ({
-    source: d.sourceServiceName,
-    target: d.targetServiceName,
-    count: d.dependencyCount || 0,
-    type: d.dependencyType || undefined,
-  }));
-
-  // Valid ID sets for post-call validation
-  const validServiceIds = new Set(input.services.map((s) => s.id));
-  const validDatabaseIds = new Set((input.databases || []).map((d) => d.id));
-  const validModuleIds = new Set((input.modules || []).map((m) => m.id));
-  const validMethodIds = new Set((input.methods || []).filter((m) => m.id).map((m) => m.id!));
-
-  // --- Build contexts ---
-
-  const serviceContext: ServiceViolationContext = {
-    architecture: input.architecture,
-    services: serviceDtos,
-    dependencies: depDtos,
-    llmRules: archRules,
-  };
-
-  const hasDBs = input.databases && input.databases.length > 0;
-  const dbContext: DatabaseViolationContext | undefined = hasDBs
-    ? { databases: input.databases!, llmRules: dbRules }
-    : undefined;
-
-  const serviceNameToIdMap = new Map(serviceDtos.map((s) => [s.name, s.id]));
-
-  const hasModules = input.modules && input.modules.length > 0;
-  const moduleContext: ModuleViolationContext | undefined = hasModules
-    ? {
-        modules: input.modules!.map((m) => ({ ...m, serviceId: serviceNameToIdMap.get(m.serviceName) })),
-        methods: input.methods || [],
-        moduleDependencies: input.moduleDependencies || [],
-        methodDependencies: input.methodDependencies || [],
-        llmRules: moduleRules,
-      }
-    : undefined;
+  const {
+    service: serviceContext,
+    database: dbContext,
+    module: moduleContext,
+  } = buildViolationLlmContexts(input, 'normal');
 
   // Run all in parallel via single traced call
   const results = await provider.generateAllViolations({
@@ -161,6 +173,21 @@ export async function generateViolations(
     onCallStart,
     onCallDone,
   });
+
+  return mergeViolationLlmResults(input, results);
+}
+
+/** Merge provider family results while rejecting graph IDs outside this analysis. */
+export function mergeViolationLlmResults(
+  input: ViolationGenerationInput,
+  results: AllViolationsResult,
+): ViolationsResult {
+  const validServiceIds = new Set(input.services.map((service) => service.id));
+  const validDatabaseIds = new Set((input.databases || []).map((database) => database.id));
+  const validModuleIds = new Set((input.modules || []).map((module) => module.id));
+  const validMethodIds = new Set(
+    (input.methods || []).flatMap((method) => method.id ? [method.id] : []),
+  );
 
   // --- Merge results ---
   const allViolations: Violation[] = [];
@@ -218,53 +245,11 @@ export async function generateViolationsWithLifecycle(
   onCallDone?: (key: 'service' | 'database' | 'module', ok: boolean) => void,
 ): Promise<AllViolationsLifecycleResult> {
   const provider = externalProvider ?? createLLMProvider();
-
-  const archRules = (input.llmRules || []).filter((r) => r.category === 'service');
-  const dbRules = (input.llmRules || []).filter((r) => r.category === 'database');
-  const moduleRules = (input.llmRules || []).filter((r) => r.category === 'module');
-
-  const serviceDtos = input.services.map((s) => ({
-    id: s.id,
-    name: s.name,
-    type: s.type,
-    framework: s.framework,
-    fileCount: s.fileCount,
-    layers: extractLayerNames(s.layerSummary),
-  }));
-
-  const depDtos = input.dependencies.map((d) => ({
-    source: d.sourceServiceName,
-    target: d.targetServiceName,
-    count: d.dependencyCount || 0,
-    type: d.dependencyType || undefined,
-  }));
-
-  const serviceContext: ServiceViolationContext = {
-    architecture: input.architecture,
-    services: serviceDtos,
-    dependencies: depDtos,
-    llmRules: archRules,
-    existingViolations: input.existingServiceViolations,
-  };
-
-  const hasDBs = input.databases && input.databases.length > 0;
-  const dbContext: DatabaseViolationContext | undefined = hasDBs
-    ? { databases: input.databases!, llmRules: dbRules, existingViolations: input.existingDatabaseViolations }
-    : undefined;
-
-  const serviceNameToIdMap = new Map(serviceDtos.map((s) => [s.name, s.id]));
-
-  const hasModules = input.modules && input.modules.length > 0;
-  const moduleContext: ModuleViolationContext | undefined = hasModules
-    ? {
-        modules: input.modules!.map((m) => ({ ...m, serviceId: serviceNameToIdMap.get(m.serviceName) })),
-        methods: input.methods || [],
-        moduleDependencies: input.moduleDependencies || [],
-        methodDependencies: input.methodDependencies || [],
-        llmRules: moduleRules,
-        existingViolations: input.existingModuleViolations,
-      }
-    : undefined;
+  const {
+    service: serviceContext,
+    database: dbContext,
+    module: moduleContext,
+  } = buildViolationLlmContexts(input, 'lifecycle');
 
   const result = await provider.generateAllViolationsWithLifecycle({
     service: serviceContext,

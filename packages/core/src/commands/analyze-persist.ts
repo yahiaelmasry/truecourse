@@ -13,20 +13,24 @@
 
 import path from 'node:path';
 import { log } from '../lib/logger.js';
-import { setLastAnalyzed } from '../config/registry.js';
 import type { RegistryEntry } from '../config/registry.js';
 import {
-  appendHistory,
   buildAnalysisFilename,
-  deleteDiff,
-  writeAnalysis,
   writeDiff,
-  writeLatest,
+  promoteCompletedAnalysisBaseline,
 } from '../lib/analysis-store.js';
+import {
+  projectCompletedAnalysis,
+  type CompletedAnalysisProjectionIntent,
+} from '../lib/completed-analysis-projection.js';
+import {
+  makeViolationDenormalizer,
+  type CompletedAnalysisPromotion,
+} from '../lib/completed-analysis-promotion.js';
+import { PromotedAnalysisNotInLineageError } from '../lib/completed-analysis-lineage.js';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
-  Graph,
   HistoryEntry,
   LatestSnapshot,
   ViolationRecord,
@@ -50,14 +54,26 @@ export interface PersistFullResult {
   violationsSummary: { total: number; bySeverity: Record<string, number> };
 }
 
-export async function persistFullAnalysis(
+export interface FullAnalysisFinalizationPlan {
+  filename: string;
+  promotion: CompletedAnalysisPromotion;
+  projection: CompletedAnalysisProjectionIntent;
+  result: Omit<PersistFullResult, 'durationMs'>;
+}
+
+/**
+ * Build the exact completed-baseline and projection payloads for one full run.
+ * The legacy writer consumes this plan now; the recovery-safe run finalizer can
+ * consume it when production journal wiring is enabled, without reconstructing
+ * analysis state after provider work.
+ */
+export function buildFullAnalysisFinalizationPlan(
   project: RegistryEntry,
   core: AnalyzeCoreResult,
-  startedAt: number,
-): Promise<PersistFullResult> {
+): FullAnalysisFinalizationPlan {
   const filename = buildAnalysisFilename(core.analysisId, core.now);
 
-  const snapshot: AnalysisSnapshot = {
+  const snapshot = persistedJson<AnalysisSnapshot>({
     id: core.analysisId,
     createdAt: core.now,
     branch: core.branch,
@@ -72,34 +88,78 @@ export async function persistFullAnalysis(
       previousAnalysisId: core.previousAnalysisId,
     },
     usage: core.usage,
-  };
+  }, 'Analysis snapshot');
 
-  const latest = buildLatestSnapshot(
+  const latest = persistedJson(buildLatestSnapshot(
     snapshot,
     filename,
     core.pipelineResult.unchanged,
     core.pipelineResult.added,
-  );
-
+  ), 'LATEST snapshot');
+  const historyEntry = buildHistoryEntry(snapshot, filename, core.pipelineResult);
   const { bySeverity, total } = summarizeActiveViolations(latest.violations);
 
-  await writeAnalysis(project.path, snapshot);
-  await writeLatest(project.path, latest);
-  await appendHistory(project.path, buildHistoryEntry(snapshot, filename, core.pipelineResult));
+  return {
+    filename,
+    promotion: {
+      expectedBaseline: core.latestBaseline,
+      snapshot,
+      latest,
+    },
+    projection: {
+      projectSlug: project.slug,
+      promotedSnapshot: snapshot,
+      historyEntry,
+    },
+    result: {
+      analysisId: core.analysisId,
+      filename,
+      serviceCount: core.graph.services.length,
+      fileCount: core.analysisResult.fileAnalyses?.length ?? 0,
+      architecture: core.architecture,
+      violationsSummary: { total, bySeverity },
+    },
+  };
+}
 
-  // Baseline moved — any prior diff is obsolete.
-  await deleteDiff(project.path);
-  await setLastAnalyzed(project.slug, core.now);
+export async function persistFullAnalysis(
+  project: RegistryEntry,
+  core: AnalyzeCoreResult,
+  startedAt: number,
+): Promise<PersistFullResult> {
+  const plan = buildFullAnalysisFinalizationPlan(project, core);
+
+  const promotion = await promoteCompletedAnalysisBaseline(project.path, plan.promotion);
+  if (promotion.state === 'conflict') {
+    try {
+      await projectCompletedAnalysis(project.path, plan.projection);
+    } catch (error) {
+      if (!(error instanceof PromotedAnalysisNotInLineageError)) throw error;
+      throw new Error(
+        `Completed analysis baseline changed before promotion (current: ${promotion.currentBaselineId ?? 'none'})`,
+      );
+    }
+  } else {
+    await projectCompletedAnalysis(project.path, plan.projection);
+  }
 
   return {
-    analysisId: core.analysisId,
-    filename,
-    serviceCount: core.graph.services.length,
-    fileCount: core.analysisResult.fileAnalyses?.length ?? 0,
-    architecture: core.architecture,
+    ...plan.result,
     durationMs: Date.now() - startedAt,
-    violationsSummary: { total, bySeverity },
   };
+}
+
+/** Match the JSON persistence contract while keeping store validation strict. */
+function persistedJson<T>(value: T, label: string): T {
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new Error('value is not serializable');
+    return JSON.parse(serialized) as T;
+  } catch (error) {
+    throw new Error(
+      `${label} could not be converted to its persisted JSON form: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +199,7 @@ function buildLatestSnapshot(
   unchanged: ViolationRecord[],
   added: ViolationRecord[],
 ): LatestSnapshot {
-  const denormalize = makeDenormalizer(snapshot.graph);
+  const denormalize = makeViolationDenormalizer(snapshot.graph);
   return {
     head: filename,
     analysis: {
@@ -225,7 +285,7 @@ function buildDiffSnapshot(
   baseline: LatestSnapshot,
 ): DiffSnapshot {
   const { graph, changedFiles, pipelineResult } = core;
-  const denormalize = makeDenormalizer(graph);
+  const denormalize = makeViolationDenormalizer(graph);
 
   const newViolations = pipelineResult.added.map(denormalize);
 
@@ -296,19 +356,4 @@ function buildDiffSnapshot(
     },
     usage: core.usage,
   };
-}
-
-/** Denormalize a violation row against a graph — shared by full and diff. */
-function makeDenormalizer(graph: Graph): (v: ViolationRecord) => ViolationWithNames {
-  const serviceById = new Map(graph.services.map((s) => [s.id, s.name]));
-  const moduleById = new Map(graph.modules.map((m) => [m.id, m.name]));
-  const methodById = new Map(graph.methods.map((m) => [m.id, m.name]));
-  const databaseById = new Map(graph.databases.map((d) => [d.id, d.name]));
-  return (v) => ({
-    ...v,
-    targetServiceName: v.targetServiceId ? serviceById.get(v.targetServiceId) ?? null : null,
-    targetModuleName: v.targetModuleId ? moduleById.get(v.targetModuleId) ?? null : null,
-    targetMethodName: v.targetMethodId ? methodById.get(v.targetMethodId) ?? null : null,
-    targetDatabaseName: v.targetDatabaseId ? databaseById.get(v.targetDatabaseId) ?? null : null,
-  });
 }

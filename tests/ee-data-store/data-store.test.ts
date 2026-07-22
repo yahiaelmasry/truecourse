@@ -9,6 +9,8 @@ import type {
   LatestSnapshot,
   HistoryEntry,
   DiffSnapshot,
+  ViolationRecord,
+  ViolationWithNames,
 } from '@truecourse/core/types/snapshot';
 import { buildAnalysisFilename } from '@truecourse/core/lib/analysis-store';
 
@@ -37,10 +39,81 @@ const snap = (id: string, createdAt: string): AnalysisSnapshot =>
     architecture: 'monolith',
     status: 'completed',
     metadata: null,
-    graph: { services: [], modules: [], methods: [] },
+    graph: {
+      services: [],
+      serviceDependencies: [],
+      layers: [],
+      modules: [],
+      methods: [],
+      moduleDeps: [],
+      methodDeps: [],
+      databases: [],
+      databaseConnections: [],
+      flows: [],
+    },
     violations: { added: [], resolved: [], previousAnalysisId: null },
     usage: [],
   }) as unknown as AnalysisSnapshot;
+
+const latestFor = (snapshot: AnalysisSnapshot): LatestSnapshot => ({
+  head: buildAnalysisFilename(snapshot.id, snapshot.createdAt),
+  analysis: {
+    id: snapshot.id,
+    createdAt: snapshot.createdAt,
+    branch: snapshot.branch,
+    commitHash: snapshot.commitHash,
+    architecture: snapshot.architecture,
+    metadata: snapshot.metadata,
+    status: 'completed',
+  },
+  graph: snapshot.graph,
+  violations: [],
+});
+
+const violation = (
+  id: string,
+  status: ViolationRecord['status'],
+  createdAt: string,
+  overrides: Partial<ViolationRecord> = {},
+): ViolationRecord => ({
+  id,
+  type: 'code',
+  category: 'rule',
+  subcategory: null,
+  title: `Finding ${id}`,
+  content: 'finding content',
+  severity: 'high',
+  status,
+  targetServiceId: null,
+  targetDatabaseId: null,
+  targetModuleId: null,
+  targetMethodId: null,
+  targetTable: null,
+  relatedServiceId: null,
+  relatedModuleId: null,
+  fixPrompt: null,
+  ruleKey: 'test/rule',
+  firstSeenAnalysisId: 'first-analysis',
+  firstSeenAt: '2025-12-31T00:00:00.000Z',
+  previousViolationId: null,
+  resolvedAt: null,
+  filePath: 'src/example.ts',
+  lineStart: 1,
+  lineEnd: 1,
+  columnStart: 1,
+  columnEnd: 5,
+  snippet: 'value',
+  createdAt,
+  ...overrides,
+});
+
+const withNames = (row: ViolationRecord): ViolationWithNames => ({
+  ...row,
+  targetServiceName: null,
+  targetModuleName: null,
+  targetMethodName: null,
+  targetDatabaseName: null,
+});
 
 describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () => {
   it('writeAnalysis → readAnalysis / listAnalyses / findAnalysisFilename round-trip', async () => {
@@ -87,6 +160,237 @@ describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () 
     expect(await store.readDiff(REPO)).toBeNull();
   });
 
+  it('reconciles only diffs stale against the active completed baseline', async () => {
+    const store = new PgAnalysisStore(db);
+    const first = snap('a1', '2026-01-01T00:00:00.000Z');
+    await store.writeLatest(REPO, latestFor(first));
+    await store.writeDiff(REPO, { id: 'old', baseAnalysisId: 'older' } as unknown as DiffSnapshot);
+
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('removed-stale');
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('absent');
+
+    const second = snap('a2', '2026-01-02T00:00:00.000Z');
+    await store.writeLatest(REPO, latestFor(second));
+    const current = { id: 'current', baseAnalysisId: second.id } as unknown as DiffSnapshot;
+    await store.writeDiff(REPO, current);
+    // A delayed repair for the first promotion must preserve the newer diff.
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('current');
+    expect(await store.readDiff(REPO)).toEqual(current);
+
+    await store.writeDiff(REPO, {
+      id: 'old-repair',
+      baseAnalysisId: first.id,
+    } as unknown as DiffSnapshot);
+    await expect(store.reconcileDiffWithLatest(REPO)).resolves.toBe('removed-stale');
+    expect(await store.readDiff(REPO)).toBeNull();
+  });
+
+  it('preserves a diff when no completed baseline exists', async () => {
+    const store = new PgAnalysisStore(db);
+    const diff = { id: 'orphan', baseAnalysisId: 'missing' } as unknown as DiffSnapshot;
+    await store.writeDiff(REPO, diff);
+
+    await expect(store.reconcileDiffWithLatest(REPO)).rejects.toThrow(
+      'Cannot reconcile diff without an active completed baseline',
+    );
+    expect(await store.readDiff(REPO)).toEqual(diff);
+
+    const corrupt = latestFor(snap('corrupt', '2026-01-01T00:00:00.000Z'));
+    corrupt.head = 'wrong-head.json';
+    await store.writeLatest(REPO, corrupt);
+    await expect(store.reconcileDiffWithLatest(REPO)).rejects.toThrow(
+      'Cannot reconcile diff without an active completed baseline',
+    );
+    expect(await store.readDiff(REPO)).toEqual(diff);
+  });
+
+  it('promotes the completed baseline transactionally and rejects a stale expectation', async () => {
+    const store = new PgAnalysisStore(db);
+    const previous = snap('a1', '2026-01-01T00:00:00.000Z');
+    await store.writeAnalysis(REPO, previous);
+    const previousLatest = latestFor(previous);
+    const carriedPrevious = withNames(violation('carry-old', 'new', previous.createdAt));
+    const resolvedPrevious = withNames(violation('resolve-old', 'new', previous.createdAt, {
+      title: 'Resolved finding',
+    }));
+    previousLatest.violations = [carriedPrevious, resolvedPrevious];
+    await store.writeLatest(REPO, previousLatest);
+
+    const candidate = {
+      ...snap('a2', '2026-01-02T00:00:00.000Z'),
+    };
+    const added = violation('added-new', 'new', candidate.createdAt, {
+      firstSeenAnalysisId: candidate.id,
+      firstSeenAt: candidate.createdAt,
+      title: 'New finding',
+    });
+    candidate.violations = {
+      added: [added],
+      resolved: [{ id: resolvedPrevious.id, resolvedAt: candidate.createdAt }],
+      previousAnalysisId: previous.id,
+    };
+    const candidateLatest = latestFor(candidate);
+    candidateLatest.violations = [
+      withNames(added),
+      withNames(violation('carry-new', 'unchanged', candidate.createdAt, {
+        firstSeenAnalysisId: carriedPrevious.firstSeenAnalysisId,
+        firstSeenAt: carriedPrevious.firstSeenAt,
+        previousViolationId: carriedPrevious.id,
+      })),
+    ];
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: candidateLatest,
+    })).resolves.toEqual({
+      state: 'promoted',
+      filename: buildAnalysisFilename(candidate.id, candidate.createdAt),
+    });
+
+    const staleBaselineSnapshot = snap('stale-baseline', '2025-12-30T00:00:00.000Z');
+    const staleBaseline = latestFor(staleBaselineSnapshot);
+    const stale = {
+      ...snap('a3', '2026-01-03T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: staleBaselineSnapshot.id },
+    };
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: staleBaseline,
+      snapshot: stale,
+      latest: latestFor(stale),
+    })).resolves.toEqual({ state: 'conflict', currentBaselineId: candidate.id });
+    expect((await store.readLatest(REPO))?.analysis.id).toBe(candidate.id);
+    expect(await store.readAnalysis(REPO, buildAnalysisFilename(stale.id, stale.createdAt))).toBeNull();
+  });
+
+  it('rolls back a pre-commit fault and recognizes a retry after a post-commit fault', async () => {
+    const store = new PgAnalysisStore(db);
+    const previous = snap('a1', '2026-01-01T00:00:00.000Z');
+    await store.writeAnalysis(REPO, previous);
+    const previousLatest = latestFor(previous);
+    await store.writeLatest(REPO, previousLatest);
+
+    const candidate = {
+      ...snap('a2', '2026-01-02T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const promotion = {
+      expectedBaseline: previousLatest,
+      snapshot: candidate,
+      latest: latestFor(candidate),
+    };
+    const filename = buildAnalysisFilename(candidate.id, candidate.createdAt);
+
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-prepare') throw new Error('injected transaction rollback');
+      },
+    })).rejects.toThrow('injected transaction rollback');
+    expect((await store.readLatest(REPO))?.analysis.id).toBe(previous.id);
+    expect(await store.readAnalysis(REPO, filename)).toBeNull();
+
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, promotion, {
+      faultInjector: (point) => {
+        if (point === 'after-commit') throw new Error('injected ambiguous commit');
+      },
+    })).rejects.toThrow('injected ambiguous commit');
+    expect((await store.readLatest(REPO))?.analysis.id).toBe(candidate.id);
+    await expect(store.promoteCompletedAnalysisBaseline(REPO, promotion)).resolves.toEqual({
+      state: 'already-promoted',
+      filename,
+    });
+  });
+
+  it('atomically admits only one of two promotions from the same completed baseline', async () => {
+    const firstStore = new PgAnalysisStore(db);
+    const secondStore = new PgAnalysisStore(db);
+    const previous = snap('a1', '2026-01-01T00:00:00.000Z');
+    await firstStore.writeAnalysis(REPO, previous);
+    const previousLatest = latestFor(previous);
+    await firstStore.writeLatest(REPO, previousLatest);
+
+    const first = {
+      ...snap('a2', '2026-01-02T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const second = {
+      ...snap('a3', '2026-01-03T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: previous.id },
+    };
+    const results = await Promise.all([
+      firstStore.promoteCompletedAnalysisBaseline(REPO, {
+        expectedBaseline: previousLatest,
+        snapshot: first,
+        latest: latestFor(first),
+      }),
+      secondStore.promoteCompletedAnalysisBaseline(REPO, {
+        expectedBaseline: previousLatest,
+        snapshot: second,
+        latest: latestFor(second),
+      }),
+    ]);
+
+    expect(results.map((result) => result.state).sort()).toEqual(['conflict', 'promoted']);
+    const currentId = (await firstStore.readLatest(REPO))?.analysis.id;
+    expect([first.id, second.id]).toContain(currentId);
+    const losing = currentId === first.id ? second : first;
+    expect(await firstStore.readAnalysis(
+      REPO,
+      buildAnalysisFilename(losing.id, losing.createdAt),
+    )).toBeNull();
+  });
+
+  it('certifies exact completed lineage and rejects ambiguous hosted ancestors', async () => {
+    const store = new PgAnalysisStore(db);
+    const first = snap('lineage-a1', '2026-01-01T00:00:00.000Z');
+    const firstLatest = latestFor(first);
+    await store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: null,
+      snapshot: first,
+      latest: firstLatest,
+    });
+    const second = {
+      ...snap('lineage-a2', '2026-01-02T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: first.id },
+    };
+    await store.promoteCompletedAnalysisBaseline(REPO, {
+      expectedBaseline: firstLatest,
+      snapshot: second,
+      latest: latestFor(second),
+    });
+
+    await expect(store.certifyCompletedAnalysisLineage(REPO, first)).resolves.toEqual({
+      activeAnalysisId: second.id,
+      generations: 1,
+    });
+
+    const cyclic = {
+      ...snap('cyclic', '2026-01-03T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: 'cyclic' },
+    };
+    await store.writeAnalysis(REPO, cyclic);
+    await store.writeLatest(REPO, latestFor(cyclic));
+    await expect(store.certifyCompletedAnalysisLineage(
+      REPO,
+      snap('not-in-cycle', '2026-01-03T12:00:00.000Z'),
+    )).rejects.toThrow(
+      'Completed-analysis lineage contains a cycle',
+    );
+
+    const duplicateOne = snap('duplicate', '2026-01-04T00:00:00.000Z');
+    const duplicateTwo = snap('duplicate', '2026-01-05T00:00:00.000Z');
+    const current = {
+      ...snap('lineage-a3', '2026-01-06T00:00:00.000Z'),
+      violations: { added: [], resolved: [], previousAnalysisId: 'duplicate' },
+    };
+    await store.writeAnalysis(REPO, duplicateOne);
+    await store.writeAnalysis(REPO, duplicateTwo);
+    await store.writeAnalysis(REPO, current);
+    await store.writeLatest(REPO, latestFor(current));
+    await expect(store.certifyCompletedAnalysisLineage(REPO, duplicateOne)).rejects.toThrow(
+      'Completed-analysis lineage contains duplicate analysis IDs',
+    );
+  });
+
   it('appendHistory accumulates; removeFromHistory drops by analysis id', async () => {
     const store = new PgAnalysisStore(db);
     expect((await store.readHistory(REPO)).analyses).toEqual([]);
@@ -99,6 +403,42 @@ describe('PgAnalysisStore (analyses / analysis_current / analysis_history)', () 
 
     await store.removeFromHistory(REPO, 'a1');
     expect((await store.readHistory(REPO)).analyses.map((e) => e.id)).toEqual(['a2']);
+  });
+
+  it('ensures one exact history entry and orders late recovery by analysis time', async () => {
+    const store = new PgAnalysisStore(db);
+    const entry = (id: string, createdAt: string): HistoryEntry => ({
+      id,
+      filename: `f-${id}`,
+      createdAt,
+    } as unknown as HistoryEntry);
+    const later = entry('later', '2026-01-02T00:00:00.000Z');
+    const earlier = entry('earlier', '2026-01-01T00:00:00.000Z');
+
+    await expect(store.ensureHistoryEntry(REPO, later)).resolves.toBe('inserted');
+    await expect(store.ensureHistoryEntry(REPO, earlier)).resolves.toBe('inserted');
+    await expect(store.ensureHistoryEntry(REPO, earlier)).resolves.toBe('present');
+    expect((await store.readHistory(REPO)).analyses).toEqual([earlier, later]);
+
+    await expect(store.ensureHistoryEntry(REPO, {
+      ...earlier,
+      filename: 'conflicting.json',
+    })).rejects.toThrow('History entry conflicts with the stored analysis ID');
+  });
+
+  it('rejects history entries that jsonb persistence would change', async () => {
+    const store = new PgAnalysisStore(db);
+    const entry = {
+      id: 'non-json-entry',
+      filename: 'non-json-entry.json',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      metadata: { values: [undefined] },
+    } as unknown as HistoryEntry;
+
+    await expect(store.ensureHistoryEntry(REPO, entry)).rejects.toThrow(
+      'History entry must be exactly JSON-round-trippable',
+    );
+    expect((await store.readHistory(REPO)).analyses).toEqual([]);
   });
 
   it('keys by repoKey — a different repo sees nothing', async () => {

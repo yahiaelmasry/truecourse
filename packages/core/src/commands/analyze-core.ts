@@ -29,7 +29,14 @@ import { createLLMProvider, type LLMProvider } from '../services/llm/provider.js
 import { getDefaultTransport, type LlmTransport } from '@truecourse/shared/llm';
 import { toUsageRecords } from '../services/usage.service.js';
 import { readLatest } from '../lib/analysis-store.js';
-import { acquireAnalyzeLock, releaseAnalyzeLock } from '../lib/atomic-write.js';
+import { withAnalyzeLifecycleLock } from '../lib/analyze-lifecycle-lock.js';
+import {
+  dispatchAnalyzeRun,
+  readAnalyzeRun,
+  type AnalyzeRunSource,
+} from '../lib/analyze-run-journal.js';
+import { readAnalyzeRunResumeCandidate } from '../lib/analyze-run-resume-candidate.js';
+import { CertifiedViolationResumeUnavailableError } from '../services/llm/certified-violation-phase.js';
 import type { Graph, LatestSnapshot, UsageRecord, ViolationRecord } from '../types/snapshot.js';
 import type { StepTracker } from '../progress.js';
 
@@ -138,6 +145,12 @@ export interface AnalyzeCoreOptions {
    */
   selectedModel?: string;
   signal?: AbortSignal;
+  /** Adapter identity used by the durable attempted-run journal. */
+  source?: AnalyzeRunSource;
+  /** @internal Full wrapper owns the matching prepared-finalization callback. */
+  journalFullRun?: boolean;
+  /** @internal Exact durable attempted run selected for production reconstruction. */
+  resumeFullRunId?: string;
 }
 
 export interface AnalyzeCoreResult {
@@ -165,98 +178,155 @@ export async function analyzeCore(
   project: RegistryEntry,
   options: AnalyzeCoreOptions,
 ): Promise<AnalyzeCoreResult> {
+  return analyzeCoreAndFinalize(project, options, async (core) => core);
+}
+
+/**
+ * Compute and finalize one analysis while retaining the repository lifecycle
+ * lock. Full/diff wrappers use this so persistence cannot race another run.
+ *
+ * @internal
+ */
+export async function analyzeCoreAndFinalize<T>(
+  project: RegistryEntry,
+  options: AnalyzeCoreOptions,
+  finalize: (core: AnalyzeCoreResult) => Promise<T>,
+  beforeCompute?: () => Promise<
+    | Readonly<{ handled: true; result: T }>
+    | Readonly<{ handled: false }>
+  >,
+): Promise<T> {
+  return withAnalyzeLifecycleLock(project.path, async () => {
+    const early = await beforeCompute?.();
+    if (early?.handled) return early.result;
+    const core = await computeAnalyzeCore(project, options);
+    return finalize(core);
+  });
+}
+
+async function computeAnalyzeCore(
+  project: RegistryEntry,
+  options: AnalyzeCoreOptions,
+): Promise<AnalyzeCoreResult> {
   // Code lives at `codeDir` (the repo, or a clone in EE); storage keys off
   // `project.path` (a path in OSS, an opaque identity in EE).
   const codeDir = options.codeDir ?? project.path;
 
-  // Single lock protects both modes. A diff while an analyze is in-flight (or
-  // vice versa) corrupts LATEST / diff.json invariants, so block both. Keyed by
-  // the STORAGE identity (`project.path`) — not the code dir — so in EE two
-  // analyses of the same repo serialize even though each clones into its own
-  // temp dir (the EE impl is a `pg_advisory_lock`). If acquire throws we never
-  // entered the body below, so the lock is not held and needs no release.
-  await acquireAnalyzeLock(project.path);
+  const { mode, signal } = options;
+  const isDiff = mode === 'diff';
+  if (options.resumeFullRunId && (isDiff || options.journalFullRun)) {
+    throw new Error('Certified Resume is available only for one existing full analyze run');
+  }
+  const resumeCandidate = options.resumeFullRunId
+    ? await readAnalyzeRunResumeCandidate(project.path, options.resumeFullRunId)
+    : null;
+  if (options.resumeFullRunId && !resumeCandidate) {
+    throw new CertifiedViolationResumeUnavailableError('run-not-found');
+  }
+  const resumeExecution = resumeCandidate && resumeCandidate.plan !== 'unsealed'
+    ? resumeCandidate.plan.execution
+    : null;
+  if (resumeCandidate && !resumeExecution) {
+    throw new CertifiedViolationResumeUnavailableError('checkpoint-execution-changed');
+  }
+  const skipGit = !isDiff && !!options.skipGit;
+  if (resumeCandidate && (!options.skipStash || skipGit)) {
+    throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+  }
+  const projectConfig = await readProjectConfig(project.path);
 
-  try {
-    const { mode, signal } = options;
-    const isDiff = mode === 'diff';
-    const skipGit = !isDiff && !!options.skipGit;
-    const projectConfig = await readProjectConfig(project.path);
+  const latestBaseline = await readLatest(project.path);
+  if (isDiff && !latestBaseline) {
+    throw new Error('Run a full analysis first before checking a diff.');
+  }
 
-    const latestBaseline = await readLatest(project.path);
-    if (isDiff && !latestBaseline) {
-      throw new Error('Run a full analysis first before checking a diff.');
-    }
-
-    // ------------------------------------------------------------
-    // Branch / commit metadata
-    // ------------------------------------------------------------
-    let branch: string | null = options.branch ?? null;
-    let commitHash: string | null = options.commitHash ?? null;
-    if (isDiff) {
-      // Diff inherits branch from the baseline so the violation pipeline can
-      // compare like-for-like. Commit hash reflects the working tree's HEAD.
-      branch = latestBaseline!.analysis.branch ?? branch;
-      if (commitHash === null) {
-        try {
-          const git = await getGit(codeDir);
-          commitHash = (await git.revparse(['HEAD'])).trim() || null;
-        } catch {
-          commitHash = null;
-        }
-      }
-    } else if (!skipGit && (branch === null || commitHash === null)) {
-      const git = await getGit(codeDir);
-      if (branch === null) branch = (await git.branch()).current || null;
-      if (commitHash === null) commitHash = (await git.revparse(['HEAD'])).trim();
-    }
-
-    const analysisId = randomUUID();
-    const now = new Date().toISOString();
-    const start = Date.now();
-
-    const effectiveCategories = options.enabledCategoriesOverride?.length
-      ? options.enabledCategoriesOverride
-      : projectConfig.enabledCategories ?? undefined;
-    const effectiveLlmRules =
-      projectConfig.enableLlmRules ?? options.enableLlmRulesOverride ?? true;
-
-    // ------------------------------------------------------------
-    // Stash dirty working tree so the entire pipeline (parse + LLM scan +
-    // persist) sees the committed state. Diff mode never stashes — it
-    // analyzes the working tree by design.
-    // ------------------------------------------------------------
-    let didStash = false;
-    let stashGit: Awaited<ReturnType<typeof getGit>> | undefined;
-    if (!isDiff && !skipGit && !options.skipStash) {
+  // ------------------------------------------------------------
+  // Branch / commit metadata
+  // ------------------------------------------------------------
+  let branch: string | null = options.branch ?? null;
+  let commitHash: string | null = options.commitHash ?? null;
+  if (isDiff) {
+    // Diff inherits branch from the baseline so the violation pipeline can
+    // compare like-for-like. Commit hash reflects the working tree's HEAD.
+    branch = latestBaseline!.analysis.branch ?? branch;
+    if (commitHash === null) {
       try {
-        stashGit = await getGit(codeDir);
-        const status = await stashGit.status();
-        if (!status.isClean()) {
-          const gitRoot = (await stashGit.revparse(['--show-toplevel'])).trim();
-          // Skip stashing when the repo path is a subdirectory of a larger
-          // repo (e.g., test fixtures inside the main repo). Stashing there
-          // would touch unrelated parent-repo files.
-          const isSubdirectory = path.resolve(codeDir) !== path.resolve(gitRoot);
-          if (!isSubdirectory) {
-            options.tracker?.detail('parse', 'Stashing pending changes...');
-            options.onProgress?.({ detail: 'Stashing pending changes to analyze committed state...' });
-            const stashResult = await stashGit.stash([
-              'push',
-              '--include-untracked',
-              '-m',
-              'truecourse-analysis-stash',
-            ]);
-            // git stash push prints "No local changes to save" if nothing to stash
-            didStash = !stashResult.includes('No local changes');
-          }
-        }
-      } catch (error) {
-        log.warn(
-          `[Analyzer] Failed to stash changes, analyzing current state: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        const git = await getGit(codeDir);
+        commitHash = (await git.revparse(['HEAD'])).trim() || null;
+      } catch {
+        commitHash = null;
       }
     }
+  } else if (resumeCandidate && !skipGit) {
+    const git = await getGit(codeDir);
+    branch = (await git.branch()).current || null;
+    commitHash = (await git.revparse(['HEAD'])).trim();
+  } else if (!skipGit && (branch === null || commitHash === null)) {
+    const git = await getGit(codeDir);
+    if (branch === null) branch = (await git.branch()).current || null;
+    if (commitHash === null) commitHash = (await git.revparse(['HEAD'])).trim();
+  }
+
+  if (resumeCandidate && options.skipStash && !skipGit) {
+    const git = await getGit(codeDir);
+    const status = await git.status();
+    const hasUserChanges = status.files.some(({ path: changedPath }) =>
+      !isTruecourseStatePath(changedPath));
+    if (hasUserChanges) {
+      throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+    }
+  }
+
+  const analysisId = resumeCandidate?.candidateAnalysisId ?? randomUUID();
+  const now = resumeCandidate?.startedAt ?? new Date().toISOString();
+  const start = Date.now();
+
+  const effectiveCategories = options.enabledCategoriesOverride?.length
+    ? options.enabledCategoriesOverride
+    : projectConfig.enabledCategories ?? undefined;
+  const effectiveLlmRules =
+    projectConfig.enableLlmRules ?? options.enableLlmRulesOverride ?? true;
+
+  // ------------------------------------------------------------
+  // Stash dirty working tree so the entire pipeline (parse + LLM scan +
+  // persist) sees the committed state. Diff mode never stashes — it
+  // analyzes the working tree by design.
+  // ------------------------------------------------------------
+  let didStash = false;
+  let stashGit: Awaited<ReturnType<typeof getGit>> | undefined;
+  let certifiedRunId: string | undefined;
+  if (!isDiff && !skipGit && !options.skipStash) {
+    try {
+      stashGit = await getGit(codeDir);
+      const status = await stashGit.status();
+      if (!status.isClean()) {
+        const gitRoot = (await stashGit.revparse(['--show-toplevel'])).trim();
+        // Skip stashing when the repo path is a subdirectory of a larger
+        // repo (e.g., test fixtures inside the main repo). Stashing there
+        // would touch unrelated parent-repo files.
+        const isSubdirectory = path.resolve(codeDir) !== path.resolve(gitRoot);
+        if (!isSubdirectory) {
+          options.tracker?.detail('parse', 'Stashing pending changes...');
+          options.onProgress?.({ detail: 'Stashing pending changes to analyze committed state...' });
+          const stashResult = await stashGit.stash([
+            'push',
+            '--include-untracked',
+            '-m',
+            'truecourse-analysis-stash',
+          ]);
+          // git stash push prints "No local changes to save" if nothing to stash
+          didStash = !stashResult.includes('No local changes');
+        }
+      }
+    } catch (error) {
+      log.warn(
+        `[Analyzer] Failed to stash changes, analyzing current state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      if (resumeCandidate) {
+        throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+      }
+    }
+  }
 
   try {
     // ------------------------------------------------------------
@@ -368,7 +438,10 @@ export async function analyzeCore(
     const provider =
       options.provider ??
       (effectiveLlmRules
-        ? createLLMProvider(options.transport ?? getDefaultTransport(), options.selectedModel)
+        ? createLLMProvider(
+            options.transport ?? getDefaultTransport(),
+            resumeExecution ? resumeExecution.requestedModel : options.selectedModel,
+          )
         : undefined);
     if (provider) {
       provider.setAnalysisId(analysisId);
@@ -393,6 +466,45 @@ export async function analyzeCore(
       disabledRules: projectConfig.disabledRules,
       provider,
       signal,
+      certifiedLlmRun: options.journalFullRun
+        && !isDiff
+        && options.source
+        && (!latestBaseline || latestBaseline.analysis.branch === branch)
+        ? {
+            repositoryKey: project.path,
+            repositoryRoot: codeDir,
+            runId: randomUUID(),
+            candidateAnalysisId: analysisId,
+            startedAt: now,
+            source: options.source,
+            branch,
+            commitHash,
+            completedBaselineId: latestBaseline?.analysis.id ?? null,
+          }
+        : undefined,
+      certifiedLlmResume: resumeCandidate
+        ? {
+            run: {
+              repositoryKey: project.path,
+              repositoryRoot: codeDir,
+              runId: resumeCandidate.runId,
+              candidateAnalysisId: resumeCandidate.candidateAnalysisId,
+              startedAt: resumeCandidate.startedAt,
+              source: resumeCandidate.source,
+              branch,
+              commitHash,
+              completedBaselineId: latestBaseline?.analysis.id ?? null,
+            },
+            activatedAt: timestampAtOrAfter(
+              resumeCandidate.blocked?.blockedAt
+                ?? resumeCandidate.executionAttempt.activatedAt,
+            ),
+            admittedAt: timestampAtOrAfter(
+              resumeCandidate.blocked?.blockedAt
+                ?? resumeCandidate.executionAttempt.activatedAt,
+            ),
+          }
+        : undefined,
       onLlmEstimate: options.onLlmEstimate
         ? async (estimate) => {
             const proceed = await options.onLlmEstimate!(estimate);
@@ -401,6 +513,7 @@ export async function analyzeCore(
           }
         : undefined,
     });
+    certifiedRunId = pipelineResult.certifiedLlmExecution?.runId;
 
     // Apply LLM-generated service descriptions to the graph in-place.
     if (pipelineResult.serviceDescriptions.length > 0) {
@@ -411,7 +524,9 @@ export async function analyzeCore(
     }
 
     // Drain LLM usage before the pipelineResult is frozen into a snapshot.
-    const usage = provider ? toUsageRecords(provider.flushUsage()) : [];
+    const usage = pipelineResult.certifiedLlmExecution?.usage
+      ? [...pipelineResult.certifiedLlmExecution.usage]
+      : provider ? toUsageRecords(provider.flushUsage()) : [];
 
     // Contract verification has been decoupled from `analyze`. The
     // rule engine and the contract verifier answer different questions
@@ -454,21 +569,37 @@ export async function analyzeCore(
       previousAnalysisId,
       analysisResult: result,
     };
-    } finally {
-      if (didStash && stashGit) {
-        options.tracker?.detail('parse', 'Restoring pending changes...');
-        options.onProgress?.({ detail: 'Restoring pending changes...' });
-        try {
-          await stashGit.stash(['pop']);
-        } catch (error) {
-          log.error(
-            `[Analyzer] Failed to restore stashed changes. Run "git stash pop" manually. ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
+  } catch (error) {
+    if (certifiedRunId) {
+      const attempted = await readAnalyzeRun(
+        project.path,
+        { runId: certifiedRunId },
+      ).catch(() => null);
+      if (attempted?.state === 'running') {
+        await dispatchAnalyzeRun(project.path, {
+          kind: 'fail',
+          runId: certifiedRunId,
+          failedAt: new Date(Math.max(Date.now(), Date.parse(attempted.updatedAt))).toISOString(),
+          error: {
+            code: 'ANALYZE_CORE_FAILED',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
       }
     }
+    throw error;
   } finally {
-    await releaseAnalyzeLock(project.path);
+    if (didStash && stashGit) {
+      options.tracker?.detail('parse', 'Restoring pending changes...');
+      options.onProgress?.({ detail: 'Restoring pending changes...' });
+      try {
+        await stashGit.stash(['pop']);
+      } catch (error) {
+        log.error(
+          `[Analyzer] Failed to restore stashed changes. Run "git stash pop" manually. ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
   }
 }
 
@@ -491,3 +622,11 @@ function enforceLocationInvariant(violations: ViolationRecord[]): void {
   }
 }
 
+function timestampAtOrAfter(notBefore: string): string {
+  return new Date(Math.max(Date.now(), Date.parse(notBefore))).toISOString();
+}
+
+function isTruecourseStatePath(changedPath: string): boolean {
+  const normalized = changedPath.replaceAll('\\', '/');
+  return normalized === '.truecourse' || normalized.startsWith('.truecourse/');
+}
