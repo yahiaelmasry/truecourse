@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Loader2, Trash2, Coins } from 'lucide-react';
 import type { AnalysisSummary } from '@/lib/api';
-import type { AnalyzeRunStatusResponse } from '@truecourse/shared';
+import type { AnalyzeRunAmbiguousRearmConsent, AnalyzeRunStatusResponse } from '@truecourse/shared';
 import { UsageDetailPanel } from './UsageDetailPanel';
 import { AnalysisRunStatusCard } from './AnalysisRunStatusCard';
 
@@ -18,9 +18,12 @@ type AnalysesPanelProps = {
   runStatusError: string | null;
   resumeRunId: string | null;
   resumeError: string | null;
+  rearmRunId: string | null;
+  rearmError: string | null;
   startOverRunId: string | null;
   startOverError: string | null;
   onResume: (runId: string) => Promise<void>;
+  onRearm: (runId: string, consent: AnalyzeRunAmbiguousRearmConsent) => Promise<void>;
   onStartOver: (runId: string) => Promise<void>;
 };
 
@@ -114,9 +117,12 @@ export function AnalysesPanel({
   runStatusError,
   resumeRunId,
   resumeError,
+  rearmRunId,
+  rearmError,
   startOverRunId,
   startOverError,
   onResume,
+  onRearm,
   onStartOver,
 }: AnalysesPanelProps) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -164,9 +170,12 @@ export function AnalysesPanel({
           status={runStatus}
           resumeRunId={resumeRunId}
           resumeError={resumeError}
+          rearmRunId={rearmRunId}
+          rearmError={rearmError}
           startOverRunId={startOverRunId}
           startOverError={startOverError}
           onResume={onResume}
+          onRearm={onRearm}
           onStartOver={onStartOver}
         />
       ) : runStatusLoading ? (

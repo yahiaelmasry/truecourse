@@ -5,6 +5,7 @@ import type { AnalyzeRunStatusResponse } from '@truecourse/shared';
 const api = vi.hoisted(() => ({
   getAnalyzeRunStatus: vi.fn(),
   resumeAnalyzeRun: vi.fn(),
+  rearmAnalyzeRun: vi.fn(),
   analyzeRepo: vi.fn(),
 }));
 
@@ -17,6 +18,7 @@ describe('useAnalyzeRunStatus', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     api.getAnalyzeRunStatus.mockReset();
     api.resumeAnalyzeRun.mockReset();
+    api.rearmAnalyzeRun.mockReset();
     api.analyzeRepo.mockReset();
   });
 
@@ -45,6 +47,36 @@ describe('useAnalyzeRunStatus', () => {
     await waitFor(() => expect(result.current.status?.latestAttempt?.state).toBe('blocked'));
     expect(result.current.error).toBeNull();
     expect(api.getAnalyzeRunStatus).toHaveBeenCalledTimes(3);
+  });
+
+  it('posts the captured rearm consent once and reconciles authoritative status', async () => {
+    api.getAnalyzeRunStatus
+      .mockResolvedValueOnce(status('blocked'))
+      .mockResolvedValueOnce(status('running', 'rearm'));
+    api.rearmAnalyzeRun.mockResolvedValueOnce({ message: 'Analysis Rearm started', repoId: 'repo-1', runId: 'run-1', mode: 'rearm' });
+    const consent = { evidence: { runId: 'run-1', runRevision: 7, executionEpoch: { kind: 'initial' as const, attemptNumber: 1, activatedAt: '2026-07-22T08:05:00.000Z' }, admittedAt: '2026-07-22T08:06:00.000Z', pendingWorkCount: 1 }, acceptedRisk: 'repeat-up-to-pending-provider-calls' as const, acceptedMaxRepeatProviderCalls: 1 };
+    const { result } = renderHook(() => useAnalyzeRunStatus('repo-1'));
+    await waitFor(() => expect(result.current.status).not.toBeNull());
+    await act(async () => result.current.rearm('run-1', consent));
+    expect(api.rearmAnalyzeRun).toHaveBeenCalledWith('repo-1', 'run-1', consent);
+    expect(result.current.status?.activeMode).toBe('rearm');
+  });
+
+  it('keeps an accepted rearm protected when the immediate status refresh fails', async () => {
+    api.getAnalyzeRunStatus
+      .mockResolvedValueOnce(status('blocked'))
+      .mockRejectedValueOnce(new Error('status temporarily unavailable'));
+    api.rearmAnalyzeRun.mockResolvedValueOnce({ message: 'Analysis Rearm started', repoId: 'repo-1', runId: 'run-1', mode: 'rearm' });
+    const consent = { evidence: { runId: 'run-1', runRevision: 7, executionEpoch: { kind: 'initial' as const, attemptNumber: 1, activatedAt: '2026-07-22T08:05:00.000Z' }, admittedAt: '2026-07-22T08:06:00.000Z', pendingWorkCount: 1 }, acceptedRisk: 'repeat-up-to-pending-provider-calls' as const, acceptedMaxRepeatProviderCalls: 1 };
+    const { result } = renderHook(() => useAnalyzeRunStatus('repo-1'));
+    await waitFor(() => expect(result.current.status).not.toBeNull());
+
+    await act(async () => result.current.rearm('run-1', consent));
+
+    expect(api.rearmAnalyzeRun).toHaveBeenCalledWith('repo-1', 'run-1', consent);
+    expect(result.current.rearmRunId).toBe('run-1');
+    expect(result.current.rearmError).toBeNull();
+    expect(result.current.error).toBe('status temporarily unavailable');
   });
 
   it('does not read the local-only endpoint when disabled', async () => {
@@ -331,6 +363,7 @@ function status(
             scope: 'structural',
             reason: 'run-not-resumable',
           },
+      rearm: null,
       startOver: {
         available: true,
         requiresExactAttempt: true,

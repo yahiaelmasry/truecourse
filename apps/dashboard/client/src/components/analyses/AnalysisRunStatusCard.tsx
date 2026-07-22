@@ -2,6 +2,8 @@ import { useRef, useState } from 'react';
 import { Clock, Loader2, RotateCcw, ShieldCheck } from 'lucide-react';
 import type {
   AnalyzeRunResumeUnavailableReason,
+  AnalyzeRunAmbiguousRearmOffer,
+  AnalyzeRunAmbiguousRearmConsent,
   AnalyzeRunStartOverUnavailableReason,
   AnalyzeRunStatusResponse,
 } from '@truecourse/shared';
@@ -19,9 +21,12 @@ interface AnalysisRunStatusCardProps {
   status: AnalyzeRunStatusResponse;
   resumeRunId: string | null;
   resumeError: string | null;
+  rearmRunId: string | null;
+  rearmError: string | null;
   startOverRunId: string | null;
   startOverError: string | null;
   onResume: (runId: string) => Promise<void>;
+  onRearm: (runId: string, consent: AnalyzeRunAmbiguousRearmConsent) => Promise<void>;
   onStartOver: (runId: string) => Promise<void>;
 }
 
@@ -46,9 +51,12 @@ export function AnalysisRunStatusCard({
   status,
   resumeRunId,
   resumeError,
+  rearmRunId,
+  rearmError,
   startOverRunId,
   startOverError,
   onResume,
+  onRearm,
   onStartOver,
 }: AnalysisRunStatusCardProps) {
   const attempt = status.latestAttempt;
@@ -57,6 +65,9 @@ export function AnalysisRunStatusCard({
     runId: string;
     savedSuccesses: number;
     completedAnalysisId: string | null;
+  } | null>(null);
+  const [rearmConfirmation, setRearmConfirmation] = useState<{
+    runId: string; offer: AnalyzeRunAmbiguousRearmOffer;
   } | null>(null);
   const [confirmationError, setConfirmationError] = useState<string | null>(null);
   const [isConfirming, setIsConfirming] = useState(false);
@@ -74,6 +85,26 @@ export function AnalysisRunStatusCard({
       setConfirmationError(
         cause instanceof Error ? cause.message : 'Unable to start replacement analysis',
       );
+    } finally {
+      confirmingRef.current = false;
+      setIsConfirming(false);
+    }
+  };
+  const confirmRearm = async () => {
+    if (!rearmConfirmation || confirmingRef.current || status.activeMode !== null) return;
+    confirmingRef.current = true;
+    setIsConfirming(true);
+    setConfirmationError(null);
+    const { runId, offer } = rearmConfirmation;
+    try {
+      await onRearm(runId, {
+        evidence: structuredClone(offer.evidence),
+        acceptedRisk: 'repeat-up-to-pending-provider-calls',
+        acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls,
+      });
+      setRearmConfirmation(null);
+    } catch (cause) {
+      setConfirmationError(cause instanceof Error ? cause.message : 'Unable to start Analyze Rearm');
     } finally {
       confirmingRef.current = false;
       setIsConfirming(false);
@@ -136,6 +167,7 @@ export function AnalysisRunStatusCard({
                   disabled={
                     resumeRunId === attempt.runId
                     || startOverRunId !== null
+                    || rearmRunId !== null
                     || status.activeMode !== null
                   }
                   onClick={() => void onResume(attempt.runId)}
@@ -171,6 +203,25 @@ export function AnalysisRunStatusCard({
                 Resume unavailable — {unavailableMessages[attempt.resume.reason]}.
               </div>
             )}
+            {attempt.rearm && (
+              <div className="space-y-2 rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-[11px] leading-4 text-muted-foreground">
+                <Button type="button" size="sm" variant="outline"
+                  disabled={status.activeMode !== null || resumeRunId !== null || startOverRunId !== null || rearmRunId !== null}
+                  onClick={() => { setRearmConfirmation({ runId: attempt.runId, offer: structuredClone(attempt.rearm!) }); setConfirmationError(null); }}>
+                  {(rearmRunId === attempt.runId || status.activeMode === 'rearm') && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  {rearmRunId === attempt.runId
+                    ? 'Starting Analyze Rearm…'
+                    : status.activeMode === 'rearm'
+                      ? 'Rearming…'
+                      : 'Rearm ambiguous execution'}
+                </Button>
+                {rearmRunId === attempt.runId && (
+                  <div role="status">Analyze Rearm was accepted. Refreshing Latest run…</div>
+                )}
+                <div>One prior provider call may have completed without a durable receipt. At most {attempt.rearm.maxRepeatProviderCalls} provider {attempt.rearm.maxRepeatProviderCalls === 1 ? 'call' : 'calls'} may repeat; {attempt.rearm.checkpointedWorkCount} saved {attempt.rearm.checkpointedWorkCount === 1 ? 'check' : 'checks'} remain eligible for reuse after revalidation.</div>
+                {rearmError && <div className="text-destructive" role="alert">{rearmError}</div>}
+              </div>
+            )}
             {attempt.startOver.available ? (
               <div className="space-y-2 rounded-md border border-destructive/25 bg-destructive/5 p-2 text-[11px] leading-4 text-muted-foreground">
                 <Button
@@ -181,6 +232,7 @@ export function AnalysisRunStatusCard({
                     status.activeMode !== null
                     || resumeRunId !== null
                     || startOverRunId !== null
+                    || rearmRunId !== null
                   }
                   onClick={() => {
                     setConfirmation({
@@ -292,13 +344,34 @@ export function AnalysisRunStatusCard({
             <Button
               type="button"
               variant="destructive"
-              disabled={isConfirming || status.activeMode !== null || startOverRunId !== null}
+              disabled={isConfirming || status.activeMode !== null || startOverRunId !== null || rearmRunId !== null}
               onClick={() => void confirmStartOver()}
             >
               {isConfirming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
               Start over and analyze
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={rearmConfirmation !== null} onOpenChange={(open) => { if (!open && !isConfirming) { setRearmConfirmation(null); setConfirmationError(null); } }}>
+        <DialogContent>
+          <DialogHeader><DialogTitle>Rearm this ambiguous execution?</DialogTitle><DialogDescription>This acknowledgement is bound to the exact run and execution evidence shown here.</DialogDescription></DialogHeader>
+          {rearmConfirmation && (
+            <div className="space-y-3 text-sm">
+              <dl className="space-y-1 rounded bg-muted px-2 py-1.5 text-xs">
+                <div><dt className="inline text-muted-foreground">Attempt run ID: </dt><dd className="inline break-all font-mono">{rearmConfirmation.runId}</dd></div>
+                <div><dt className="inline text-muted-foreground">Submitted evidence run ID: </dt><dd className="inline break-all font-mono">{rearmConfirmation.offer.evidence.runId}</dd></div>
+                <div><dt className="inline text-muted-foreground">Revision: </dt><dd className="inline">{rearmConfirmation.offer.evidence.runRevision}</dd></div>
+                <div><dt className="inline text-muted-foreground">Execution epoch: </dt><dd className="inline">{rearmConfirmation.offer.evidence.executionEpoch.kind} #{rearmConfirmation.offer.evidence.executionEpoch.attemptNumber}, activated {rearmConfirmation.offer.evidence.executionEpoch.activatedAt}</dd></div>
+                <div><dt className="inline text-muted-foreground">Admitted: </dt><dd className="inline font-mono">{rearmConfirmation.offer.evidence.admittedAt}</dd></div>
+                <div><dt className="inline text-muted-foreground">Pending work: </dt><dd className="inline">{rearmConfirmation.offer.evidence.pendingWorkCount}</dd></div>
+              </dl>
+              <p>Up to {rearmConfirmation.offer.maxRepeatProviderCalls} provider {rearmConfirmation.offer.maxRepeatProviderCalls === 1 ? 'call may' : 'calls may'} repeat. Completed checkpoints can be reused only after full revalidation.</p>
+              <p>The active completed analysis remains the trustworthy baseline until this run fully completes and is promoted.</p>
+              {(confirmationError || rearmError) && <div className="text-destructive" role="alert">{confirmationError ?? rearmError}</div>}
+            </div>
+          )}
+          <DialogFooter><Button type="button" variant="outline" disabled={isConfirming} onClick={() => setRearmConfirmation(null)}>Keep saved run</Button><Button type="button" disabled={isConfirming || status.activeMode !== null || rearmRunId !== null} onClick={() => void confirmRearm()}>{isConfirming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}Acknowledge and rearm</Button></DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

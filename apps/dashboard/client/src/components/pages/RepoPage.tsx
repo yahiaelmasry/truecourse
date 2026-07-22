@@ -81,9 +81,11 @@ import { useAnalysisList } from '@/hooks/useAnalysisList';
 import { useAnalyzeRunStatus } from '@/hooks/useAnalyzeRunStatus';
 import {
   isActiveAnalysisProgress,
+  getAnalysisProgressActivity,
+  isSettledRearmActivity,
   isSettledResumeActivity,
   isSettledStartOverActivity,
-  shouldClearSettledResumeProgress,
+  shouldClearSettledRunProgress,
 } from '@/lib/analysis-activity';
 import { useCodeViolationSummary } from '@/hooks/useCodeViolationSummary';
 import { useFlows } from '@/hooks/useFlows';
@@ -292,18 +294,27 @@ function RepoPageInner() {
     resume: resumeAnalyzeRun,
     resumeRunId,
     resumeError,
+    rearm: rearmAnalyzeRun,
+    rearmRunId,
+    rearmError,
     startOver: startOverAnalyzeRun,
     startOverRunId,
     startOverError,
   } = useAnalyzeRunStatus(repoId, hasVerifiedLocalFilesystem && leftTab === 'analyses');
   const previousAnalyzeRunMode = useRef(analyzeRunStatus?.activeMode);
   const previousResumeRunId = useRef(resumeRunId);
+  const previousRearmRunId = useRef(rearmRunId);
   const previousStartOverRunId = useRef(startOverRunId);
   const initiatedResumeRepoId = useRef<string | null>(null);
   const initiatedStartOverRepoId = useRef<string | null>(null);
   const currentRepoId = useRef(repoId);
   currentRepoId.current = repoId;
-  const progressIsResume = analysisProgress?.mode === 'resume';
+  const progressActivity = getAnalysisProgressActivity({
+    progress: analysisProgress,
+    activeMode: analyzeRunStatus?.activeMode,
+    rearmRunId,
+  });
+  const { isResume: progressIsResume, isRearm: progressIsRearm, isProtected: progressIsProtected } = progressActivity;
   const graphAnalysisId = isDiffMode && diffResult?.diffAnalysisId
     ? diffResult.diffAnalysisId
     : selectedAnalysisId ?? undefined;
@@ -542,7 +553,7 @@ function RepoPageInner() {
   useEffect(() => {
     if (analyzeRunStatus === null) return;
     const activeMode = analyzeRunStatus?.activeMode;
-    if (activeMode === 'resume' || resumeRunId !== null) {
+    if (activeMode === 'resume' || activeMode === 'rearm' || resumeRunId !== null || rearmRunId !== null) {
       setIsAnalyzing(true);
     } else if (isSettledResumeActivity({
       statusAvailable: true,
@@ -552,7 +563,7 @@ function RepoPageInner() {
       initiated: initiatedResumeRepoId.current === repoId,
     })) {
       setIsAnalyzing(false);
-      if (shouldClearSettledResumeProgress(
+      if (shouldClearSettledRunProgress(
         previousAnalyzeRunMode.current,
         activeMode,
         analysisProgress,
@@ -562,6 +573,22 @@ function RepoPageInner() {
         clearProgress();
       }
       initiatedResumeRepoId.current = null;
+    }
+    if (isSettledRearmActivity({
+      statusAvailable: true,
+      activeMode,
+      previousMode: previousAnalyzeRunMode.current,
+      hadPendingAction: previousRearmRunId.current !== null,
+    })) {
+      setIsAnalyzing(false);
+      if (shouldClearSettledRunProgress(
+        previousAnalyzeRunMode.current,
+        activeMode,
+        analysisProgress,
+        previousRearmRunId.current !== null,
+      )) {
+        clearProgress();
+      }
     }
     if (
       (activeMode === 'analysis' && initiatedStartOverRepoId.current === repoId)
@@ -576,7 +603,7 @@ function RepoPageInner() {
       initiated: initiatedStartOverRepoId.current === repoId,
     })) {
       setIsAnalyzing(false);
-      if (shouldClearSettledResumeProgress(
+      if (shouldClearSettledRunProgress(
         previousAnalyzeRunMode.current,
         activeMode,
         analysisProgress,
@@ -589,8 +616,9 @@ function RepoPageInner() {
     }
     previousAnalyzeRunMode.current = activeMode;
     previousResumeRunId.current = resumeRunId;
+    previousRearmRunId.current = rearmRunId;
     previousStartOverRunId.current = startOverRunId;
-  }, [analysisProgress, analyzeRunStatus, clearProgress, repoId, resumeRunId, startOverRunId]);
+  }, [analysisProgress, analyzeRunStatus, clearProgress, rearmRunId, repoId, resumeRunId, startOverRunId]);
 
   useEffect(() => {
     if (initiatedResumeRepoId.current && initiatedResumeRepoId.current !== repoId) {
@@ -636,7 +664,7 @@ function RepoPageInner() {
 
   useEffect(() => {
     if (analysisProgress?.step === 'error') {
-      if (analysisProgress.mode === 'resume') {
+      if (analysisProgress.mode === 'resume' || analysisProgress.mode === 'rearm') {
         initiatedResumeRepoId.current = null;
         setIsAnalyzing(false);
       }
@@ -1622,9 +1650,12 @@ function RepoPageInner() {
               runStatusError={analyzeRunStatusError}
               resumeRunId={resumeRunId}
               resumeError={resumeError}
+              rearmRunId={rearmRunId}
+              rearmError={rearmError}
               startOverRunId={startOverRunId}
               startOverError={startOverError}
               onResume={handleResumeAnalysis}
+              onRearm={rearmAnalyzeRun}
               onStartOver={handleStartOverAnalysis}
             />
           ) : leftTab === 'home' || leftTab === 'analytics' || leftTab === 'violations' ? (
@@ -1871,13 +1902,9 @@ function RepoPageInner() {
                 analysisProgress.step === 'error' ? 'text-destructive' : 'text-foreground'
               }`}
             >
-              {analysisProgress.step === 'error'
-                ? progressIsResume ? 'Resume stopped' : 'Analysis failed'
-                : progressIsResume
-                  ? 'Resuming analysis...'
-                : isCancelling
-                  ? 'Cancelling...'
-                  : 'Analyzing...'}
+              {isCancelling && analysisProgress.step !== 'error' && !progressIsProtected
+                ? 'Cancelling...'
+                : progressActivity.label}
             </span>
             {analysisProgress.step === 'error' ? (
               <button
@@ -1890,7 +1917,7 @@ function RepoPageInner() {
               >
                 <X className="h-3.5 w-3.5" />
               </button>
-            ) : progressIsResume ? (
+            ) : progressIsProtected ? (
               <span className="shrink-0 px-1.5 py-0.5 text-[10px] text-muted-foreground">
                 Protected from cancellation
               </span>

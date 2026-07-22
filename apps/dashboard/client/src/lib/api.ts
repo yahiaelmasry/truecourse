@@ -12,6 +12,8 @@ import type {
   GuardScenarioSource,
   GuardStaleness,
   AnalyzeResumeAcceptedResponse,
+  AnalyzeRearmAcceptedResponse,
+  AnalyzeRunAmbiguousRearmConsent,
   AnalyzeRunStatusResponse,
 } from '@truecourse/shared';
 import type { LlmEstimateData } from '@/hooks/useSocket';
@@ -268,6 +270,17 @@ export function resumeAnalyzeRun(
   return fetchApi<AnalyzeResumeAcceptedResponse>(
     `/api/repos/${repoId}/analyses/${encodeURIComponent(runId)}/resume`,
     { method: 'POST' },
+  );
+}
+
+export function rearmAnalyzeRun(
+  repoId: string,
+  runId: string,
+  consent: AnalyzeRunAmbiguousRearmConsent,
+): Promise<AnalyzeRearmAcceptedResponse> {
+  return fetchApi<AnalyzeRearmAcceptedResponse>(
+    `/api/repos/${repoId}/analyses/${encodeURIComponent(runId)}/rearm`,
+    { method: 'POST', body: JSON.stringify({ consent }) },
   );
 }
 

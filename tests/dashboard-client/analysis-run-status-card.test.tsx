@@ -28,6 +28,7 @@ const blockedStatus: AnalyzeRunStatusResponse = {
       requiresLatestAttempt: true,
       requiresRevalidation: true,
     },
+    rearm: null,
     startOver: {
       available: true,
       requiresExactAttempt: true,
@@ -42,7 +43,115 @@ const blockedStatus: AnalyzeRunStatusResponse = {
   },
 };
 
+const inactiveRearmProps = {
+  rearmRunId: null,
+  rearmError: null,
+  onRearm: async () => undefined,
+};
+
 describe('AnalysisRunStatusCard', () => {
+  it('captures the certified rearm offer and submits that exact bound only after acknowledgement', async () => {
+    const onRearm = vi.fn(async () => undefined);
+    const status: AnalyzeRunStatusResponse = {
+      ...blockedStatus,
+      latestAttempt: {
+        ...blockedStatus.latestAttempt!,
+        resume: { available: false, scope: 'structural', reason: 'resume-execution-ambiguous' },
+        rearm: {
+          scope: 'structural', mode: 'rearm-ambiguous-execution', requiresLatestAttempt: true, requiresRevalidation: true,
+          evidence: { runId: 'run-blocked-123', runRevision: 7, executionEpoch: { kind: 'initial', attemptNumber: 1, activatedAt: '2026-07-22T08:05:00.000Z' }, admittedAt: '2026-07-22T08:06:00.000Z', pendingWorkCount: 39 },
+          checkpointedWorkCount: 60, maxRepeatProviderCalls: 39, requiredAcknowledgement: 'possible-duplicate-provider-charges',
+        },
+      },
+    };
+    render(<AnalysisRunStatusCard status={status} resumeRunId={null} resumeError={null} rearmRunId={null} rearmError={null} startOverRunId={null} startOverError={null} onResume={async () => undefined} onRearm={onRearm} onStartOver={async () => undefined} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Rearm ambiguous execution' }));
+    expect(screen.getByText(/Up to 39 provider calls may repeat/i)).toBeInTheDocument();
+    expect(screen.getByRole('dialog')).toHaveTextContent('Revision: 7');
+    expect(screen.getByRole('dialog')).toHaveTextContent('initial #1, activated 2026-07-22T08:05:00.000Z');
+    expect(screen.getByRole('dialog')).toHaveTextContent('Admitted: 2026-07-22T08:06:00.000Z');
+    expect(screen.getByRole('dialog')).toHaveTextContent('Pending work: 39');
+    await userEvent.click(screen.getByRole('button', { name: 'Acknowledge and rearm' }));
+    expect(onRearm).toHaveBeenCalledWith('run-blocked-123', {
+      evidence: status.latestAttempt!.rearm!.evidence,
+      acceptedRisk: 'repeat-up-to-pending-provider-calls',
+      acceptedMaxRepeatProviderCalls: 39,
+    });
+  });
+
+  it('protects every conflicting action while a rearm is pending or active', () => {
+    const status: AnalyzeRunStatusResponse = {
+      ...blockedStatus,
+      activeMode: 'rearm',
+      latestAttempt: {
+        ...blockedStatus.latestAttempt!,
+        rearm: {
+          scope: 'structural', mode: 'rearm-ambiguous-execution', requiresLatestAttempt: true, requiresRevalidation: true,
+          evidence: { runId: 'run-blocked-123', runRevision: 7, executionEpoch: { kind: 'initial', attemptNumber: 1, activatedAt: '2026-07-22T08:05:00.000Z' }, admittedAt: '2026-07-22T08:06:00.000Z', pendingWorkCount: 39 },
+          checkpointedWorkCount: 60, maxRepeatProviderCalls: 39, requiredAcknowledgement: 'possible-duplicate-provider-charges',
+        },
+      },
+    };
+    render(
+      <AnalysisRunStatusCard
+        status={status}
+        resumeRunId={null}
+        resumeError={null}
+        rearmRunId={null}
+        rearmError={null}
+        startOverRunId={null}
+        startOverError={null}
+        onResume={async () => undefined}
+        onRearm={async () => undefined}
+        onStartOver={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Start over' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Rearming…' })).toBeDisabled();
+  });
+
+  it('protects every conflicting action while a rearm acknowledgement is refreshing', () => {
+    const status: AnalyzeRunStatusResponse = {
+      ...blockedStatus,
+      activeMode: null,
+      latestAttempt: {
+        ...blockedStatus.latestAttempt!,
+        rearm: {
+          scope: 'structural', mode: 'rearm-ambiguous-execution', requiresLatestAttempt: true, requiresRevalidation: true,
+          evidence: { runId: 'run-blocked-123', runRevision: 7, executionEpoch: { kind: 'initial', attemptNumber: 1, activatedAt: '2026-07-22T08:05:00.000Z' }, admittedAt: '2026-07-22T08:06:00.000Z', pendingWorkCount: 39 },
+          checkpointedWorkCount: 60, maxRepeatProviderCalls: 39, requiredAcknowledgement: 'possible-duplicate-provider-charges',
+        },
+      },
+    };
+    render(<AnalysisRunStatusCard status={status} resumeRunId={null} resumeError={null} rearmRunId="run-blocked-123" rearmError={null} startOverRunId={null} startOverError={null} onResume={async () => undefined} onRearm={async () => undefined} onStartOver={async () => undefined} />);
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Start over' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Starting Analyze Rearm…' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('accepted. Refreshing Latest run');
+  });
+
+  it('shows the submitted evidence run ID separately from the attempted-run route', async () => {
+    const status: AnalyzeRunStatusResponse = {
+      ...blockedStatus,
+      latestAttempt: {
+        ...blockedStatus.latestAttempt!,
+        rearm: {
+          scope: 'structural', mode: 'rearm-ambiguous-execution', requiresLatestAttempt: true, requiresRevalidation: true,
+          evidence: { runId: 'certified-evidence-run', runRevision: 7, executionEpoch: { kind: 'initial', attemptNumber: 1, activatedAt: '2026-07-22T08:05:00.000Z' }, admittedAt: '2026-07-22T08:06:00.000Z', pendingWorkCount: 39 },
+          checkpointedWorkCount: 60, maxRepeatProviderCalls: 39, requiredAcknowledgement: 'possible-duplicate-provider-charges',
+        },
+      },
+    };
+    render(<AnalysisRunStatusCard status={status} resumeRunId={null} resumeError={null} rearmRunId={null} rearmError={null} startOverRunId={null} startOverError={null} onResume={async () => undefined} onRearm={async () => undefined} onStartOver={async () => undefined} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rearm ambiguous execution' }));
+
+    expect(screen.getByRole('dialog')).toHaveTextContent('Attempt run ID: run-blocked-123');
+    expect(screen.getByRole('dialog')).toHaveTextContent('Submitted evidence run ID: certified-evidence-run');
+  });
+
   it('keeps the baseline distinct and starts Resume for the exact attempted run', async () => {
     const onResume = vi.fn(async () => undefined);
     render(
@@ -50,6 +159,7 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={onResume}
@@ -81,6 +191,7 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -102,6 +213,7 @@ describe('AnalysisRunStatusCard', () => {
         }}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -120,6 +232,7 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -149,6 +262,7 @@ describe('AnalysisRunStatusCard', () => {
         }}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -167,6 +281,7 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -193,6 +308,7 @@ describe('AnalysisRunStatusCard', () => {
         status={{ ...blockedStatus, activeMode }}
         resumeRunId={resumeRunId}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -210,6 +326,7 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError="The selected attempted run is no longer the latest."
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -239,6 +356,7 @@ describe('AnalysisRunStatusCard', () => {
         }}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -274,6 +392,7 @@ describe('AnalysisRunStatusCard', () => {
         }}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -303,6 +422,7 @@ describe('AnalysisRunStatusCard', () => {
         runStatusError={null}
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}
@@ -327,6 +447,7 @@ describe('AnalysisRunStatusCard', () => {
         runStatusError="temporary disconnect"
         resumeRunId={null}
         resumeError={null}
+        {...inactiveRearmProps}
         startOverRunId={null}
         startOverError={null}
         onResume={async () => undefined}

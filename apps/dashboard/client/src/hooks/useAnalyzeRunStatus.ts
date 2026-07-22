@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AnalyzeRunStatusResponse } from '@truecourse/shared';
+import type { AnalyzeRunAmbiguousRearmConsent, AnalyzeRunStatusResponse } from '@truecourse/shared';
 import * as api from '@/lib/api';
 
 const STATUS_POLL_MS = 2_000;
@@ -11,11 +11,14 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
   const [error, setError] = useState<string | null>(null);
   const [resumeRunId, setResumeRunId] = useState<string | null>(null);
   const [resumeFailure, setResumeFailure] = useState<{ runId: string; message: string } | null>(null);
+  const [rearmRunId, setRearmRunId] = useState<string | null>(null);
+  const [rearmFailure, setRearmFailure] = useState<{ runId: string; message: string } | null>(null);
   const [startOverRunId, setStartOverRunId] = useState<string | null>(null);
   const [startOverFailure, setStartOverFailure] = useState<{ runId: string; message: string } | null>(null);
   const requestSequence = useRef(0);
   const inFlight = useRef<{ repoId: string; requestId: number } | null>(null);
   const resumeSequence = useRef(0);
+  const rearmSequence = useRef(0);
   const startOverSequence = useRef(0);
   const currentRepoId = useRef(repoId);
   currentRepoId.current = repoId;
@@ -24,6 +27,9 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     runId: string;
     actionId: number;
     phase: 'posting' | 'reconciling';
+  } | null>(null);
+  const rearmAction = useRef<{
+    repoId: string; runId: string; actionId: number; phase: 'posting' | 'reconciling';
   } | null>(null);
   const startOverAction = useRef<{
     repoId: string;
@@ -59,6 +65,11 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
         startOverAction.current = null;
         setStartOverRunId(null);
       }
+      const rearm = rearmAction.current;
+      if (rearm?.repoId === repoId && rearm.phase === 'reconciling') {
+        rearmAction.current = null;
+        setRearmRunId(null);
+      }
       return nextStatus;
     } catch (cause) {
       if (requestId !== requestSequence.current) return;
@@ -74,6 +85,7 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     if (
       resumeAction.current?.repoId === repoId
       || startOverAction.current?.repoId === repoId
+      || rearmAction.current?.repoId === repoId
     ) return;
 
     const actionId = ++resumeSequence.current;
@@ -105,11 +117,43 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     }
   }, [enabled, refetch, repoId]);
 
+  const rearm = useCallback(async (
+    runId: string,
+    consent: AnalyzeRunAmbiguousRearmConsent,
+  ): Promise<void> => {
+    if (!enabled || !repoId) throw new Error('Analyze Rearm is unavailable.');
+    if (resumeAction.current?.repoId === repoId || startOverAction.current?.repoId === repoId || rearmAction.current?.repoId === repoId) return;
+    const actionId = ++rearmSequence.current;
+    const action = { repoId, runId, actionId, phase: 'posting' as const };
+    rearmAction.current = action;
+    requestSequence.current += 1;
+    inFlight.current = null;
+    setRearmRunId(runId);
+    setRearmFailure(null);
+    try {
+      await api.rearmAnalyzeRun(repoId, runId, consent);
+      if (rearmSequence.current !== actionId || rearmAction.current !== action) return;
+      rearmAction.current = { ...action, phase: 'reconciling' };
+      await refetch(true, true);
+    } catch (cause) {
+      if (rearmSequence.current !== actionId || rearmAction.current?.actionId !== actionId) {
+        if (currentRepoId.current === repoId) throw cause;
+        return;
+      }
+      rearmAction.current = null;
+      setRearmRunId(null);
+      setRearmFailure({ runId, message: cause instanceof Error ? cause.message : 'Unable to start Analyze Rearm' });
+      await refetch(true, true);
+      throw cause;
+    }
+  }, [enabled, refetch, repoId]);
+
   const startOver = useCallback(async (runId: string): Promise<void> => {
     if (!enabled || !repoId) throw new Error('Analyze Start over is unavailable.');
     if (
       resumeAction.current?.repoId === repoId
       || startOverAction.current?.repoId === repoId
+      || rearmAction.current?.repoId === repoId
     ) return;
 
     const actionId = ++startOverSequence.current;
@@ -156,6 +200,10 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
       resumeAction.current = null;
       setResumeRunId(null);
       setResumeFailure(null);
+      rearmSequence.current += 1;
+      rearmAction.current = null;
+      setRearmRunId(null);
+      setRearmFailure(null);
       startOverSequence.current += 1;
       startOverAction.current = null;
       setStartOverRunId(null);
@@ -166,6 +214,8 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     setError(null);
     setResumeRunId(null);
     setResumeFailure(null);
+    setRearmRunId(null);
+    setRearmFailure(null);
     setStartOverRunId(null);
     setStartOverFailure(null);
     void refetch();
@@ -176,6 +226,8 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
       inFlight.current = null;
       resumeSequence.current += 1;
       resumeAction.current = null;
+      rearmSequence.current += 1;
+      rearmAction.current = null;
       startOverSequence.current += 1;
       startOverAction.current = null;
     };
@@ -191,6 +243,11 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     resumeError: resumeFailure && statusRepoId === repoId
       && status?.latestAttempt?.runId === resumeFailure.runId
       ? resumeFailure.message
+      : null,
+    rearm,
+    rearmRunId,
+    rearmError: rearmFailure && statusRepoId === repoId && status?.latestAttempt?.runId === rearmFailure.runId
+      ? rearmFailure.message
       : null,
     startOver,
     startOverRunId,
