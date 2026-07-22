@@ -199,7 +199,11 @@ const analyzeRunResumePlanActivations = new WeakMap<object, {
   reusedWorkIds: readonly string[];
   executionPin: AnalyzeRunResumeExecutionPin;
   attemptSequence: number;
-  mode: 'activated' | 'ambiguous-activated' | 'executing-complete';
+  mode:
+    | 'activated'
+    | 'ambiguous-activated'
+    | 'executing-complete-provider-session-limit'
+    | 'executing-complete-ambiguous-rearm';
   claimed: boolean;
 }>();
 
@@ -1256,7 +1260,8 @@ export async function admitAnalyzeRunPlanExecution<T>(
 }
 
 /**
- * Atomically activate one exact latest blocked attempt for certified resume.
+ * Atomically activate one exact latest blocked attempt for certified resume,
+ * or recover a receipt for an already durable certified activation/completion.
  * This transition does not admit or call a provider. The caller must retain
  * the repository lifecycle lock through the later admission/finalization flow.
  */
@@ -1278,11 +1283,17 @@ export async function activateAnalyzeRunResume(
   assertAnalyzeRunStorage(storage);
   const recoveringActivated = current.status.state === 'running'
     && current.executionAttempt.number > 1
-    && current.executionAttempt.resume?.activation === 'provider-session-limit'
+    && (
+      current.executionAttempt.resume?.activation === 'provider-session-limit'
+      || current.executionAttempt.resume?.activation === 'ambiguous-rearm'
+    )
     && current.executionAttempt.resume?.admission === 'activated';
   const recoveringCompletedExecution = current.status.state === 'running'
     && current.executionAttempt.number > 1
-    && current.executionAttempt.resume?.activation === 'provider-session-limit'
+    && (
+      current.executionAttempt.resume?.activation === 'provider-session-limit'
+      || current.executionAttempt.resume?.activation === 'ambiguous-rearm'
+    )
     && current.executionAttempt.resume?.admission === 'executing'
     && current.plan.state === 'sealed'
     && current.plan.work.every((work) => work.state === 'succeeded-checkpointed');
@@ -1501,7 +1512,13 @@ export async function activateAnalyzeRunResume(
     reusedWorkIds: Object.freeze([...reusedWorkIds]),
     executionPin,
     attemptSequence: next.attemptSequence,
-    mode: recoveringCompletedExecution ? 'executing-complete' : 'activated',
+    mode: recoveringCompletedExecution
+      ? next.executionAttempt.resume?.activation === 'ambiguous-rearm'
+        ? 'executing-complete-ambiguous-rearm'
+        : 'executing-complete-provider-session-limit'
+      : next.executionAttempt.resume?.activation === 'ambiguous-rearm'
+        ? 'ambiguous-activated'
+        : 'activated',
     claimed: false,
   });
   return Object.freeze({ view: toView(next), activation });
@@ -1885,6 +1902,11 @@ export async function admitAnalyzeRunResumeExecution<T>(
     : activation.mode === 'ambiguous-activated'
       ? 'ambiguous-rearm'
       : null;
+  const completedExecutionKind = activation.mode === 'executing-complete-provider-session-limit'
+    ? 'provider-session-limit'
+    : activation.mode === 'executing-complete-ambiguous-rearm'
+      ? 'ambiguous-rearm'
+      : null;
   const activatedIsExecutable = activatedResumeKind !== null
     && stored?.status.state === 'running'
     && stored.plan.state === 'sealed'
@@ -1897,11 +1919,12 @@ export async function admitAnalyzeRunResumeExecution<T>(
     && activation.workKey === activationWorkKey(stored.plan.work)
     && isDeepStrictEqual([...activation.pendingWorkIds].sort(), [...durablePending].sort())
     && isDeepStrictEqual([...activation.reusedWorkIds].sort(), [...durableReused].sort());
-  const completedExecutionIsRecoverable = activation.mode === 'executing-complete'
+  const completedExecutionIsRecoverable = completedExecutionKind !== null
     && stored?.status.state === 'running'
     && stored.plan.state === 'sealed'
     && stored.revision === activation.revision
     && stored.attemptSequence === activation.attemptSequence
+    && stored.executionAttempt.resume?.activation === completedExecutionKind
     && stored.executionAttempt.resume?.admission === 'executing'
     && isDeepStrictEqual(stored.executionAttempt.resume.executionPin, activation.executionPin)
     && isDeepStrictEqual(stored.plan.execution, activation.execution)

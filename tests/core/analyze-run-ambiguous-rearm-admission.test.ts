@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   activateAnalyzeRunAmbiguousRearm,
+  activateAnalyzeRunResume,
   admitAnalyzeRunPlanExecution,
   admitAnalyzeRunResumeExecution,
   checkpointAnalyzeRunWork,
@@ -14,6 +15,7 @@ import {
   type AnalyzeRunCheckpointWriter,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import { certifyAnalyzeRunAmbiguousRearmActivation } from '../../packages/core/src/lib/analyze-run-ambiguous-rearm-activation-certification.js';
+import { certifyAnalyzeRunResumeActivation } from '../../packages/core/src/lib/analyze-run-resume-activation-certification.js';
 import { certifyAnalyzeRunWorkCheckpoint } from '../../packages/core/src/lib/analyze-run-work-checkpoint-certification.js';
 
 const runId = 'ambiguous-rearm-admission';
@@ -185,6 +187,139 @@ describe('ambiguous analyze execution admission', () => {
     )).resolves.toEqual({ admitted: false });
     expect(callbacks).toBe(0);
   });
+
+  it('recovers a discarded already-consented activation receipt without another write', async () => {
+    await createAmbiguousActivation();
+    const before = fs.readFileSync(runFile());
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      revision: 4,
+      resume: { available: false, reason: 'run-not-resumable' },
+      rearm: null,
+      executionAttempt: {
+        resume: { activation: 'ambiguous-rearm', admission: 'activated' },
+      },
+    });
+    const recovered = await recoverDurableResumeActivation([work[1].workId]);
+    expect(fs.readFileSync(runFile())).toEqual(before);
+    const stopped = new Error('stop after recovered admission');
+    let callbacks = 0;
+    const admission = await admitAnalyzeRunResumeExecution(
+      recovered,
+      repoPath,
+      runId,
+      work,
+      [work[1].workId],
+      executionPin,
+      '2026-07-22T13:00:05.000Z',
+      () => undefined,
+      async () => {
+        callbacks += 1;
+        throw stopped;
+      },
+    );
+    expect(admission.admitted).toBe(true);
+    if (!admission.admitted) throw new Error('expected recovered admission');
+    await expect(admission.execution).rejects.toBe(stopped);
+    expect(callbacks).toBe(1);
+  });
+
+  it('recovers completion after the last checkpoint without repeating provider work', async () => {
+    const activation = await createAmbiguousActivation();
+    const admitted = await admitAnalyzeRunResumeExecution(
+      activation,
+      repoPath,
+      runId,
+      work,
+      [work[1].workId],
+      executionPin,
+      '2026-07-22T13:00:05.000Z',
+      () => undefined,
+      async (writer) => {
+        await checkpoint(writer, 1, '2026-07-22T13:00:06.000Z');
+        return [];
+      },
+    );
+    if (!admitted.admitted) throw new Error('expected ambiguous rearm admission');
+    await admitted.execution;
+    const before = fs.readFileSync(runFile());
+
+    const recovered = await recoverDurableResumeActivation([]);
+    expect(fs.readFileSync(runFile())).toEqual(before);
+    const stored = JSON.parse(before.toString()) as Record<string, any>;
+    stored.executionAttempt.resume.activation = 'provider-session-limit';
+    stored.executionAttempt.resume.resumedFrom = {
+      reason: 'provider-session-limit',
+      resetHint: '7pm',
+      blockedAt: '2026-07-22T13:00:03.500Z',
+    };
+    fs.writeFileSync(runFile(), JSON.stringify(stored));
+    let crossModeCallbacks = 0;
+    await expect(admitAnalyzeRunResumeExecution(
+      recovered,
+      repoPath,
+      runId,
+      work,
+      [],
+      executionPin,
+      '2026-07-22T13:00:07.000Z',
+      () => undefined,
+      async () => { crossModeCallbacks += 1; },
+    )).resolves.toEqual({ admitted: false });
+    expect(crossModeCallbacks).toBe(0);
+    fs.writeFileSync(runFile(), before);
+    let recoveryCallbacks = 0;
+    const completion = await admitAnalyzeRunResumeExecution(
+      recovered,
+      repoPath,
+      runId,
+      work,
+      [],
+      executionPin,
+      '2026-07-22T13:00:07.000Z',
+      () => undefined,
+      async () => {
+        recoveryCallbacks += 1;
+        return [];
+      },
+    );
+    expect(completion.admitted).toBe(true);
+    if (!completion.admitted) throw new Error('expected recovered completion admission');
+    await expect(completion.execution).resolves.toMatchObject({
+      result: [],
+      checkpoints: expect.arrayContaining([
+        expect.objectContaining({ workId: work[0].workId }),
+        expect.objectContaining({ workId: work[1].workId }),
+      ]),
+    });
+    expect(recoveryCallbacks).toBe(1);
+    expect(fs.readFileSync(runFile())).toEqual(before);
+  });
+
+  it('keeps an admitted ambiguous execution with pending work on the consent path', async () => {
+    const activation = await createAmbiguousActivation();
+    const stopped = new Error('provider outcome remains ambiguous');
+    const admitted = await admitAnalyzeRunResumeExecution(
+      activation,
+      repoPath,
+      runId,
+      work,
+      [work[1].workId],
+      executionPin,
+      '2026-07-22T13:00:05.000Z',
+      () => undefined,
+      async () => { throw stopped; },
+    );
+    if (!admitted.admitted) throw new Error('expected ambiguous rearm admission');
+    await expect(admitted.execution).rejects.toBe(stopped);
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      resume: { available: false, reason: 'resume-execution-ambiguous' },
+      rearm: { maxRepeatProviderCalls: 1 },
+    });
+
+    await expect(recoverDurableResumeActivation([work[1].workId]))
+      .rejects.toThrow(/Cannot activate analyze run/);
+  });
 });
 
 async function createAmbiguousActivation() {
@@ -280,4 +415,39 @@ function checkpoint(
       durationMs: 500,
     },
   }));
+}
+
+async function recoverDurableResumeActivation(pendingWorkIds: readonly string[]) {
+  const current = await readAnalyzeRun(repoPath, { runId });
+  if (!current) throw new Error('expected durable ambiguous attempt');
+  const pending = new Set(pendingWorkIds);
+  const activated = await activateAnalyzeRunResume(
+    repoPath,
+    certifyAnalyzeRunResumeActivation({
+      kind: 'activate-resume',
+      runId,
+      candidateAnalysisId: 'ambiguous-rearm-analysis',
+      startedAt: '2026-07-22T13:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'ambiguous-rearm-commit',
+      completedBaselineId: null,
+      activatedAt: current.executionAttempt.activatedAt,
+      work,
+      reusedWorkIds: work.filter((item) => !pending.has(item.workId)).map((item) => item.workId),
+      pendingWorkIds,
+      executionPin,
+      observed: {
+        runRevision: current.revision,
+        attemptSequence: 1,
+        latestAttemptSequence: 1,
+        completedBaselineFingerprint: null,
+      },
+    }),
+  );
+  return activated.activation;
+}
+
+function runFile() {
+  return path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
 }
