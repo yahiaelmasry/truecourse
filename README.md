@@ -107,7 +107,11 @@ selected blocked run, atomically revalidate it, replay its checkpoints, execute
 only pending work, and promote the candidate after complete finalization. The
 read-only `truecourse analyze status` command shows the latest attempted run,
 durable progress, and advisory provider reset hint separately from the active
-completed analysis. The manual CLI Resume action accepts one exact latest run ID,
+completed analysis. A complete timezone-qualified Claude reset hint is also
+shown as a verified UTC reset time when it can be derived unambiguously from
+the durable block timestamp; unknown wording, invalid zones, and DST ambiguity
+remain advisory only. Automatic waiting is not enabled. The manual CLI Resume
+action accepts one exact latest run ID,
 revalidates every durable input before reusing saved successful checkpoints,
 executes only pending checks, and promotes the candidate only after complete
 finalization.

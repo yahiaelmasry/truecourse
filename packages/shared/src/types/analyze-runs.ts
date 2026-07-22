@@ -69,6 +69,8 @@ export interface AnalyzeRunStatusResponse {
     lastProviderLimit: {
       resetHint: string;
       blockedAt: string;
+      /** Strictly certified UTC instant; null when provider wording is not trustworthy. */
+      resetAt: string | null;
     } | null;
     resume: AnalyzeRunResumeStatus;
     /** Server-classified replacement safety; clients must not infer this from state. */

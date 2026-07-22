@@ -43,6 +43,7 @@ import {
   inspectAnalyzeRunResumeActivationCertification,
   type AnalyzeRunResumeActivationCertification,
 } from './analyze-run-resume-activation-certification.js';
+import { certifyClaudeSessionResetAt } from '@truecourse/shared/llm';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
@@ -349,6 +350,8 @@ export interface AnalyzeRunView {
     reason: 'provider-session-limit';
     resetHint: string;
     blockedAt: string;
+    /** Certified UTC instant derived from the durable hint + block timestamp. */
+    resetAt: string | null;
   };
   failure: null | {
     code: string;
@@ -1814,10 +1817,17 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
           reason: run.status.reason,
           resetHint: run.status.resetHint,
           blockedAt: run.status.blockedAt,
+          resetAt: certifyClaudeSessionResetAt(run.status.resetHint, run.status.blockedAt),
         }
       : run.executionAttempt.resume === null
         ? null
-        : structuredClone(run.executionAttempt.resume.resumedFrom),
+        : {
+            ...structuredClone(run.executionAttempt.resume.resumedFrom),
+            resetAt: certifyClaudeSessionResetAt(
+              run.executionAttempt.resume.resumedFrom.resetHint,
+              run.executionAttempt.resume.resumedFrom.blockedAt,
+            ),
+          },
     failure: run.status.state === 'failed'
       ? {
           code: run.status.code,

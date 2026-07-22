@@ -20,6 +20,7 @@ describe('analyze run CLI status', () => {
     expect(formatAnalyzeRunStatus(blockedStatus())).toEqual([
       'Latest run: run-interrupted · blocked · 1/2 LLM checks complete · 1 pending',
       'Provider reported reset: tomorrow 8pm (Africa/Cairo) (advisory)',
+      'Verified reset time: 2026-07-20T17:00:00.000Z',
       'Resume: truecourse analyze resume run-interrupted after the provider reset (repository, baseline, rules, configuration, prompts/schemas, provider, and model will be revalidated)',
       'Active completed analysis: analysis-completed · 2026-07-19T09:00:00.000Z · main@abc1234',
     ]);
@@ -781,6 +782,7 @@ function blockedStatus(): AnalyzeRunStatus {
         reason: 'provider-session-limit',
         resetHint: 'tomorrow 8pm (Africa/Cairo)',
         blockedAt: '2026-07-19T10:00:02.000Z',
+        resetAt: '2026-07-20T17:00:00.000Z',
       },
       failure: null,
       finalization: null,

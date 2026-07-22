@@ -194,6 +194,9 @@ export function formatAnalyzeRunStatus(status: AnalyzeRunStatus): string[] {
     }
     if (run.lastProviderLimit) {
       lines.push(`Provider reported reset: ${run.lastProviderLimit.resetHint} (advisory)`);
+      if (run.lastProviderLimit.resetAt) {
+        lines.push(`Verified reset time: ${run.lastProviderLimit.resetAt}`);
+      }
     }
     if (!run.resume.available && run.resume.reason === 'resume-execution-ambiguous') {
       lines.push(`Resume: unavailable — ${resumeUnavailableMessage(run.resume.reason)}`);

@@ -56,6 +56,7 @@ describe('dashboard analyze-run status route', () => {
           reason: 'provider-session-limit',
           resetHint: 'tomorrow 8pm (Africa/Cairo)',
           blockedAt: '2026-07-22T08:45:00.000Z',
+          resetAt: '2026-07-23T17:00:00.000Z',
         },
         finalization: null,
         resume: {
@@ -92,6 +93,7 @@ describe('dashboard analyze-run status route', () => {
         lastProviderLimit: {
           resetHint: 'tomorrow 8pm (Africa/Cairo)',
           blockedAt: '2026-07-22T08:45:00.000Z',
+          resetAt: '2026-07-23T17:00:00.000Z',
         },
         resume: {
           available: true,

@@ -114,12 +114,19 @@ export function AnalysisRunStatusCard({
               </div>
             )}
             {attempt.lastProviderLimit && (
-              <div className="flex items-start gap-1.5 text-muted-foreground">
-                <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                <span>
-                  {attempt.state === 'blocked' ? 'Provider session limit' : 'Last provider limit'}:
-                  {' '}reset {attempt.lastProviderLimit.resetHint}
-                </span>
+              <div className="space-y-1 text-muted-foreground">
+                <div className="flex items-start gap-1.5">
+                  <Clock className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>
+                    {attempt.state === 'blocked' ? 'Provider session limit' : 'Last provider limit'}:
+                    {' '}reset {attempt.lastProviderLimit.resetHint}
+                  </span>
+                </div>
+                {attempt.lastProviderLimit.resetAt && (
+                  <div className="font-mono text-[10px]">
+                    Verified reset time: {attempt.lastProviderLimit.resetAt}
+                  </div>
+                )}
               </div>
             )}
             {attempt.resume.available ? (

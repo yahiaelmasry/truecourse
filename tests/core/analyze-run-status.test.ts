@@ -92,7 +92,10 @@ describe('analyze run status', () => {
         state: 'blocked',
         counts: { total: 2, succeeded: 0, pending: 2 },
         blocked: { resetHint: 'tomorrow 8pm (Africa/Cairo)' },
-        lastProviderLimit: { resetHint: 'tomorrow 8pm (Africa/Cairo)' },
+        lastProviderLimit: {
+          resetHint: 'tomorrow 8pm (Africa/Cairo)',
+          resetAt: '2026-07-20T17:00:00.000Z',
+        },
         resume: { available: true, mode: 'resume', requiresRevalidation: true },
       },
       activeCompletedAnalysis: {

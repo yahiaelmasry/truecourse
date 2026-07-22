@@ -30,6 +30,7 @@ import type { ZodTypeAny } from 'zod';
 import { parseLlmSessionLimitError } from './errors.js';
 
 export {
+  certifyClaudeSessionResetAt,
   LlmSessionLimitError,
   isLlmSessionLimitError,
 } from './errors.js';

@@ -59,6 +59,7 @@ function toAnalyzeRunStatusResponse(
             ? {
                 resetHint: attempt.lastProviderLimit.resetHint,
                 blockedAt: attempt.lastProviderLimit.blockedAt,
+                resetAt: attempt.lastProviderLimit.resetAt,
               }
             : null,
           resume: toResumeStatus(attempt.resume),

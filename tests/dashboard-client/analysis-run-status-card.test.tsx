@@ -17,8 +17,9 @@ const blockedStatus: AnalyzeRunStatusResponse = {
     commitHash: '1234567890abcdef',
     counts: { total: 100, succeeded: 60, pending: 39, running: 0, failed: 1 },
     lastProviderLimit: {
-      resetHint: 'Jul 23 at 8:00 PM (Africa/Cairo)',
+      resetHint: 'tomorrow 8pm (Africa/Cairo)',
       blockedAt: '2026-07-22T08:10:00.000Z',
+      resetAt: '2026-07-23T17:00:00.000Z',
     },
     resume: {
       available: true,
@@ -59,7 +60,8 @@ describe('AnalysisRunStatusCard', () => {
     expect(screen.getByRole('region', { name: 'Latest run' })).toHaveTextContent('blocked');
     expect(screen.getByText('60/100 LLM checks complete')).toBeInTheDocument();
     expect(screen.getByText(/39 pending · 1 failed/i)).toBeInTheDocument();
-    expect(screen.getByText(/Jul 23 at 8:00 PM/)).toBeInTheDocument();
+    expect(screen.getByText(/tomorrow 8pm/)).toBeInTheDocument();
+    expect(screen.getByText('Verified reset time: 2026-07-23T17:00:00.000Z')).toBeInTheDocument();
     expect(screen.getByText('truecourse analyze resume run-blocked-123')).toBeInTheDocument();
 
     const completed = screen.getByRole('region', { name: 'Active completed analysis' });
