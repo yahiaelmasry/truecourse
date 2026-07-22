@@ -1,7 +1,7 @@
 /**
  * All endpoints under the `/api/repos/:id/analyses` noun:
  *
- *   POST   /analyses          — start a run (body: `{mode, skipGit?}`)
+ *   POST   /analyses          — start a run (full may acknowledge `abandonAttemptRunId`)
  *   POST   /analyses/cancel   — abort a normal run; admitted Resume is protected
  *   POST   /analyses/:runId/resume — resume one exact latest attempted run
  *   GET    /analyses/status   — latest attempt + active completed baseline
@@ -25,7 +25,10 @@ import {
   analyzeInProcess,
   AnalysisResumeUnavailableError,
   AnalysisSessionLimitError,
+  AnalysisStartBlockedError,
+  resolveAnalyzeStartExpectationFromStatus,
   resumeAnalyzeInProcess,
+  type LatestAttemptExpectation,
 } from '@truecourse/core/commands/analyze-in-process';
 import { readAnalyzeRunStatus } from '@truecourse/core/commands/analyze-run-status';
 import { diffInProcess } from '@truecourse/core/commands/diff-in-process';
@@ -185,9 +188,28 @@ router.post('/:id/analyses', async (req: Request, res: Response, next: NextFunct
     const id = req.params.id as string;
     const parsed = AnalyzeRepoSchema.safeParse(req.body);
     if (!parsed.success) throw createAppError('Invalid request body', 400);
-    const { mode, skipGit } = parsed.data;
+    const { mode, skipGit, abandonAttemptRunId } = parsed.data;
+
+    const hasLocalFilesystem = getCapabilities().includes('local-filesystem');
+    if (abandonAttemptRunId !== undefined && !hasLocalFilesystem) {
+      throw createAppError('Not found', 404);
+    }
 
     const repo = await resolveProjectForRequest(id);
+    let latestAttemptExpectation: LatestAttemptExpectation | undefined;
+    if (mode === 'full' && hasLocalFilesystem) {
+      try {
+        latestAttemptExpectation = resolveAnalyzeStartExpectationFromStatus(
+          await readAnalyzeRunStatus(repo.path),
+          abandonAttemptRunId,
+        );
+      } catch (error) {
+        if (error instanceof AnalysisStartBlockedError) {
+          throw createAppError(dashboardStartBlockedDetail(error), 409);
+        }
+        throw error;
+      }
+    }
 
     // Diff requires a baseline. Fail fast with 400 before the 202 accept
     // so the client doesn't wait on sockets that never come.
@@ -223,6 +245,7 @@ router.post('/:id/analyses', async (req: Request, res: Response, next: NextFunct
               effectiveLlmRules,
               tracker,
               signal: abortController.signal,
+              latestAttemptExpectation,
             });
           } else {
             await runDiffAnalyze(id, repo, {
@@ -241,7 +264,7 @@ router.post('/:id/analyses', async (req: Request, res: Response, next: NextFunct
             emitAnalysisProgress(id, {
               step: 'error',
               percent: -1,
-              detail: error instanceof Error ? error.message : `${mode === 'diff' ? 'Diff check' : 'Analysis'} failed`,
+              detail: analysisFailureDetail(error, mode),
             });
           }
         }
@@ -413,6 +436,7 @@ interface StartRunOptions {
   effectiveLlmRules: boolean;
   tracker: StepTracker;
   signal: AbortSignal;
+  latestAttemptExpectation?: LatestAttemptExpectation;
 }
 
 // Mirror of CLI `resolveStashDecision` for the dashboard. Returns 'stash' /
@@ -467,11 +491,35 @@ async function runFullAnalyze(id: string, repo: RegistryEntry, opts: StartRunOpt
     signal: opts.signal,
     provider,
     source: 'dashboard',
+    latestAttemptExpectation: opts.latestAttemptExpectation,
     onLlmEstimate: createSocketLlmEstimateHandler(id),
   });
 
   emitViolationsReady(id, outcome.analysisId);
   emitAnalysisComplete(id, outcome.analysisId);
+}
+
+function analysisFailureDetail(error: unknown, mode: 'full' | 'diff'): string {
+  if (error instanceof AnalysisStartBlockedError) {
+    return `Analysis did not start. ${dashboardStartBlockedDetail(error)} Open Analyses to refresh the latest run before trying again.`;
+  }
+  return error instanceof Error ? error.message : `${mode === 'diff' ? 'Diff check' : 'Analysis'} failed`;
+}
+
+function dashboardStartBlockedDetail(error: AnalysisStartBlockedError): string {
+  const selected = error.runId ?? 'the previously observed run';
+  switch (error.reason) {
+    case 'resume-required':
+      return `Saved attempted run ${selected} can be resumed. Open Analyses and choose Resume to reuse completed LLM work, or explicitly choose Start over; paid LLM calls may repeat and the active completed analysis remains canonical.`;
+    case 'recovery-required':
+      return `Saved attempted run ${selected} must be resumed to finish durable recovery. Start over is not offered because completed projections may need repair.`;
+    case 'resume-execution-ambiguous':
+      return `Saved attempted run ${selected} may still have a provider call in flight. Start over is blocked to avoid repeating a paid call.`;
+    case 'abandon-confirmation-required':
+      return `Saved attempted run ${selected} is incomplete. Open Analyses and explicitly choose Start over; paid LLM calls may repeat and the active completed analysis remains canonical.`;
+    case 'expectation-changed':
+      return `The saved attempted run changed before analysis started. Refresh Analyses and choose an action for ${selected}.`;
+  }
 }
 
 async function runDiffAnalyze(id: string, repo: RegistryEntry, opts: Pick<StartRunOptions, 'tracker' | 'signal'>): Promise<void> {

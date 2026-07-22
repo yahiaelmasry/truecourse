@@ -82,6 +82,7 @@ import { useAnalyzeRunStatus } from '@/hooks/useAnalyzeRunStatus';
 import {
   isActiveAnalysisProgress,
   isSettledResumeActivity,
+  isSettledStartOverActivity,
   shouldClearSettledResumeProgress,
 } from '@/lib/analysis-activity';
 import { useCodeViolationSummary } from '@/hooks/useCodeViolationSummary';
@@ -291,10 +292,15 @@ function RepoPageInner() {
     resume: resumeAnalyzeRun,
     resumeRunId,
     resumeError,
+    startOver: startOverAnalyzeRun,
+    startOverRunId,
+    startOverError,
   } = useAnalyzeRunStatus(repoId, hasVerifiedLocalFilesystem && leftTab === 'analyses');
   const previousAnalyzeRunMode = useRef(analyzeRunStatus?.activeMode);
   const previousResumeRunId = useRef(resumeRunId);
+  const previousStartOverRunId = useRef(startOverRunId);
   const initiatedResumeRepoId = useRef<string | null>(null);
+  const initiatedStartOverRepoId = useRef<string | null>(null);
   const currentRepoId = useRef(repoId);
   currentRepoId.current = repoId;
   const progressIsResume = analysisProgress?.mode === 'resume';
@@ -557,9 +563,34 @@ function RepoPageInner() {
       }
       initiatedResumeRepoId.current = null;
     }
+    if (
+      (activeMode === 'analysis' && initiatedStartOverRepoId.current === repoId)
+      || startOverRunId !== null
+    ) {
+      setIsAnalyzing(true);
+    } else if (isSettledStartOverActivity({
+      statusAvailable: true,
+      activeMode,
+      previousMode: previousAnalyzeRunMode.current,
+      hadPendingAction: previousStartOverRunId.current !== null,
+      initiated: initiatedStartOverRepoId.current === repoId,
+    })) {
+      setIsAnalyzing(false);
+      if (shouldClearSettledResumeProgress(
+        previousAnalyzeRunMode.current,
+        activeMode,
+        analysisProgress,
+        previousStartOverRunId.current !== null,
+        initiatedStartOverRepoId.current === repoId,
+      )) {
+        clearProgress();
+      }
+      initiatedStartOverRepoId.current = null;
+    }
     previousAnalyzeRunMode.current = activeMode;
     previousResumeRunId.current = resumeRunId;
-  }, [analysisProgress, analyzeRunStatus, clearProgress, repoId, resumeRunId]);
+    previousStartOverRunId.current = startOverRunId;
+  }, [analysisProgress, analyzeRunStatus, clearProgress, repoId, resumeRunId, startOverRunId]);
 
   useEffect(() => {
     if (initiatedResumeRepoId.current && initiatedResumeRepoId.current !== repoId) {
@@ -569,10 +600,19 @@ function RepoPageInner() {
     }
   }, [clearProgress, repoId]);
 
+  useEffect(() => {
+    if (initiatedStartOverRepoId.current && initiatedStartOverRepoId.current !== repoId) {
+      initiatedStartOverRepoId.current = null;
+      setIsAnalyzing(false);
+      clearProgress();
+    }
+  }, [clearProgress, repoId]);
+
   // Listen for analysis complete/canceled to update state
   useEffect(() => {
     const unsub1 = onEvent('analysis:complete', () => {
       initiatedResumeRepoId.current = null;
+      initiatedStartOverRepoId.current = null;
       setIsAnalyzing(false);
       setIsCancelling(false);
       refetchGraph();
@@ -586,6 +626,7 @@ function RepoPageInner() {
       api.getRepo(repoId).then(setRepo).catch(() => {});
     });
     const unsub2 = onEvent('analysis:canceled', () => {
+      initiatedStartOverRepoId.current = null;
       setIsAnalyzing(false);
       setIsCancelling(false);
       void refetchAnalyzeRunStatus();
@@ -599,9 +640,13 @@ function RepoPageInner() {
         initiatedResumeRepoId.current = null;
         setIsAnalyzing(false);
       }
+      if (initiatedStartOverRepoId.current === repoId) {
+        initiatedStartOverRepoId.current = null;
+        setIsAnalyzing(false);
+      }
       void refetchAnalyzeRunStatus();
     }
-  }, [analysisProgress?.mode, analysisProgress?.step, refetchAnalyzeRunStatus]);
+  }, [analysisProgress?.mode, analysisProgress?.step, refetchAnalyzeRunStatus, repoId]);
 
   // Refresh guard/spec staleness after a Scan / guard-generate / guard-run. The
   // server emits `spec:complete` with a kind — the corpus Scan updates its view
@@ -682,6 +727,25 @@ function RepoPageInner() {
       if (currentRepoId.current === initiatingRepoId) {
         setAnalysisError(error instanceof Error ? error.message : 'Analysis Resume failed');
       }
+    }
+  };
+
+  const handleStartOverAnalysis = async (runId: string) => {
+    const initiatingRepoId = repoId;
+    initiatedStartOverRepoId.current = initiatingRepoId;
+    setIsAnalyzing(true);
+    setAnalysisError(null);
+    try {
+      await startOverAnalyzeRun(runId);
+    } catch (error) {
+      if (initiatedStartOverRepoId.current === initiatingRepoId) {
+        initiatedStartOverRepoId.current = null;
+      }
+      setIsAnalyzing(false);
+      if (currentRepoId.current === initiatingRepoId) {
+        setAnalysisError(error instanceof Error ? error.message : 'Unable to start replacement analysis');
+      }
+      throw error;
     }
   };
 
@@ -1558,7 +1622,10 @@ function RepoPageInner() {
               runStatusError={analyzeRunStatusError}
               resumeRunId={resumeRunId}
               resumeError={resumeError}
+              startOverRunId={startOverRunId}
+              startOverError={startOverError}
               onResume={handleResumeAnalysis}
+              onStartOver={handleStartOverAnalysis}
             />
           ) : leftTab === 'home' || leftTab === 'analytics' || leftTab === 'violations' ? (
             repo == null ? (

@@ -30,6 +30,23 @@ export type AnalyzeRunResumeStatus =
       reason: AnalyzeRunResumeUnavailableReason;
     };
 
+export type AnalyzeRunStartOverUnavailableReason =
+  | 'resume-execution-ambiguous'
+  | 'recovery-required'
+  | 'run-completed'
+  | 'attempt-superseded';
+
+export type AnalyzeRunStartOverStatus =
+  | {
+      available: true;
+      requiresExactAttempt: true;
+      mayRepeatPaidCalls: true;
+    }
+  | {
+      available: false;
+      reason: AnalyzeRunStartOverUnavailableReason;
+    };
+
 export interface AnalyzeRunStatusResponse {
   /** In-process server activity; durable attempted-run state remains authoritative. */
   activeMode: AnalysisActivityMode | null;
@@ -54,6 +71,8 @@ export interface AnalyzeRunStatusResponse {
       blockedAt: string;
     } | null;
     resume: AnalyzeRunResumeStatus;
+    /** Server-classified replacement safety; clients must not infer this from state. */
+    startOver: AnalyzeRunStartOverStatus;
   } | null;
   /** Canonical completed findings baseline used by existing consumers. */
   activeCompletedAnalysis: {

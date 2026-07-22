@@ -10,15 +10,25 @@ export const CreateRepoSchema = z.object({
 
 export type CreateRepoInput = z.infer<typeof CreateRepoSchema>
 
-export const AnalyzeRepoSchema = z.object({
-  /** Which mode to run — full analyze (HEAD committed state) or diff (working tree
-   *  vs LATEST). Required; no silent default. */
-  mode: z.enum(['full', 'diff']),
-  /** Skip git ops (branch detection, commit hash read, pre-parse stash). Useful
-   *  for non-git dirs or test environments. No per-repo-config equivalent —
-   *  only way to opt out for a single run. */
-  skipGit: z.boolean().optional().default(false),
-})
+const AnalyzeSkipGitSchema = z.boolean().optional().default(false)
+
+export const AnalyzeRepoSchema = z.discriminatedUnion('mode', [
+  z.object({
+    /** Full analyze of the committed HEAD state. */
+    mode: z.literal('full'),
+    /** Skip git ops (branch detection, commit hash read, pre-parse stash). */
+    skipGit: AnalyzeSkipGitSchema,
+    /** Exact incomplete attempted run the user explicitly chose to replace. */
+    abandonAttemptRunId: z.string().min(1).optional(),
+  }),
+  z.object({
+    /** Working tree vs the active completed analysis in LATEST. */
+    mode: z.literal('diff'),
+    skipGit: AnalyzeSkipGitSchema,
+    /** Starting over is meaningful only for a full analysis. */
+    abandonAttemptRunId: z.never().optional(),
+  }),
+])
 
 export type AnalyzeRepoInput = z.infer<typeof AnalyzeRepoSchema>
 

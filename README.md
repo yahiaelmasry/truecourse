@@ -120,9 +120,13 @@ checkpoint reuse, reports progress and provider reset failures, and protects
 admitted execution from unsafe cancellation. The CLI will not silently replace incomplete paid work:
 resumable attempts direct the user toward recovery, execution-ambiguous
 attempts fail closed, and starting over requires exact acknowledgement with
-`--abandon-attempt <run-id>`. Dashboard enforcement and recovery actions follow
-the read-only status view in later dependencies. Starting over may repeat paid LLM calls; the active completed
-analysis remains canonical until the replacement succeeds. Once a replacement
+`--abandon-attempt <run-id>`. The local dashboard applies the same core-owned
+replacement policy before accepting a full analysis. Its Analyses view offers
+Start over only when the server classifies the saved attempt as safely
+abandonable, then requires confirmation bound to that exact run ID. Ambiguous
+provider execution and durable recovery/finalization states remain fail-closed.
+Starting over may repeat paid LLM calls; the active completed analysis remains
+canonical until the replacement succeeds. Once a replacement
 does succeed, the older attempt is ineligible for Resume against the newer
 completed baseline and no longer blocks later CLI analyses unless an admitted
 provider call remains execution-ambiguous. Until every full analysis is
@@ -132,7 +136,7 @@ internal admission boundary durably records `executing` and revalidates the
 exact provider/model pin before and after that write, before allowing pending
 work to start. The certified runner can recover with zero calls after the final
 checkpoint, and a prepared finalization can be replayed without provider work;
-dashboard Start over enforcement and automatic reset waiting remain later dependencies. A
+automatic reset waiting remains a later dependency. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
 Resume accounting is derived once from the complete durable checkpoint ledger,

@@ -5,6 +5,7 @@ import type { AnalyzeRunStatusResponse } from '@truecourse/shared';
 const api = vi.hoisted(() => ({
   getAnalyzeRunStatus: vi.fn(),
   resumeAnalyzeRun: vi.fn(),
+  analyzeRepo: vi.fn(),
 }));
 
 vi.mock('@/lib/api', () => api);
@@ -16,6 +17,7 @@ describe('useAnalyzeRunStatus', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     api.getAnalyzeRunStatus.mockReset();
     api.resumeAnalyzeRun.mockReset();
+    api.analyzeRepo.mockReset();
   });
 
   afterEach(() => {
@@ -257,6 +259,45 @@ describe('useAnalyzeRunStatus', () => {
     expect(result.current.resumeRunId).toBeNull();
     expect(result.current.resumeError).toBeNull();
   });
+
+  it('submits one exact Start over acknowledgement and reconciles status', async () => {
+    api.getAnalyzeRunStatus
+      .mockResolvedValueOnce(status('blocked', null, true))
+      .mockResolvedValueOnce(status('running', 'analysis'));
+    const start = deferred<void>();
+    api.analyzeRepo.mockReturnValue(start.promise);
+    const { result } = renderHook(() => useAnalyzeRunStatus('repo-1'));
+    await waitFor(() => expect(result.current.status).not.toBeNull());
+
+    let first!: Promise<void>;
+    await act(async () => {
+      first = result.current.startOver('run-1');
+      void result.current.startOver('run-1');
+    });
+
+    expect(api.analyzeRepo).toHaveBeenCalledTimes(1);
+    expect(api.analyzeRepo).toHaveBeenCalledWith('repo-1', { abandonAttemptRunId: 'run-1' });
+    expect(result.current.startOverRunId).toBe('run-1');
+    start.resolve();
+    await act(async () => first);
+    expect(result.current.status?.activeMode).toBe('analysis');
+    expect(result.current.startOverRunId).toBeNull();
+  });
+
+  it('binds a rejected Start over error to the exact run and refreshes policy', async () => {
+    api.getAnalyzeRunStatus.mockResolvedValue(status('blocked', null, true));
+    api.analyzeRepo.mockRejectedValue(new Error('The saved attempted run changed'));
+    const { result } = renderHook(() => useAnalyzeRunStatus('repo-1'));
+    await waitFor(() => expect(result.current.status).not.toBeNull());
+
+    await act(async () => {
+      await expect(result.current.startOver('run-1')).rejects.toThrow(/changed/i);
+    });
+
+    expect(api.getAnalyzeRunStatus).toHaveBeenCalledTimes(2);
+    expect(result.current.startOverRunId).toBeNull();
+    expect(result.current.startOverError).toMatch(/changed/i);
+  });
 });
 
 function status(
@@ -290,6 +331,11 @@ function status(
             scope: 'structural',
             reason: 'run-not-resumable',
           },
+      startOver: {
+        available: true,
+        requiresExactAttempt: true,
+        mayRepeatPaidCalls: true,
+      },
     },
     activeCompletedAnalysis: null,
   };

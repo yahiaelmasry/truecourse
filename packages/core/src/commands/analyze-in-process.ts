@@ -6,7 +6,6 @@
  */
 
 import {
-  activeCompletedBaselineId,
   readLatest,
   removeFromHistory,
 } from '../lib/analysis-store.js';
@@ -43,6 +42,10 @@ import {
   trackEvent,
   type TelemetrySource,
 } from '../services/telemetry.service.js';
+import {
+  readAnalyzeRunStatus,
+  type AnalyzeRunStatus,
+} from './analyze-run-status.js';
 
 export type { LlmEstimate };
 
@@ -65,6 +68,82 @@ export class AnalysisStartBlockedError extends Error {
     super(`Analysis start blocked: ${reason}${runId === null ? '' : ` (${runId})`}`);
     this.name = 'AnalysisStartBlockedError';
   }
+}
+
+export type AnalyzeStartDisposition =
+  | Readonly<{
+      kind: 'clear';
+      reason: 'no-incomplete-attempt' | 'run-completed' | 'attempt-superseded';
+    }>
+  | Readonly<{ kind: 'abandonable'; runId: string }>
+  | Readonly<{
+      kind: 'blocked';
+      reason: 'resume-execution-ambiguous' | 'recovery-required';
+      runId: string;
+    }>;
+
+/**
+ * Classify whether a new full analysis may replace the latest saved attempt.
+ * Adapters use this for presentation; the lifecycle-locked start path applies
+ * the same policy again before any compute or provider work begins.
+ */
+export function classifyAnalyzeStart(status: AnalyzeRunStatus): AnalyzeStartDisposition {
+  const run = status.latestAttempt;
+  if (run === null) return { kind: 'clear', reason: 'no-incomplete-attempt' };
+  if (run.state === 'completed') return { kind: 'clear', reason: 'run-completed' };
+
+  // An admitted provider call is fail-closed even if a newer baseline exists:
+  // supersession cannot prove that the paid call stopped.
+  if (!run.resume.available && run.resume.reason === 'resume-execution-ambiguous') {
+    return { kind: 'blocked', reason: 'resume-execution-ambiguous', runId: run.runId };
+  }
+
+  const activeCompletedId = status.activeCompletedAnalysis?.analysisId ?? null;
+  const superseded = activeCompletedId !== null
+    && run.completedBaselineId !== activeCompletedId
+    && run.candidateAnalysisId !== activeCompletedId;
+  if (superseded) return { kind: 'clear', reason: 'attempt-superseded' };
+
+  const requiresRecovery = (
+    (run.resume.available && run.state !== 'blocked')
+    || run.state === 'finalizing'
+    || run.finalization?.persistence === 'prepared'
+  );
+  if (requiresRecovery) {
+    return { kind: 'blocked', reason: 'recovery-required', runId: run.runId };
+  }
+  return { kind: 'abandonable', runId: run.runId };
+}
+
+/** Resolve an adapter's exact replacement intent against one status snapshot. */
+export function resolveAnalyzeStartExpectationFromStatus(
+  status: AnalyzeRunStatus,
+  abandonAttemptRunId?: string,
+): LatestAttemptExpectation {
+  const disposition = classifyAnalyzeStart(status);
+  if (disposition.kind === 'clear') {
+    if (abandonAttemptRunId !== undefined) {
+      throw new AnalysisStartBlockedError(
+        'expectation-changed',
+        status.latestAttempt?.runId ?? null,
+      );
+    }
+    return { kind: 'none-incomplete' };
+  }
+  if (disposition.kind === 'blocked') {
+    throw new AnalysisStartBlockedError(disposition.reason, disposition.runId);
+  }
+  if (abandonAttemptRunId === undefined) {
+    const run = status.latestAttempt!;
+    throw new AnalysisStartBlockedError(
+      run.resume.available ? 'resume-required' : 'abandon-confirmation-required',
+      run.runId,
+    );
+  }
+  if (abandonAttemptRunId !== disposition.runId) {
+    throw new AnalysisStartBlockedError('expectation-changed', disposition.runId);
+  }
+  return { kind: 'abandon', runId: disposition.runId };
 }
 
 export interface AnalyzeInProcessOptions {
@@ -202,36 +281,26 @@ async function validateLatestAttemptExpectation(
   repositoryKey: string,
   expectation: LatestAttemptExpectation,
 ): Promise<Readonly<{ handled: false }>> {
-  const [latest, completed] = await Promise.all([
-    readAnalyzeRun(repositoryKey, 'latest-attempt'),
-    readLatest(repositoryKey),
-  ]);
-  if (latest === null || latest.state === 'completed') {
+  const status = await readAnalyzeRunStatus(repositoryKey);
+  const disposition = classifyAnalyzeStart(status);
+  if (disposition.kind === 'blocked' && disposition.reason === 'resume-execution-ambiguous') {
+    throw new AnalysisStartBlockedError(disposition.reason, disposition.runId);
+  }
+  if (disposition.kind === 'clear') {
     if (expectation.kind === 'none-incomplete') return { handled: false };
-    throw new AnalysisStartBlockedError('expectation-changed', latest?.runId ?? null);
-  }
-
-  if (!latest.resume.available && latest.resume.reason === 'resume-execution-ambiguous') {
-    throw new AnalysisStartBlockedError('resume-execution-ambiguous', latest.runId);
-  }
-
-  const activeCompletedId = completed === null ? null : activeCompletedBaselineId(completed);
-  const superseded = activeCompletedId !== null
-    && latest.completedBaselineId !== activeCompletedId
-    && latest.candidateAnalysisId !== activeCompletedId;
-  if (superseded) {
-    if (expectation.kind === 'none-incomplete') return { handled: false };
-    throw new AnalysisStartBlockedError('expectation-changed', latest.runId);
-  }
-  if (expectation.kind === 'none-incomplete' || latest.runId !== expectation.runId) {
-    throw new AnalysisStartBlockedError('expectation-changed', latest.runId);
+    throw new AnalysisStartBlockedError(
+      'expectation-changed',
+      status.latestAttempt?.runId ?? null,
+    );
   }
   if (
-    (latest.resume.available && latest.state !== 'blocked')
-    || latest.state === 'finalizing'
-    || latest.finalization?.persistence === 'prepared'
+    expectation.kind !== 'abandon'
+    || expectation.runId !== disposition.runId
   ) {
-    throw new AnalysisStartBlockedError('recovery-required', latest.runId);
+    throw new AnalysisStartBlockedError('expectation-changed', disposition.runId);
+  }
+  if (disposition.kind === 'blocked') {
+    throw new AnalysisStartBlockedError(disposition.reason, disposition.runId);
   }
   return { handled: false };
 }

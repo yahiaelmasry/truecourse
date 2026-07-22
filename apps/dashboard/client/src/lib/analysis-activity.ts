@@ -23,6 +23,22 @@ export function isSettledResumeActivity(options: {
     );
 }
 
+export function isSettledStartOverActivity(options: {
+  statusAvailable: boolean;
+  activeMode: AnalysisActivityMode | null | undefined;
+  previousMode: AnalysisActivityMode | null | undefined;
+  hadPendingAction: boolean;
+  initiated: boolean;
+}): boolean {
+  return options.statusAvailable
+    && options.activeMode === null
+    && (
+      options.previousMode === 'analysis'
+      || options.hadPendingAction
+      || options.initiated
+    );
+}
+
 export function shouldClearSettledResumeProgress(
   previousMode: AnalysisActivityMode | null | undefined,
   activeMode: AnalysisActivityMode | null | undefined,

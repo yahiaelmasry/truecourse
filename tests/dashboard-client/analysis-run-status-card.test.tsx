@@ -27,6 +27,11 @@ const blockedStatus: AnalyzeRunStatusResponse = {
       requiresLatestAttempt: true,
       requiresRevalidation: true,
     },
+    startOver: {
+      available: true,
+      requiresExactAttempt: true,
+      mayRepeatPaidCalls: true,
+    },
   },
   activeCompletedAnalysis: {
     analysisId: 'analysis-safe-456',
@@ -44,7 +49,10 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
         onResume={onResume}
+        onStartOver={async () => undefined}
       />,
     );
 
@@ -61,6 +69,116 @@ describe('AnalysisRunStatusCard', () => {
     expect(onResume).toHaveBeenCalledWith('run-blocked-123');
     expect(screen.getByText(/revalidates saved inputs and checkpoints before reuse/i)).toBeInTheDocument();
     expect(screen.getByText(/CLI fallback/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start over' })).toBeEnabled();
+  });
+
+  it('confirms the captured exact run and explains checkpoint and baseline consequences', async () => {
+    const onStartOver = vi.fn(async () => undefined);
+    const { rerender } = render(
+      <AnalysisRunStatusCard
+        status={blockedStatus}
+        resumeRunId={null}
+        resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
+        onResume={async () => undefined}
+        onStartOver={onStartOver}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Start over' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('run-blocked-123');
+    expect(screen.getByRole('dialog')).toHaveTextContent(/60 successful LLM checks recorded/i);
+    expect(screen.getByRole('dialog')).toHaveTextContent(/paid calls may repeat/i);
+    expect(screen.getByRole('dialog')).toHaveTextContent(/analysis-safe-456.*remains trustworthy/i);
+
+    rerender(
+      <AnalysisRunStatusCard
+        status={{
+          ...blockedStatus,
+          latestAttempt: { ...blockedStatus.latestAttempt!, runId: 'newer-run' },
+        }}
+        resumeRunId={null}
+        resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
+        onResume={async () => undefined}
+        onStartOver={onStartOver}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Start over and analyze' }));
+    expect(onStartOver).toHaveBeenCalledTimes(1);
+    expect(onStartOver).toHaveBeenCalledWith('run-blocked-123');
+  });
+
+  it('keeps the saved run when confirmation is canceled', async () => {
+    const onStartOver = vi.fn(async () => undefined);
+    render(
+      <AnalysisRunStatusCard
+        status={blockedStatus}
+        resumeRunId={null}
+        resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
+        onResume={async () => undefined}
+        onStartOver={onStartOver}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Start over' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Keep saved run' }));
+    expect(onStartOver).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('does not describe uncheckpointed successful work as saved checkpoints', async () => {
+    render(
+      <AnalysisRunStatusCard
+        status={{
+          ...blockedStatus,
+          latestAttempt: {
+            ...blockedStatus.latestAttempt!,
+            resume: {
+              available: false,
+              scope: 'structural',
+              reason: 'successful-results-not-checkpointed',
+            },
+          },
+        }}
+        resumeRunId={null}
+        resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
+        onResume={async () => undefined}
+        onStartOver={async () => undefined}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Start over' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent(/60 successful LLM checks recorded/i);
+    expect(screen.getByRole('dialog')).not.toHaveTextContent(/saved.*checkpoints/i);
+  });
+
+  it('keeps authoritative rejection visible in the confirmation dialog', async () => {
+    render(
+      <AnalysisRunStatusCard
+        status={blockedStatus}
+        resumeRunId={null}
+        resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
+        onResume={async () => undefined}
+        onStartOver={async () => {
+          throw new Error('The saved attempted run changed; refresh Analyses.');
+        }}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Start over' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Start over and analyze' }));
+
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(/changed.*refresh/i);
   });
 
   it.each([
@@ -73,11 +191,15 @@ describe('AnalysisRunStatusCard', () => {
         status={{ ...blockedStatus, activeMode }}
         resumeRunId={resumeRunId}
         resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
         onResume={async () => undefined}
+        onStartOver={async () => undefined}
       />,
     );
 
     expect(screen.getByRole('button', { name: label })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Start over' })).toBeDisabled();
   });
 
   it('reports admission errors beside the exact Resume action', () => {
@@ -86,7 +208,10 @@ describe('AnalysisRunStatusCard', () => {
         status={blockedStatus}
         resumeRunId={null}
         resumeError="The selected attempted run is no longer the latest."
+        startOverRunId={null}
+        startOverError={null}
         onResume={async () => undefined}
+        onStartOver={async () => undefined}
       />,
     );
 
@@ -107,15 +232,19 @@ describe('AnalysisRunStatusCard', () => {
               scope: 'structural',
               reason: 'resume-execution-ambiguous',
             },
+            startOver: { available: false, reason: 'resume-execution-ambiguous' },
           },
         }}
         resumeRunId={null}
         resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
         onResume={async () => undefined}
+        onStartOver={async () => undefined}
       />,
     );
 
-    expect(screen.getByText(/provider call may still be incomplete/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/provider call may still be incomplete/i)).toHaveLength(2);
     expect(screen.queryByText(/truecourse analyze resume/i)).not.toBeInTheDocument();
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
@@ -128,7 +257,7 @@ describe('AnalysisRunStatusCard', () => {
     ['run-failed', /failed and is not eligible/i],
     ['run-not-resumable', /not in a resumable state/i],
     ['run-completed', /already completed/i],
-  ] as const)('explains %s without rendering a dashboard action', (reason, message) => {
+  ] as const)('explains %s and follows the server Start over policy', (reason, message) => {
     render(
       <AnalysisRunStatusCard
         status={{
@@ -136,16 +265,27 @@ describe('AnalysisRunStatusCard', () => {
           latestAttempt: {
             ...blockedStatus.latestAttempt!,
             resume: { available: false, scope: 'structural', reason },
+            startOver: reason === 'run-completed'
+              ? { available: false, reason: 'run-completed' }
+              : { available: true, requiresExactAttempt: true, mayRepeatPaidCalls: true },
           },
         }}
         resumeRunId={null}
         resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
         onResume={async () => undefined}
+        onStartOver={async () => undefined}
       />,
     );
 
     expect(screen.getByText(message)).toBeInTheDocument();
-    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument();
+    if (reason === 'run-completed') {
+      expect(screen.queryByRole('button', { name: 'Start over' })).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByRole('button', { name: 'Start over' })).toBeEnabled();
+    }
   });
 
   it('shows an interrupted attempt when no completed analysis rows exist', () => {
@@ -161,7 +301,10 @@ describe('AnalysisRunStatusCard', () => {
         runStatusError={null}
         resumeRunId={null}
         resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
         onResume={async () => undefined}
+        onStartOver={async () => undefined}
       />,
     );
 
@@ -182,7 +325,10 @@ describe('AnalysisRunStatusCard', () => {
         runStatusError="temporary disconnect"
         resumeRunId={null}
         resumeError={null}
+        startOverRunId={null}
+        startOverError={null}
         onResume={async () => undefined}
+        onStartOver={async () => undefined}
       />,
     );
 

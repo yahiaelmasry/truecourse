@@ -8,6 +8,7 @@ import {
   AnalysisResumeUnavailableError,
   AnalysisSessionLimitError,
   AnalysisStartBlockedError,
+  resolveAnalyzeStartExpectationFromStatus,
   type AnalyzeInProcessResult,
   type LatestAttemptExpectation,
   type ResumeAnalyzeInProcessOptions,
@@ -155,38 +156,19 @@ export async function resolveAnalyzeStartExpectation(
   options: AnalyzeStartExpectationOptions,
 ): Promise<LatestAttemptExpectation | null> {
   const status = await (options.readStatus ?? readAnalyzeRunStatus)(options.repositoryKey);
-  const run = status.latestAttempt;
-  if (run === null || run.state === 'completed') {
-    if (options.abandonAttemptRunId) {
-      throw new AnalysisStartBlockedError('expectation-changed', run?.runId ?? null);
+  try {
+    return resolveAnalyzeStartExpectationFromStatus(status, options.abandonAttemptRunId);
+  } catch (error) {
+    if (
+      !(error instanceof AnalysisStartBlockedError)
+      || error.reason !== 'abandon-confirmation-required'
+      || !options.interactive
+    ) {
+      throw error;
     }
-    return { kind: 'none-incomplete' };
-  }
-  if (!run.resume.available && run.resume.reason === 'resume-execution-ambiguous') {
-    throw new AnalysisStartBlockedError('resume-execution-ambiguous', run.runId);
-  }
-  if (attemptWasSuperseded(status)) {
-    if (options.abandonAttemptRunId) {
-      throw new AnalysisStartBlockedError('expectation-changed', run.runId);
-    }
-    return { kind: 'none-incomplete' };
-  }
-  if (requiresRecoveryBeforeReplacement(status)) {
-    throw new AnalysisStartBlockedError('recovery-required', run.runId);
-  }
-  if (options.abandonAttemptRunId) {
-    if (options.abandonAttemptRunId !== run.runId) {
-      throw new AnalysisStartBlockedError('expectation-changed', run.runId);
-    }
-    return { kind: 'abandon', runId: run.runId };
-  }
-  if (run.resume.available) {
-    throw new AnalysisStartBlockedError('resume-required', run.runId);
-  }
-  if (!options.interactive) {
-    throw new AnalysisStartBlockedError('abandon-confirmation-required', run.runId);
   }
 
+  const run = status.latestAttempt!;
   const baseline = status.activeCompletedAnalysis?.analysisId ?? 'none';
   const confirmed = await options.confirmAbandon(
     `Paid LLM calls may repeat when starting over. Active completed analysis ${baseline} stays canonical until a new analysis succeeds. Replace attempted run ${run.runId} and start over?`,
@@ -264,14 +246,6 @@ function attemptWasSuperseded(status: AnalyzeRunStatus): boolean {
   return activeCompletedId !== null
     && run.completedBaselineId !== activeCompletedId
     && run.candidateAnalysisId !== activeCompletedId;
-}
-
-function requiresRecoveryBeforeReplacement(status: AnalyzeRunStatus): boolean {
-  const run = status.latestAttempt;
-  if (run === null || run.state === 'completed') return false;
-  return (run.resume.available && run.state !== 'blocked')
-    || run.state === 'finalizing'
-    || run.finalization?.persistence === 'prepared';
 }
 
 function selectAnalyzeResumeRun(

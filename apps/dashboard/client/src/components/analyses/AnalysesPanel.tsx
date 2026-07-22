@@ -18,7 +18,10 @@ type AnalysesPanelProps = {
   runStatusError: string | null;
   resumeRunId: string | null;
   resumeError: string | null;
+  startOverRunId: string | null;
+  startOverError: string | null;
   onResume: (runId: string) => Promise<void>;
+  onStartOver: (runId: string) => Promise<void>;
 };
 
 const severityColors: Record<string, string> = {
@@ -111,7 +114,10 @@ export function AnalysesPanel({
   runStatusError,
   resumeRunId,
   resumeError,
+  startOverRunId,
+  startOverError,
   onResume,
+  onStartOver,
 }: AnalysesPanelProps) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [usageAnalysisId, setUsageAnalysisId] = useState<string | null>(null);
@@ -158,7 +164,10 @@ export function AnalysesPanel({
           status={runStatus}
           resumeRunId={resumeRunId}
           resumeError={resumeError}
+          startOverRunId={startOverRunId}
+          startOverError={startOverError}
           onResume={onResume}
+          onStartOver={onStartOver}
         />
       ) : runStatusLoading ? (
         <div

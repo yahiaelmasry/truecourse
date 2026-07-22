@@ -77,6 +77,30 @@ describe('AnalyzeRepoSchema', () => {
     expect(result.success).toBe(true);
   });
 
+  it('accepts an exact attempted-run acknowledgement for a full analysis', () => {
+    const result = AnalyzeRepoSchema.safeParse({
+      mode: 'full',
+      abandonAttemptRunId: 'run-blocked-123',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an empty attempted-run acknowledgement', () => {
+    const result = AnalyzeRepoSchema.safeParse({
+      mode: 'full',
+      abandonAttemptRunId: '',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects attempted-run acknowledgement for a diff analysis', () => {
+    const result = AnalyzeRepoSchema.safeParse({
+      mode: 'diff',
+      abandonAttemptRunId: 'run-blocked-123',
+    });
+    expect(result.success).toBe(false);
+  });
+
   it('rejects {} (mode is required)', () => {
     const result = AnalyzeRepoSchema.safeParse({});
     expect(result.success).toBe(false);

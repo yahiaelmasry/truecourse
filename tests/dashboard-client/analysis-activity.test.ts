@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   isActiveAnalysisProgress,
   isSettledResumeActivity,
+  isSettledStartOverActivity,
   shouldClearSettledResumeProgress,
 } from '@/lib/analysis-activity';
 
@@ -47,5 +48,29 @@ describe('dashboard analysis activity presentation', () => {
       false,
       true,
     )).toBe(true);
+  });
+
+  it('settles an initiated Start over from authoritative analysis ownership', () => {
+    expect(isSettledStartOverActivity({
+      statusAvailable: false,
+      activeMode: undefined,
+      previousMode: 'analysis',
+      hadPendingAction: false,
+      initiated: true,
+    })).toBe(false);
+    expect(isSettledStartOverActivity({
+      statusAvailable: true,
+      activeMode: null,
+      previousMode: 'analysis',
+      hadPendingAction: false,
+      initiated: true,
+    })).toBe(true);
+    expect(isSettledStartOverActivity({
+      statusAvailable: true,
+      activeMode: 'analysis',
+      previousMode: null,
+      hadPendingAction: false,
+      initiated: true,
+    })).toBe(false);
   });
 });

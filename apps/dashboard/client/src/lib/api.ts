@@ -207,11 +207,17 @@ export function browseDir(path?: string): Promise<BrowseDirResponse> {
 
 export function analyzeRepo(
   id: string,
-  options?: { skipGit?: boolean },
+  options?: { skipGit?: boolean; abandonAttemptRunId?: string },
 ): Promise<{ message: string; repoId: string; mode: 'full' }> {
   return fetchApi(`/api/repos/${id}/analyses`, {
     method: 'POST',
-    body: JSON.stringify({ mode: 'full', ...(options?.skipGit != null ? { skipGit: options.skipGit } : {}) }),
+    body: JSON.stringify({
+      mode: 'full',
+      ...(options?.skipGit != null ? { skipGit: options.skipGit } : {}),
+      ...(options?.abandonAttemptRunId != null
+        ? { abandonAttemptRunId: options.abandonAttemptRunId }
+        : {}),
+    }),
   });
 }
 

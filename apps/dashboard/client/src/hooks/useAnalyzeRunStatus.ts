@@ -11,12 +11,21 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
   const [error, setError] = useState<string | null>(null);
   const [resumeRunId, setResumeRunId] = useState<string | null>(null);
   const [resumeFailure, setResumeFailure] = useState<{ runId: string; message: string } | null>(null);
+  const [startOverRunId, setStartOverRunId] = useState<string | null>(null);
+  const [startOverFailure, setStartOverFailure] = useState<{ runId: string; message: string } | null>(null);
   const requestSequence = useRef(0);
   const inFlight = useRef<{ repoId: string; requestId: number } | null>(null);
   const resumeSequence = useRef(0);
+  const startOverSequence = useRef(0);
   const currentRepoId = useRef(repoId);
   currentRepoId.current = repoId;
   const resumeAction = useRef<{
+    repoId: string;
+    runId: string;
+    actionId: number;
+    phase: 'posting' | 'reconciling';
+  } | null>(null);
+  const startOverAction = useRef<{
     repoId: string;
     runId: string;
     actionId: number;
@@ -45,6 +54,11 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
         resumeAction.current = null;
         setResumeRunId(null);
       }
+      const replacement = startOverAction.current;
+      if (replacement?.repoId === repoId && replacement.phase === 'reconciling') {
+        startOverAction.current = null;
+        setStartOverRunId(null);
+      }
       return nextStatus;
     } catch (cause) {
       if (requestId !== requestSequence.current) return;
@@ -57,7 +71,10 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
 
   const resume = useCallback(async (runId: string): Promise<void> => {
     if (!enabled || !repoId) throw new Error('Analyze Resume is unavailable.');
-    if (resumeAction.current?.repoId === repoId) return;
+    if (
+      resumeAction.current?.repoId === repoId
+      || startOverAction.current?.repoId === repoId
+    ) return;
 
     const actionId = ++resumeSequence.current;
     const action = { repoId, runId, actionId, phase: 'posting' as const };
@@ -88,6 +105,45 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     }
   }, [enabled, refetch, repoId]);
 
+  const startOver = useCallback(async (runId: string): Promise<void> => {
+    if (!enabled || !repoId) throw new Error('Analyze Start over is unavailable.');
+    if (
+      resumeAction.current?.repoId === repoId
+      || startOverAction.current?.repoId === repoId
+    ) return;
+
+    const actionId = ++startOverSequence.current;
+    const action = { repoId, runId, actionId, phase: 'posting' as const };
+    startOverAction.current = action;
+    requestSequence.current += 1;
+    inFlight.current = null;
+    setStartOverRunId(runId);
+    setStartOverFailure(null);
+
+    try {
+      await api.analyzeRepo(repoId, { abandonAttemptRunId: runId });
+      if (startOverSequence.current !== actionId || startOverAction.current !== action) return;
+      startOverAction.current = { ...action, phase: 'reconciling' };
+      await refetch(true, true);
+    } catch (cause) {
+      if (
+        startOverSequence.current !== actionId
+        || startOverAction.current?.actionId !== actionId
+      ) {
+        if (currentRepoId.current === repoId) throw cause;
+        return;
+      }
+      startOverAction.current = null;
+      setStartOverRunId(null);
+      setStartOverFailure({
+        runId,
+        message: cause instanceof Error ? cause.message : 'Unable to start replacement analysis',
+      });
+      await refetch(true, true);
+      throw cause;
+    }
+  }, [enabled, refetch, repoId]);
+
   useEffect(() => {
     if (!enabled || !repoId) {
       requestSequence.current += 1;
@@ -100,12 +156,18 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
       resumeAction.current = null;
       setResumeRunId(null);
       setResumeFailure(null);
+      startOverSequence.current += 1;
+      startOverAction.current = null;
+      setStartOverRunId(null);
+      setStartOverFailure(null);
       return;
     }
 
     setError(null);
     setResumeRunId(null);
     setResumeFailure(null);
+    setStartOverRunId(null);
+    setStartOverFailure(null);
     void refetch();
     const timer = window.setInterval(() => void refetch(true), STATUS_POLL_MS);
     return () => {
@@ -114,6 +176,8 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
       inFlight.current = null;
       resumeSequence.current += 1;
       resumeAction.current = null;
+      startOverSequence.current += 1;
+      startOverAction.current = null;
     };
   }, [enabled, refetch, repoId]);
 
@@ -127,6 +191,12 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     resumeError: resumeFailure && statusRepoId === repoId
       && status?.latestAttempt?.runId === resumeFailure.runId
       ? resumeFailure.message
+      : null,
+    startOver,
+    startOverRunId,
+    startOverError: startOverFailure && statusRepoId === repoId
+      && status?.latestAttempt?.runId === startOverFailure.runId
+      ? startOverFailure.message
       : null,
   };
 }

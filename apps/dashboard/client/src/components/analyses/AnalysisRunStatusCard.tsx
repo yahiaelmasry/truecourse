@@ -1,14 +1,28 @@
+import { useRef, useState } from 'react';
 import { Clock, Loader2, RotateCcw, ShieldCheck } from 'lucide-react';
 import type {
   AnalyzeRunResumeUnavailableReason,
+  AnalyzeRunStartOverUnavailableReason,
   AnalyzeRunStatusResponse,
 } from '@truecourse/shared';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 interface AnalysisRunStatusCardProps {
   status: AnalyzeRunStatusResponse;
   resumeRunId: string | null;
   resumeError: string | null;
+  startOverRunId: string | null;
+  startOverError: string | null;
   onResume: (runId: string) => Promise<void>;
+  onStartOver: (runId: string) => Promise<void>;
 }
 
 const unavailableMessages: Record<AnalyzeRunResumeUnavailableReason, string> = {
@@ -21,14 +35,50 @@ const unavailableMessages: Record<AnalyzeRunResumeUnavailableReason, string> = {
   'run-completed': 'this run is already completed',
 };
 
+const startOverUnavailableMessages: Record<AnalyzeRunStartOverUnavailableReason, string> = {
+  'resume-execution-ambiguous': 'a previously admitted provider call may still be incomplete',
+  'recovery-required': 'durable recovery or finalization must be resumed first',
+  'run-completed': 'this run is already completed',
+  'attempt-superseded': 'a newer completed analysis has already superseded this attempt',
+};
+
 export function AnalysisRunStatusCard({
   status,
   resumeRunId,
   resumeError,
+  startOverRunId,
+  startOverError,
   onResume,
+  onStartOver,
 }: AnalysisRunStatusCardProps) {
   const attempt = status.latestAttempt;
   const completed = status.activeCompletedAnalysis;
+  const [confirmation, setConfirmation] = useState<{
+    runId: string;
+    savedSuccesses: number;
+    completedAnalysisId: string | null;
+  } | null>(null);
+  const [confirmationError, setConfirmationError] = useState<string | null>(null);
+  const [isConfirming, setIsConfirming] = useState(false);
+  const confirmingRef = useRef(false);
+
+  const confirmStartOver = async () => {
+    if (!confirmation || confirmingRef.current || status.activeMode !== null) return;
+    confirmingRef.current = true;
+    setIsConfirming(true);
+    setConfirmationError(null);
+    try {
+      await onStartOver(confirmation.runId);
+      setConfirmation(null);
+    } catch (cause) {
+      setConfirmationError(
+        cause instanceof Error ? cause.message : 'Unable to start replacement analysis',
+      );
+    } finally {
+      confirmingRef.current = false;
+      setIsConfirming(false);
+    }
+  };
 
   return (
     <div className="mb-4 grid gap-3 rounded-lg border border-border bg-card p-4 md:grid-cols-2">
@@ -76,7 +126,11 @@ export function AnalysisRunStatusCard({
               <div className="space-y-2 rounded-md bg-muted/60 p-2 text-[11px] leading-4 text-muted-foreground">
                 <button
                   type="button"
-                  disabled={resumeRunId === attempt.runId || status.activeMode !== null}
+                  disabled={
+                    resumeRunId === attempt.runId
+                    || startOverRunId !== null
+                    || status.activeMode !== null
+                  }
                   onClick={() => void onResume(attempt.runId)}
                   className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
                 >
@@ -110,6 +164,44 @@ export function AnalysisRunStatusCard({
                 Resume unavailable — {unavailableMessages[attempt.resume.reason]}.
               </div>
             )}
+            {attempt.startOver.available ? (
+              <div className="space-y-2 rounded-md border border-destructive/25 bg-destructive/5 p-2 text-[11px] leading-4 text-muted-foreground">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={
+                    status.activeMode !== null
+                    || resumeRunId !== null
+                    || startOverRunId !== null
+                  }
+                  onClick={() => {
+                    setConfirmation({
+                      runId: attempt.runId,
+                      savedSuccesses: attempt.counts?.succeeded ?? 0,
+                      completedAnalysisId: completed?.analysisId ?? null,
+                    });
+                    setConfirmationError(null);
+                  }}
+                >
+                  {startOverRunId === attempt.runId && (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  )}
+                  {startOverRunId === attempt.runId ? 'Starting over…' : 'Start over'}
+                </Button>
+                <div>
+                  Start a new full analysis only after confirming this exact run. Saved successful
+                  work will not be reused, so paid LLM calls may repeat.
+                </div>
+                {startOverError && (
+                  <div className="text-destructive" role="alert">{startOverError}</div>
+                )}
+              </div>
+            ) : attempt.startOver.reason !== 'run-completed' ? (
+              <div className="text-[11px] text-muted-foreground">
+                Start over unavailable — {startOverUnavailableMessages[attempt.startOver.reason]}.
+              </div>
+            ) : null}
             {attempt.state !== 'completed' && (
               <div className="text-[11px] text-muted-foreground">
                 Partial findings from this run do not replace the active completed analysis.
@@ -143,6 +235,65 @@ export function AnalysisRunStatusCard({
           <div className="text-xs text-muted-foreground">No completed analysis yet.</div>
         )}
       </section>
+
+      <Dialog
+        open={confirmation !== null}
+        onOpenChange={(open) => {
+          if (!open && !isConfirming) {
+            setConfirmation(null);
+            setConfirmationError(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Start over this run?</DialogTitle>
+            <DialogDescription>
+              This acknowledgement is bound to the exact attempted run shown below.
+            </DialogDescription>
+          </DialogHeader>
+          {confirmation && (
+            <div className="space-y-3 text-sm">
+              <code className="block break-all rounded bg-muted px-2 py-1.5 text-xs">
+                {confirmation.runId}
+              </code>
+              <p>
+                Starting over will not reuse {confirmation.savedSuccesses} successful LLM
+                {' '}{confirmation.savedSuccesses === 1 ? 'check' : 'checks'} recorded in this attempt,
+                so paid calls may repeat.
+              </p>
+              <p>
+                Active completed analysis {confirmation.completedAnalysisId ?? 'none'} remains
+                trustworthy and canonical until the replacement analysis completes.
+              </p>
+              {(confirmationError || startOverError) && (
+                <div className="text-destructive" role="alert">
+                  {confirmationError ?? startOverError}
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isConfirming}
+              onClick={() => setConfirmation(null)}
+            >
+              Keep saved run
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={isConfirming || status.activeMode !== null || startOverRunId !== null}
+              onClick={() => void confirmStartOver()}
+            >
+              {isConfirming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              Start over and analyze
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

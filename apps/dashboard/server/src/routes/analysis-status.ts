@@ -1,7 +1,12 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
-import type { AnalyzeRunResumeStatus, AnalyzeRunStatusResponse } from '@truecourse/shared';
+import type {
+  AnalyzeRunResumeStatus,
+  AnalyzeRunStartOverStatus,
+  AnalyzeRunStatusResponse,
+} from '@truecourse/shared';
 import { createAppError } from '@truecourse/core/lib/errors';
 import { resolveProjectForRequest } from '@truecourse/core/config/current-project';
+import { classifyAnalyzeStart } from '@truecourse/core/commands/analyze-in-process';
 import {
   readAnalyzeRunStatus,
   type AnalyzeRunStatus,
@@ -57,6 +62,7 @@ function toAnalyzeRunStatusResponse(
               }
             : null,
           resume: toResumeStatus(attempt.resume),
+          startOver: toStartOverStatus(status),
         }
       : null,
     activeCompletedAnalysis: completed
@@ -67,6 +73,26 @@ function toAnalyzeRunStatusResponse(
           commitHash: completed.commitHash,
         }
       : null,
+  };
+}
+
+function toStartOverStatus(status: AnalyzeRunStatus): AnalyzeRunStartOverStatus {
+  const disposition = classifyAnalyzeStart(status);
+  if (disposition.kind === 'abandonable') {
+    return {
+      available: true,
+      requiresExactAttempt: true,
+      mayRepeatPaidCalls: true,
+    };
+  }
+  if (disposition.kind === 'blocked') {
+    return { available: false, reason: disposition.reason };
+  }
+  return {
+    available: false,
+    reason: disposition.reason === 'attempt-superseded'
+      ? 'attempt-superseded'
+      : 'run-completed',
   };
 }
 
