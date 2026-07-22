@@ -35,6 +35,8 @@ import {
   readAnalyzeRun,
   type AnalyzeRunSource,
 } from '../lib/analyze-run-journal.js';
+import { readAnalyzeRunResumeCandidate } from '../lib/analyze-run-resume-candidate.js';
+import { CertifiedViolationResumeUnavailableError } from '../services/llm/certified-violation-phase.js';
 import type { Graph, LatestSnapshot, UsageRecord, ViolationRecord } from '../types/snapshot.js';
 import type { StepTracker } from '../progress.js';
 
@@ -147,6 +149,8 @@ export interface AnalyzeCoreOptions {
   source?: AnalyzeRunSource;
   /** @internal Full wrapper owns the matching prepared-finalization callback. */
   journalFullRun?: boolean;
+  /** @internal Exact durable attempted run selected for production reconstruction. */
+  resumeFullRunId?: string;
 }
 
 export interface AnalyzeCoreResult {
@@ -204,7 +208,25 @@ async function computeAnalyzeCore(
 
   const { mode, signal } = options;
   const isDiff = mode === 'diff';
+  if (options.resumeFullRunId && (isDiff || options.journalFullRun)) {
+    throw new Error('Certified Resume is available only for one existing full analyze run');
+  }
+  const resumeCandidate = options.resumeFullRunId
+    ? await readAnalyzeRunResumeCandidate(project.path, options.resumeFullRunId)
+    : null;
+  if (options.resumeFullRunId && !resumeCandidate) {
+    throw new CertifiedViolationResumeUnavailableError('run-not-found');
+  }
+  const resumeExecution = resumeCandidate && resumeCandidate.plan !== 'unsealed'
+    ? resumeCandidate.plan.execution
+    : null;
+  if (resumeCandidate && !resumeExecution) {
+    throw new CertifiedViolationResumeUnavailableError('checkpoint-execution-changed');
+  }
   const skipGit = !isDiff && !!options.skipGit;
+  if (resumeCandidate && (!options.skipStash || skipGit)) {
+    throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+  }
   const projectConfig = await readProjectConfig(project.path);
 
   const latestBaseline = await readLatest(project.path);
@@ -229,14 +251,28 @@ async function computeAnalyzeCore(
         commitHash = null;
       }
     }
+  } else if (resumeCandidate && !skipGit) {
+    const git = await getGit(codeDir);
+    branch = (await git.branch()).current || null;
+    commitHash = (await git.revparse(['HEAD'])).trim();
   } else if (!skipGit && (branch === null || commitHash === null)) {
     const git = await getGit(codeDir);
     if (branch === null) branch = (await git.branch()).current || null;
     if (commitHash === null) commitHash = (await git.revparse(['HEAD'])).trim();
   }
 
-  const analysisId = randomUUID();
-  const now = new Date().toISOString();
+  if (resumeCandidate && options.skipStash && !skipGit) {
+    const git = await getGit(codeDir);
+    const status = await git.status();
+    const hasUserChanges = status.files.some(({ path: changedPath }) =>
+      !isTruecourseStatePath(changedPath));
+    if (hasUserChanges) {
+      throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+    }
+  }
+
+  const analysisId = resumeCandidate?.candidateAnalysisId ?? randomUUID();
+  const now = resumeCandidate?.startedAt ?? new Date().toISOString();
   const start = Date.now();
 
   const effectiveCategories = options.enabledCategoriesOverride?.length
@@ -280,6 +316,9 @@ async function computeAnalyzeCore(
       log.warn(
         `[Analyzer] Failed to stash changes, analyzing current state: ${error instanceof Error ? error.message : String(error)}`,
       );
+      if (resumeCandidate) {
+        throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+      }
     }
   }
 
@@ -393,7 +432,10 @@ async function computeAnalyzeCore(
     const provider =
       options.provider ??
       (effectiveLlmRules
-        ? createLLMProvider(options.transport ?? getDefaultTransport(), options.selectedModel)
+        ? createLLMProvider(
+            options.transport ?? getDefaultTransport(),
+            resumeExecution ? resumeExecution.requestedModel : options.selectedModel,
+          )
         : undefined);
     if (provider) {
       provider.setAnalysisId(analysisId);
@@ -434,6 +476,29 @@ async function computeAnalyzeCore(
             completedBaselineId: latestBaseline?.analysis.id ?? null,
           }
         : undefined,
+      certifiedLlmResume: resumeCandidate
+        ? {
+            run: {
+              repositoryKey: project.path,
+              repositoryRoot: codeDir,
+              runId: resumeCandidate.runId,
+              candidateAnalysisId: resumeCandidate.candidateAnalysisId,
+              startedAt: resumeCandidate.startedAt,
+              source: resumeCandidate.source,
+              branch,
+              commitHash,
+              completedBaselineId: latestBaseline?.analysis.id ?? null,
+            },
+            activatedAt: timestampAtOrAfter(
+              resumeCandidate.blocked?.blockedAt
+                ?? resumeCandidate.executionAttempt.activatedAt,
+            ),
+            admittedAt: timestampAtOrAfter(
+              resumeCandidate.blocked?.blockedAt
+                ?? resumeCandidate.executionAttempt.activatedAt,
+            ),
+          }
+        : undefined,
       onLlmEstimate: options.onLlmEstimate
         ? async (estimate) => {
             const proceed = await options.onLlmEstimate!(estimate);
@@ -453,7 +518,9 @@ async function computeAnalyzeCore(
     }
 
     // Drain LLM usage before the pipelineResult is frozen into a snapshot.
-    const usage = provider ? toUsageRecords(provider.flushUsage()) : [];
+    const usage = pipelineResult.certifiedLlmExecution?.usage
+      ? [...pipelineResult.certifiedLlmExecution.usage]
+      : provider ? toUsageRecords(provider.flushUsage()) : [];
 
     // Contract verification has been decoupled from `analyze`. The
     // rule engine and the contract verifier answer different questions
@@ -547,4 +614,13 @@ function enforceLocationInvariant(violations: ViolationRecord[]): void {
     v.lineStart = null;
     v.lineEnd = null;
   }
+}
+
+function timestampAtOrAfter(notBefore: string): string {
+  return new Date(Math.max(Date.now(), Date.parse(notBefore))).toISOString();
+}
+
+function isTruecourseStatePath(changedPath: string): boolean {
+  const normalized = changedPath.replaceAll('\\', '/');
+  return normalized === '.truecourse' || normalized.startsWith('.truecourse/');
 }

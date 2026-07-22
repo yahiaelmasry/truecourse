@@ -30,12 +30,15 @@ import {
   type ActiveViolation,
 } from './violation-lifecycle.service.js';
 import { log } from '../lib/logger.js';
-import type { ResolvedViolationRef, ViolationRecord } from '../types/snapshot.js';
+import type { ResolvedViolationRef, UsageRecord, ViolationRecord } from '../types/snapshot.js';
 import { isLlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   executeCertifiedViolationPhase,
+  resumeCertifiedViolationPhase,
   type CertifiedViolationPhaseResult,
   type CertifiedViolationPhaseRun,
+  type CertifiedViolationResumePhaseResult,
+  CertifiedViolationResumeUnavailableError,
 } from './llm/certified-violation-phase.js';
 import type { AnalyzeLlmExecutionAdapter } from './llm/certified-analyze-llm-run.js';
 import { dispatchAnalyzeRun, readAnalyzeRun } from '../lib/analyze-run-journal.js';
@@ -43,6 +46,7 @@ import {
   mergeCertifiedArchitectureResults,
   selectCertifiedArchitectureContexts,
 } from './llm/certified-architecture-phase.js';
+import { fingerprintCertifiedAnalysisInputs } from './llm/certified-analysis-input-fingerprint.js';
 
 /** Throw if the abort signal has been triggered. */
 function throwIfAborted(signal?: AbortSignal) {
@@ -207,6 +211,12 @@ export interface ViolationPipelineInput {
   onLlmEstimate?: (estimate: import('./llm/context-router.js').PreFlightEstimate) => Promise<boolean>;
   /** Exact attempted-run identity for an eligible full-analysis certified LLM phase. */
   certifiedLlmRun?: CertifiedViolationPhaseRun;
+  /** Exact selected attempted run and chronology for an eligible certified Resume. */
+  certifiedLlmResume?: {
+    run: CertifiedViolationPhaseRun;
+    activatedAt: string;
+    admittedAt: string;
+  };
 }
 
 export interface ViolationPipelineResult {
@@ -221,7 +231,10 @@ export interface ViolationPipelineResult {
   /** Compact refs for AnalysisSnapshot.violations.resolved (saves space in delta). */
   resolvedRefs: ResolvedViolationRef[];
   /** Present only when every provider call belonged to one certified durable plan. */
-  certifiedLlmExecution?: Pick<CertifiedViolationPhaseResult, 'runId' | 'completion'>;
+  certifiedLlmExecution?: Pick<CertifiedViolationPhaseResult, 'runId' | 'completion'> & {
+    /** Present only for Resume, where durable checkpoints are the accounting authority. */
+    usage?: readonly UsageRecord[];
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +410,9 @@ export async function runViolationPipeline(
 async function runViolationPipelineInternal(
   input: ViolationPipelineInput,
 ): Promise<ViolationPipelineResult> {
+  if (input.certifiedLlmRun && input.certifiedLlmResume) {
+    throw new Error('Analyze cannot start and resume a certified LLM run together');
+  }
   // Ensure tree-sitter WASM parsers are loaded before any parseFile/checkCodeRules
   // call below. Idempotent — returns the cached promise on subsequent calls.
   await initParsers();
@@ -413,6 +429,7 @@ async function runViolationPipelineInternal(
     signal,
   } = input;
   const disabledRuleSet = new Set<string>(disabledRules ?? []);
+  const certifiedRun = input.certifiedLlmRun ?? input.certifiedLlmResume?.run;
 
   const added: ViolationRecord[] = [];
   const unchanged: ViolationRecord[] = [];
@@ -440,6 +457,14 @@ async function runViolationPipelineInternal(
     .filter((r) => !enabledCategories || enabledCategories.includes(r.domain ?? r.category))
     .filter((r) => enableLlmRules !== false || r.type !== 'llm')
     .filter((r) => !disabledRuleSet.has(r.key));
+  const analysisInputFingerprint = certifiedRun
+    ? fingerprintCertifiedAnalysisInputs({
+        enabledCategories,
+        enableLlmRules,
+        disabledRules: [...disabledRuleSet],
+        rules: allRules,
+      })
+    : undefined;
 
   let llmSkipped = false;
   const enabledDeterministic = allRules.filter((r) => r.type === 'deterministic');
@@ -1294,17 +1319,30 @@ async function runViolationPipelineInternal(
   };
   const aggregateContextMode = hasAggregateLlmExistingViolations ? 'lifecycle' : 'normal';
   const aggregateLlmContexts = buildViolationLlmContexts(violationInput, aggregateContextMode);
-  const certifiedArchitectureContexts = selectCertifiedArchitectureContexts(
+  const selectedCertifiedArchitectureContexts = selectCertifiedArchitectureContexts(
     aggregateLlmContexts,
   );
+  const certifiedArchitectureContexts = selectedCertifiedArchitectureContexts
+    ? {
+        service: selectedCertifiedArchitectureContexts.service && analysisInputFingerprint
+          ? { ...selectedCertifiedArchitectureContexts.service, analysisInputFingerprint }
+          : selectedCertifiedArchitectureContexts.service,
+        module: selectedCertifiedArchitectureContexts.module && analysisInputFingerprint
+          ? { ...selectedCertifiedArchitectureContexts.module, analysisInputFingerprint }
+          : selectedCertifiedArchitectureContexts.module,
+      }
+    : null;
   const certifiedArchitectureOnly = Boolean(
-    input.certifiedLlmRun
+    certifiedRun
     && domainCodeBatches.size === 0
     && !dbSchemaContext
     && certifiedArchitectureContexts
     && isCertifiedExecutionAdapter(provider)
     && provider.execution.provider !== 'transport:unverified',
   );
+  if (input.certifiedLlmResume && !certifiedArchitectureOnly) {
+    throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
+  }
   let certifiedLlmExecution: ViolationPipelineResult['certifiedLlmExecution'];
 
   // ---------- Build LLM trackers (one shared instance per tracker key) ----------
@@ -1527,30 +1565,42 @@ async function runViolationPipelineInternal(
     const archOnCallDone = (key: 'service' | 'database' | 'module') => {
       archLl?.onCallDone(archStarted.has(key));
     };
-    let certifiedPhase: CertifiedViolationPhaseResult | undefined;
+    let certifiedPhase: CertifiedViolationPhaseResult | CertifiedViolationResumePhaseResult | undefined;
     try {
       let archResult: ViolationsResult | AllViolationsLifecycleResult;
       if (certifiedArchitectureOnly) {
-        certifiedPhase = await executeCertifiedViolationPhase({
-          run: input.certifiedLlmRun!,
-          analysisTimestamp: now,
-          adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
-          code: [],
-          service: certifiedArchitectureContexts!.service,
-          module: certifiedArchitectureContexts!.module,
-          observer: {
-            onWorkStart(work) {
-              if (work.family === 'service' || work.family === 'module') {
-                archOnCallStart(work.family);
-              }
-            },
-            onWorkDone(work) {
-              if (work.family === 'service' || work.family === 'module') {
-                archOnCallDone(work.family);
-              }
-            },
+        const observer = {
+          onWorkStart(work) {
+            if (work.family === 'service' || work.family === 'module') {
+              archOnCallStart(work.family);
+            }
           },
-        });
+          onWorkDone(work) {
+            if (work.family === 'service' || work.family === 'module') {
+              archOnCallDone(work.family);
+            }
+          },
+        } satisfies NonNullable<Parameters<typeof executeCertifiedViolationPhase>[0]['observer']>;
+        certifiedPhase = input.certifiedLlmResume
+          ? await resumeCertifiedViolationPhase({
+              run: input.certifiedLlmResume.run,
+              adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
+              code: [],
+              service: certifiedArchitectureContexts!.service,
+              module: certifiedArchitectureContexts!.module,
+              activatedAt: input.certifiedLlmResume.activatedAt,
+              admittedAt: input.certifiedLlmResume.admittedAt,
+              observer,
+            })
+          : await executeCertifiedViolationPhase({
+              run: input.certifiedLlmRun!,
+              analysisTimestamp: now,
+              adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
+              code: [],
+              service: certifiedArchitectureContexts!.service,
+              module: certifiedArchitectureContexts!.module,
+              observer,
+            });
         archResult = mergeCertifiedArchitectureResults(
           violationInput,
           certifiedPhase,
@@ -1644,6 +1694,7 @@ async function runViolationPipelineInternal(
         certifiedLlmExecution = {
           runId: certifiedPhase.runId,
           completion: certifiedPhase.completion,
+          ...('usage' in certifiedPhase ? { usage: certifiedPhase.usage } : {}),
         };
       }
 
@@ -1652,14 +1703,14 @@ async function runViolationPipelineInternal(
     } catch (error) {
       if (certifiedPhase) {
         const attempted = await readAnalyzeRun(
-          input.certifiedLlmRun!.repositoryKey,
+          certifiedRun!.repositoryKey,
           { runId: certifiedPhase.runId },
         );
-        await dispatchAnalyzeRun(input.certifiedLlmRun!.repositoryKey, {
+        await dispatchAnalyzeRun(certifiedRun!.repositoryKey, {
           kind: 'fail',
           runId: certifiedPhase.runId,
           failedAt: timestampAtOrAfter(
-            attempted?.updatedAt ?? input.certifiedLlmRun!.startedAt,
+            attempted?.updatedAt ?? certifiedRun!.startedAt,
           ),
           error: {
             code: 'ANALYZE_LLM_RESULT_FAILED',

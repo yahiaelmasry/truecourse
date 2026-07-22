@@ -5,6 +5,7 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ARCHITECTURE_LLM_RULES } from '../../packages/analyzer/src/index.js';
+import { analyzeCore } from '../../packages/core/src/commands/analyze-core.js';
 import { analyzeInProcess } from '../../packages/core/src/commands/analyze-in-process.js';
 import {
   registerProject,
@@ -64,6 +65,10 @@ class LimitedDirectClaudeProvider extends ClaudeCodeProvider {
 }
 
 class PartiallyLimitedDirectClaudeProvider extends ClaudeCodeProvider {
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
   protected async spawnCLI(
     _prompt: string,
     _schema: string,
@@ -75,8 +80,64 @@ class PartiallyLimitedDirectClaudeProvider extends ClaudeCodeProvider {
     return JSON.stringify({
       structured_output: { violations: [], serviceDescriptions: [] },
       usage: { input_tokens: 100, output_tokens: 20 },
+      modelUsage: { 'claude-sonnet-4-5-20250929': { inputTokens: 100 } },
       total_cost_usd: 0.0123,
     });
+  }
+}
+
+class ResumingDirectClaudeProvider extends ClaudeCodeProvider {
+  readonly stages: string[] = [];
+  readonly modelOverrides: (string | undefined)[] = [];
+
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string; modelOverride?: string },
+  ): Promise<string> {
+    this.stages.push(options?.stage ?? 'unknown');
+    this.modelOverrides.push(options?.modelOverride);
+    const resolvedModel = options?.modelOverride ?? 'claude-sonnet-4-5-20250929';
+    return JSON.stringify({
+      structured_output: { violations: [] },
+      usage: { input_tokens: 100, output_tokens: 20 },
+      modelUsage: { [resolvedModel]: { inputTokens: 100 } },
+      total_cost_usd: 0.0123,
+    });
+  }
+}
+
+class NeverCallDirectClaudeProvider extends ClaudeCodeProvider {
+  calls = 0;
+
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(): Promise<string> {
+    this.calls += 1;
+    throw new Error('Provider must not be called');
+  }
+}
+
+class ResumeLimitedDirectClaudeProvider extends ClaudeCodeProvider {
+  readonly stages: string[] = [];
+
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string },
+  ): Promise<string> {
+    this.stages.push(options?.stage ?? 'unknown');
+    throw new LlmSessionLimitError('tomorrow 8pm (Africa/Cairo)');
   }
 }
 
@@ -206,6 +267,7 @@ describe('certified full analyze production path', () => {
     execSync('git add -A', { cwd: workDir, env });
     execSync('git -c commit.gpgsign=false commit -q -m init', { cwd: workDir, env });
     project = await registerProject(workDir);
+    await writeProjectConfig(workDir, { enabledCategories: ['architecture'] });
     clearLatestCache();
   });
 
@@ -317,6 +379,307 @@ describe('certified full analyze production path', () => {
     });
     await expect(readLatest(workDir)).resolves.toMatchObject({
       analysis: { id: baseline.analysisId, status: 'completed' },
+    });
+  }, 30_000);
+
+  it('rejects a missing selected attempt before analysis or provider work', async () => {
+    const provider = new NeverCallDirectClaudeProvider();
+
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: 'missing-run',
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({ reason: 'run-not-found' });
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toBeNull();
+  });
+
+  it('reconstructs the selected attempt, executes only pending work, and leaves completed truth unchanged', async () => {
+    const baseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    resetAnalyzeRunStorage();
+    const provider = new ResumingDirectClaudeProvider();
+    const resumed = await analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    });
+
+    expect(resumed.analysisId).toBe(blocked!.candidateAnalysisId);
+    expect(resumed.pipelineResult.certifiedLlmExecution).toMatchObject({
+      runId: blocked!.runId,
+      usage: [
+        expect.objectContaining({ totalTokens: 120 }),
+        expect.objectContaining({ totalTokens: 120 }),
+      ],
+    });
+    expect(provider.stages).toEqual(['analyze.module']);
+    expect(provider.modelOverrides).toEqual(['claude-sonnet-4-5-20250929']);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'running',
+      executionAttempt: { number: 2, resume: { admission: 'executing' } },
+      counts: { total: 2, succeeded: 2, pending: 0 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId },
+    });
+  }, 30_000);
+
+  it('rejects a dirty working-tree reconstruction before a provider call', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    fs.appendFileSync(path.join(workDir, 'src', 'orders.ts'), '// uncommitted change\n');
+
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({ reason: 'work-plan-changed' });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'blocked',
+      revision: blocked!.revision,
+      counts: { succeeded: 1, pending: 1 },
+    });
+  }, 30_000);
+
+  it('rejects attempts to bypass repository validation with a spoofed old git identity', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    fs.appendFileSync(path.join(workDir, 'src', 'orders.ts'), '// committed drift\n');
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 't@t',
+    };
+    execSync('git add -A', { cwd: workDir, env });
+    execSync('git -c commit.gpgsign=false commit -q -m changed', { cwd: workDir, env });
+
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      skipGit: true,
+      branch: blocked!.branch,
+      commitHash: blocked!.commitHash,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({ reason: 'work-plan-changed' });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'blocked',
+      revision: blocked!.revision,
+      counts: { succeeded: 1, pending: 1 },
+    });
+  }, 30_000);
+
+  it('derives actual HEAD instead of trusting supplied identity hints during reconstruction', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    fs.writeFileSync(path.join(workDir, 'README.md'), 'docs-only clean commit\n');
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 't@t',
+    };
+    execSync('git add -A', { cwd: workDir, env });
+    execSync('git -c commit.gpgsign=false commit -q -m docs', { cwd: workDir, env });
+
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      branch: blocked!.branch,
+      commitHash: blocked!.commitHash,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({ reason: 'run-identity-changed' });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'blocked',
+      revision: blocked!.revision,
+      counts: { succeeded: 1, pending: 1 },
+    });
+  }, 30_000);
+
+  it('rejects configuration drift before a reconstructed provider call', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    await writeProjectConfig(workDir, {
+      enabledCategories: ['architecture'],
+      disabledRules: ['architecture/deterministic/god-service'],
+    });
+
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({ reason: 'work-plan-changed' });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'blocked',
+      revision: blocked!.revision,
+      counts: { succeeded: 1, pending: 1 },
+    });
+  }, 30_000);
+
+  it('rejects completed-baseline drift before a reconstructed provider call', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    const newerBaseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({ reason: 'run-identity-changed' });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'blocked',
+      revision: blocked!.revision,
+      counts: { succeeded: 1, pending: 1 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: newerBaseline.analysisId },
+    });
+  }, 30_000);
+
+  it('re-blocks the selected attempt when its pending provider work reaches the limit again', async () => {
+    const baseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    resetAnalyzeRunStorage();
+    const provider = new ResumeLimitedDirectClaudeProvider();
+    await expect(analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    })).rejects.toMatchObject({
+      code: 'LLM_SESSION_LIMIT',
+      resetHint: 'tomorrow 8pm (Africa/Cairo)',
+    });
+
+    expect(provider.stages).toEqual(['analyze.module']);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'blocked',
+      executionAttempt: { number: 2 },
+      blocked: { resetHint: 'tomorrow 8pm (Africa/Cairo)' },
+      counts: { total: 2, succeeded: 1, pending: 1 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId },
     });
   }, 30_000);
 
