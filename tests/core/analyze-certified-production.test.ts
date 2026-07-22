@@ -6,7 +6,11 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ARCHITECTURE_LLM_RULES } from '../../packages/analyzer/src/index.js';
 import { analyzeCore } from '../../packages/core/src/commands/analyze-core.js';
-import { analyzeInProcess } from '../../packages/core/src/commands/analyze-in-process.js';
+import {
+  AnalysisResumeUnavailableError,
+  analyzeInProcess,
+  resumeAnalyzeInProcess,
+} from '../../packages/core/src/commands/analyze-in-process.js';
 import {
   registerProject,
   resetRegistryStore,
@@ -18,6 +22,7 @@ import {
   clearLatestCache,
   getAnalysisStore,
   listAnalyses,
+  readAnalysis,
   readHistory,
   readLatest,
   resetAnalysisStore,
@@ -138,6 +143,12 @@ class ResumeLimitedDirectClaudeProvider extends ClaudeCodeProvider {
   ): Promise<string> {
     this.stages.push(options?.stage ?? 'unknown');
     throw new LlmSessionLimitError('tomorrow 8pm (Africa/Cairo)');
+  }
+}
+
+class CleanupFailingResumingProvider extends ResumingDirectClaudeProvider {
+  override flushUsage(): never {
+    throw new Error('injected provider cleanup failure');
   }
 }
 
@@ -396,6 +407,18 @@ describe('certified full analyze production path', () => {
     await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toBeNull();
   });
 
+  it('reports unavailable public Resume states through one typed command error', async () => {
+    const provider = new NeverCallDirectClaudeProvider();
+    const failure = await resumeAnalyzeInProcess(project, {
+      runId: 'missing-run',
+      provider,
+    }).then(() => null, (error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AnalysisResumeUnavailableError);
+    expect(failure).toMatchObject({ reason: 'run-not-found' });
+    expect(provider.calls).toBe(0);
+  });
+
   it('reconstructs the selected attempt, executes only pending work, and leaves completed truth unchanged', async () => {
     const baseline = await analyzeInProcess(project, {
       enableLlmRulesOverride: false,
@@ -438,6 +461,50 @@ describe('certified full analyze production path', () => {
     });
     await expect(readLatest(workDir)).resolves.toMatchObject({
       analysis: { id: baseline.analysisId },
+    });
+  }, 30_000);
+
+  it('resumes pending production work and atomically promotes the completed candidate', async () => {
+    const baseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId },
+    });
+
+    resetAnalyzeRunStorage();
+    const provider = new ResumingDirectClaudeProvider();
+    const resumed = await resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
+      provider,
+    });
+
+    expect(resumed.analysisId).toBe(blocked!.candidateAnalysisId);
+    expect(provider.stages).toEqual(['analyze.module']);
+    expect(provider.modelOverrides).toEqual(['claude-sonnet-4-5-20250929']);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'completed',
+      counts: { total: 2, succeeded: 2, pending: 0 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: resumed.analysisId, status: 'completed' },
+    });
+    await expect(readAnalysis(workDir, resumed.filename)).resolves.toMatchObject({
+      id: resumed.analysisId,
+      usage: [
+        expect.objectContaining({ totalTokens: 120 }),
+        expect.objectContaining({ totalTokens: 120 }),
+      ],
     });
   }, 30_000);
 
@@ -660,16 +727,18 @@ describe('certified full analyze production path', () => {
 
     resetAnalyzeRunStorage();
     const provider = new ResumeLimitedDirectClaudeProvider();
-    await expect(analyzeCore(project, {
-      mode: 'full',
-      resumeFullRunId: blocked!.runId,
+    const failure = await resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
       provider,
-      skipStash: true,
-      enableLlmRulesOverride: true,
-    })).rejects.toMatchObject({
+    }).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
       code: 'LLM_SESSION_LIMIT',
       resetHint: 'tomorrow 8pm (Africa/Cairo)',
     });
+    expect(failure instanceof Error ? failure.message : '').toMatch(
+      /saved as the latest attempted run.*Core API callers can resume.*CLI\/dashboard Resume actions are not wired yet.*starting a new run may repeat/is,
+    );
 
     expect(provider.stages).toEqual(['analyze.module']);
     await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
@@ -680,6 +749,55 @@ describe('certified full analyze production path', () => {
     });
     await expect(readLatest(workDir)).resolves.toMatchObject({
       analysis: { id: baseline.analysisId },
+    });
+  }, 30_000);
+
+  it('finalizes fully checkpointed reconstruction recovery without another provider call', async () => {
+    const baseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    resetAnalyzeRunStorage();
+    await expect(resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
+      provider: new CleanupFailingResumingProvider(),
+    })).rejects.toThrow('injected provider cleanup failure');
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'running',
+      executionAttempt: { resume: { admission: 'executing' } },
+      counts: { total: 2, succeeded: 2, pending: 0 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId },
+    });
+
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    const recovered = await resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
+      provider,
+    });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: blocked!.runId })).resolves.toMatchObject({
+      state: 'completed',
+      counts: { total: 2, succeeded: 2, pending: 0 },
+    });
+    await expect(readAnalysis(workDir, recovered.filename)).resolves.toMatchObject({
+      usage: [
+        expect.objectContaining({ totalTokens: 120 }),
+        expect.objectContaining({ totalTokens: 120 }),
+      ],
     });
   }, 30_000);
 
@@ -844,6 +962,24 @@ describe('certified full analyze production path', () => {
     await expect(readLatest(workDir)).resolves.toMatchObject({
       analysis: { id: attempted?.candidateAnalysisId, status: 'completed' },
     });
+
+    setAnalysisStore(baseStore);
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+    const recovered = await resumeAnalyzeInProcess(project, {
+      runId: attempted!.runId,
+      provider,
+    });
+
+    expect(provider.calls).toBe(0);
+    expect(recovered.analysisId).toBe(attempted?.candidateAnalysisId);
+    await expect(readAnalyzeRun(workDir, { runId: attempted!.runId })).resolves.toMatchObject({
+      state: 'completed',
+      finalization: { persistence: 'prepared' },
+    });
+    expect((await readHistory(workDir)).analyses.filter(
+      (analysis) => analysis.id === recovered.analysisId,
+    )).toHaveLength(1);
   }, 30_000);
 
   it('fails the attempted run when its finalization plan cannot be built', async () => {

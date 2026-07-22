@@ -191,8 +191,14 @@ export async function analyzeCoreAndFinalize<T>(
   project: RegistryEntry,
   options: AnalyzeCoreOptions,
   finalize: (core: AnalyzeCoreResult) => Promise<T>,
+  beforeCompute?: () => Promise<
+    | Readonly<{ handled: true; result: T }>
+    | Readonly<{ handled: false }>
+  >,
 ): Promise<T> {
   return withAnalyzeLifecycleLock(project.path, async () => {
+    const early = await beforeCompute?.();
+    if (early?.handled) return early.result;
     const core = await computeAnalyzeCore(project, options);
     return finalize(core);
   });

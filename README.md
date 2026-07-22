@@ -99,16 +99,16 @@ diff/registry projections, and journal completion in that order. An exact retry
 repairs any interrupted step without replacing a newer completed descendant.
 The certified executor writes each accepted result and its usage evidence to
 the attempted-run journal before reporting that work item successful. Eligible
-Eligible journaled architecture runs therefore preserve paid successes. The
-production analysis core can reconstruct one explicitly selected blocked run,
-atomically revalidate it, replay its checkpoints, and execute only pending work,
-but no CLI/dashboard Resume action or completed-analysis finalization is exposed
-yet. The journal's internal
+journaled architecture runs therefore preserve paid successes. The
+production `resumeAnalyzeInProcess` command can reconstruct one explicitly
+selected blocked run, atomically revalidate it, replay its checkpoints, execute
+only pending work, and promote the candidate after complete finalization. CLI
+and dashboard Resume actions are not wired yet. The journal's internal
 admission boundary durably records `executing` and revalidates the exact
 provider/model pin before and after that write, before allowing pending work to
 start. The certified runner can recover with zero calls after the final
-checkpoint; `analyzeInProcess`/CLI/dashboard finalization wiring remains a later
-dependency. A
+checkpoint, and a prepared finalization can be replayed without provider work;
+CLI/dashboard wiring remains a later dependency. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
 Resume accounting is derived once from the complete durable checkpoint ledger,
