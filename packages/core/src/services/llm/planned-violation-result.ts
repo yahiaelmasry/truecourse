@@ -213,9 +213,12 @@ function materializeCode(
   raw: CodeViolationOutput | CodeViolationLifecycleOutput,
 ): CodeViolationsResult {
   const request = planned.request;
+  const runtimePathByPrompt = new Map(
+    request.sourceBindings.map(({ promptPath, runtimePath }) => [promptPath, runtimePath]),
+  );
   const mapFinding = (violation: CodeViolationOutput['violations'][number]) => ({
     ruleKey: violation.ruleKey,
-    filePath: violation.filePath,
+    filePath: runtimePathByPrompt.get(violation.filePath) ?? violation.filePath,
     lineStart: violation.lineStart,
     lineEnd: violation.lineEnd,
     severity: violation.severity,

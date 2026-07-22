@@ -278,4 +278,29 @@ describe('planned violation result materialization', () => {
       }, options)).toEqual(expect.objectContaining(candidate.expected));
     }
   });
+
+  it('maps a prompt-local targeted code finding back to its runtime path', () => {
+    const targetedPromptContext: CodeViolationContext = {
+      ...codeContext,
+      files: [{ path: 'context', content: '=== src/orders.ts (lines 1-1) ===\n1: export const order = 1;' }],
+    };
+    const work = certified('code', 'bugs', 'normal', planCodeViolationWork(targetedPromptContext, execution));
+
+    const materialized = materializePlannedViolationResult(
+      {
+        work,
+        result: {
+          violations: [{
+            ruleKey: 'bugs/llm/review', filePath: 'file-0', lineStart: 1, lineEnd: 1,
+            severity: 'high', title: 'Code issue', content: 'Fix code.', fixPrompt: null,
+          }],
+        },
+      },
+      { createId: () => 'unused', createdAt: () => '2026-07-19T12:00:00.000Z' },
+    );
+
+    expect(materialized.result).toEqual({
+      violations: [expect.objectContaining({ filePath: 'src/orders.ts' })],
+    });
+  });
 });

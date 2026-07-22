@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { checkCodeRules, withParsedTree, detectLanguage, buildScopedCompilerOptions, createTypeQueryService, hasTypeAwareVisitors, hasSchemaAwareVisitors, buildSchemaIndex, initParsers, runRoslynHost, runRoslynWorkspace, RoslynHostUnavailableError, type TypeQueryService, type SchemaIndex } from '@truecourse/analyzer';
-import type { CodeViolation } from '@truecourse/shared';
+import type { CodeViolation, RuleDomain } from '@truecourse/shared';
 import type { ModuleViolation, ServiceViolation } from '@truecourse/analyzer';
 import { runDeterministicModuleChecks, runDeterministicMethodChecks, runDeterministicServiceChecks, type AnalysisResult } from './analyzer.service.js';
 import { DOMAIN_ORDER, CODE_DOMAINS } from '../progress.js';
@@ -49,6 +49,7 @@ import {
   selectCertifiedArchitectureContexts,
 } from './llm/certified-architecture-phase.js';
 import { fingerprintCertifiedAnalysisInputs } from './llm/certified-analysis-input-fingerprint.js';
+import { codeViolationToolPolicy } from './llm/prepared-code-violation-request.js';
 
 /** Throw if the abort signal has been triggered. */
 function throwIfAborted(signal?: AbortSignal) {
@@ -342,6 +343,13 @@ export function aggregateCodeBatchOutcomes(
     failures,
   };
 }
+
+type DomainLlmResult = {
+  domain: string;
+  violations: CodeViolation[];
+  resolvedIds: string[];
+  unchangedIds: string[];
+};
 
 export function hasCodeLifecycleResults(
   violations: CodeViolation[],
@@ -1345,15 +1353,21 @@ async function runViolationPipelineInternal(
           : selectedCertifiedArchitectureContexts.module,
       }
     : null;
-  const certifiedArchitectureOnly = Boolean(
+  const certifiedCode = [...domainCodeBatches.entries()].flatMap(([domain, batches]) =>
+    batches.map((context) => ({
+      domain: domain as RuleDomain,
+      context: analysisInputFingerprint ? { ...context, analysisInputFingerprint } : context,
+    })),
+  );
+  const certifiedCompletePlan = Boolean(
     certifiedRun
-    && domainCodeBatches.size === 0
     && !dbSchemaContext
-    && certifiedArchitectureContexts
+    && (certifiedArchitectureContexts || certifiedCode.length > 0)
+    && certifiedCode.every(({ context }) => codeViolationToolPolicy(context) === 'none')
     && isCertifiedExecutionAdapter(provider)
     && provider.execution.provider !== 'transport:unverified',
   );
-  if (certifiedRecovery && !certifiedArchitectureOnly) {
+  if (certifiedRecovery && !certifiedCompletePlan) {
     throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
   }
   let certifiedLlmExecution: ViolationPipelineResult['certifiedLlmExecution'];
@@ -1388,10 +1402,9 @@ async function runViolationPipelineInternal(
     tracker?.start('architecture', ll.initialDetail);
   }
 
-  type DomainLlmResult = { domain: string; violations: CodeViolation[]; resolvedIds: string[]; unchangedIds: string[] };
   const domainLlmPromises: Promise<DomainLlmResult>[] = [];
 
-  for (const [domain, batches] of domainCodeBatches) {
+  for (const [domain, batches] of certifiedCompletePlan ? [] : domainCodeBatches) {
     domainLlmPromises.push((async (): Promise<DomainLlmResult> => {
       const detCount = violationsByDomain.get(domain) ?? 0;
       log.info(`[LLM] ${domain}: starting (${batches.length} code batches)`);
@@ -1565,8 +1578,8 @@ async function runViolationPipelineInternal(
 
   onProgress?.({ step: 'analyzing', percent: 86, detail: 'Analyzing architecture & modules...' });
 
-  const llmRulePromise = (async () => {
-    if (enableLlmRules === false || llmSkipped) return;
+  const llmRulePromise = (async (): Promise<DomainLlmResult[]> => {
+    if (enableLlmRules === false || llmSkipped) return [];
     const archLl = llmTrackers.get('architecture');
     // Mirror sub-call lifecycle events into the architecture tracker so
     // `LLM X/Y · M running · elapsed` refreshes per sub-call, not all-at-end.
@@ -1581,15 +1594,20 @@ async function runViolationPipelineInternal(
     let certifiedPhase: CertifiedViolationPhaseResult | CertifiedViolationResumePhaseResult | undefined;
     try {
       let archResult: ViolationsResult | AllViolationsLifecycleResult;
-      if (certifiedArchitectureOnly) {
+      let certifiedCodeResults: DomainLlmResult[] = [];
+      if (certifiedCompletePlan) {
         const observer = {
           onWorkStart(work) {
-            if (work.family === 'service' || work.family === 'module') {
+            if (work.family === 'code') {
+              llmTrackers.get(work.domain)?.onCallStart();
+            } else if (work.family === 'service' || work.family === 'module') {
               archOnCallStart(work.family);
             }
           },
-          onWorkDone(work) {
-            if (work.family === 'service' || work.family === 'module') {
+          onWorkDone(work, state) {
+            if (work.family === 'code') {
+              llmTrackers.get(work.domain)?.onCallDone(state.started);
+            } else if (work.family === 'service' || work.family === 'module') {
               archOnCallDone(work.family);
             }
           },
@@ -1598,9 +1616,9 @@ async function runViolationPipelineInternal(
           ? await resumeCertifiedViolationPhase({
               run: input.certifiedLlmResume.run,
               adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
-              code: [],
-              service: certifiedArchitectureContexts!.service,
-              module: certifiedArchitectureContexts!.module,
+              code: certifiedCode,
+              service: certifiedArchitectureContexts?.service,
+              module: certifiedArchitectureContexts?.module,
               activatedAt: input.certifiedLlmResume.activatedAt,
               admittedAt: input.certifiedLlmResume.admittedAt,
               observer,
@@ -1609,9 +1627,9 @@ async function runViolationPipelineInternal(
             ? await rearmCertifiedViolationPhase({
                 run: input.certifiedLlmRearm.run,
                 adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
-                code: [],
-                service: certifiedArchitectureContexts!.service,
-                module: certifiedArchitectureContexts!.module,
+                code: certifiedCode,
+                service: certifiedArchitectureContexts?.service,
+                module: certifiedArchitectureContexts?.module,
                 consent: input.certifiedLlmRearm.consent,
                 activatedAt: input.certifiedLlmRearm.activatedAt,
                 admittedAt: input.certifiedLlmRearm.admittedAt,
@@ -1621,11 +1639,20 @@ async function runViolationPipelineInternal(
               run: input.certifiedLlmRun!,
               analysisTimestamp: now,
               adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
-              code: [],
-              service: certifiedArchitectureContexts!.service,
-              module: certifiedArchitectureContexts!.module,
+              code: certifiedCode,
+              service: certifiedArchitectureContexts?.service,
+              module: certifiedArchitectureContexts?.module,
               observer,
             });
+        certifiedCodeResults = materializeCertifiedCodeDomains(
+          certifiedPhase,
+          domainCodeBatches,
+          violationsByDomain,
+          validFilePaths,
+          fileContents,
+          repoPath,
+          tracker,
+        );
         archResult = mergeCertifiedArchitectureResults(
           violationInput,
           certifiedPhase,
@@ -1725,6 +1752,7 @@ async function runViolationPipelineInternal(
 
       const archCount = serviceViolationResults.length + moduleViolationResults.length + methodViolationResults.length;
       tracker?.done('architecture', archCount > 0 ? `${archCount} violations` : 'Clean');
+      return certifiedCodeResults;
     } catch (error) {
       if (certifiedPhase) {
         const attempted = await readAnalyzeRun(
@@ -1757,9 +1785,15 @@ async function runViolationPipelineInternal(
     (result) => result.status === 'rejected' && isLlmSessionLimitError(result.reason),
   );
   if (sessionLimit?.status === 'rejected') throw sessionLimit.reason;
-  if (certifiedArchitectureOnly && llmResult.status === 'rejected') {
+  if (certifiedCompletePlan && llmResult.status === 'rejected') {
     throw llmResult.reason;
   }
+  const allDomainLlmResults: PromiseSettledResult<DomainLlmResult>[] = [
+    ...domainLlmResults,
+    ...(llmResult.status === 'fulfilled'
+      ? llmResult.value.map((value) => ({ status: 'fulfilled' as const, value }))
+      : []),
+  ];
 
   if (detResult.status === 'rejected') {
     log.error(`[Violations] Deterministic lifecycle tracking failed: ${detResult.reason instanceof Error ? detResult.reason.message : String(detResult.reason)}`);
@@ -1886,7 +1920,7 @@ async function runViolationPipelineInternal(
   const allLlmCodeViolations: CodeViolation[] = [];
   const allLlmResolvedIds: string[] = [];
   const allLlmUnchangedIds: string[] = [];
-  for (const r of domainLlmResults) {
+  for (const r of allDomainLlmResults) {
     if (r.status === 'fulfilled') {
       const v = r.value as DomainLlmResult;
       allLlmCodeViolations.push(...v.violations);
@@ -2034,6 +2068,64 @@ async function runViolationPipelineInternal(
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
+
+function materializeCertifiedCodeDomains(
+  phase: CertifiedViolationPhaseResult,
+  batchesByDomain: ReadonlyMap<string, CodeViolationContext[]>,
+  deterministicCounts: ReadonlyMap<string, number>,
+  validFilePaths: Set<string>,
+  fileContents: Map<string, { content: string; lineCount: number }>,
+  repoPath: string,
+  tracker?: import('../progress.js').StepTracker,
+): DomainLlmResult[] {
+  const resultsByDomain = new Map<string, CodeViolationsResult[]>();
+  for (const outcome of phase.results) {
+    if (outcome.family !== 'code') continue;
+    const results = resultsByDomain.get(outcome.domain) ?? [];
+    results.push(outcome.result as CodeViolationsResult);
+    resultsByDomain.set(outcome.domain, results);
+  }
+
+  const expectedCount = [...batchesByDomain.values()].reduce(
+    (total, batches) => total + batches.length,
+    0,
+  );
+  const actualCount = [...resultsByDomain.values()].reduce(
+    (total, results) => total + results.length,
+    0,
+  );
+  if (actualCount !== expectedCount) {
+    throw new Error(`Certified code plan returned ${actualCount} results for ${expectedCount} batches`);
+  }
+
+  const materialized: DomainLlmResult[] = [];
+  for (const [domain, batches] of batchesByDomain) {
+    const results = resultsByDomain.get(domain) ?? [];
+    if (results.length !== batches.length) {
+      throw new Error(`Certified code plan returned ${results.length} ${domain} results for ${batches.length} batches`);
+    }
+    const violations = results.flatMap((result) => result.violations);
+    const resolvedIds = [...new Set(results.flatMap((result) => result.resolvedViolationIds ?? []))];
+    const unchangedIds = [...new Set(results.flatMap((result) => result.unchangedViolationIds ?? []))];
+    const processed: CodeViolation[] = [];
+    processLlmCodeViolations(
+      { violations },
+      validFilePaths,
+      fileContents,
+      processed,
+      repoPath,
+    );
+    const total = codeDomainViolationTotal(
+      deterministicCounts.get(domain) ?? 0,
+      processed.length,
+      unchangedIds,
+    );
+    log.info(`[LLM] ${domain}: certified ${processed.length} LLM violations (${total} total)`);
+    tracker?.done(domain, total > 0 ? `${total} violations` : 'Clean');
+    materialized.push({ domain, violations: processed, resolvedIds, unchangedIds });
+  }
+  return materialized;
+}
 
 function processLlmCodeViolations(
   codeResult: { violations: { ruleKey: string; filePath: string; lineStart: number; lineEnd: number; severity: string; title: string; content: string; fixPrompt: string | null; sourceTier?: CodeViolationRaw['sourceTier'] }[] },
