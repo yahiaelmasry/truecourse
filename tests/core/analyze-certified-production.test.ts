@@ -102,6 +102,46 @@ class PartiallyLimitedDirectClaudeProvider extends ClaudeCodeProvider {
   }
 }
 
+class TargetedCodeCheckpointThenLimitProvider extends ClaudeCodeProvider {
+  readonly stages: string[] = [];
+
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string },
+  ): Promise<string> {
+    const stage = options?.stage ?? 'unknown';
+    this.stages.push(stage);
+    if (stage === 'analyze.module') {
+      throw new LlmSessionLimitError('7pm (Africa/Cairo)');
+    }
+    const structuredOutput = stage === 'analyze.code'
+      ? {
+          violations: [{
+            ruleKey: 'bugs/llm/race-condition',
+            filePath: 'file-0',
+            lineStart: 1,
+            lineEnd: 1,
+            severity: 'high',
+            title: 'Checkpointed targeted code finding',
+            content: 'The async operation may race with another invocation.',
+            fixPrompt: null,
+          }],
+        }
+      : { violations: [], serviceDescriptions: [] };
+    return JSON.stringify({
+      structured_output: structuredOutput,
+      usage: { input_tokens: 100, output_tokens: 20 },
+      modelUsage: { 'claude-sonnet-4-5-20250929': { inputTokens: 100 } },
+      total_cost_usd: 0.0123,
+    });
+  }
+}
+
 class ResumingDirectClaudeProvider extends ClaudeCodeProvider {
   readonly stages: string[] = [];
   readonly modelOverrides: (string | undefined)[] = [];
@@ -389,6 +429,125 @@ describe('certified full analyze production path', () => {
     });
     await expect(getProjectBySlug(project.slug)).resolves.toMatchObject({
       lastAnalyzed: expect.any(String),
+    });
+  }, 30_000);
+
+  it('checkpoints eligible targeted code before a later provider limit blocks the attempted run', async () => {
+    fs.writeFileSync(
+      path.join(workDir, 'src', 'async-order.ts'),
+      "export async function loadOrder() { return await Promise.resolve('ok'); }\n",
+    );
+    await writeProjectConfig(workDir, {
+      enabledCategories: ['bugs', 'architecture'],
+      disabledRules: ['bugs/llm/inconsistent-return'],
+    });
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 't@t',
+    };
+    execSync('git add -A', { cwd: workDir, env });
+    execSync('git -c commit.gpgsign=false commit -q -m targeted-code', { cwd: workDir, env });
+
+    const baseline = await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    const latestPath = path.join(workDir, '.truecourse', 'LATEST.json');
+    const historyPath = path.join(workDir, '.truecourse', 'history.json');
+    const digest = (file: string): string =>
+      createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    const latestBefore = digest(latestPath);
+    const historyBefore = digest(historyPath);
+
+    const provider = new TargetedCodeCheckpointThenLimitProvider();
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider,
+      enabledCategoriesOverride: ['bugs', 'architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      code: 'LLM_SESSION_LIMIT',
+      resetHint: '7pm (Africa/Cairo)',
+      runId: expect.any(String),
+    });
+
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
+      state: 'blocked',
+      counts: { total: 3, succeeded: 2, pending: 1 },
+      resume: { available: true, mode: 'resume' },
+    });
+    expect([...provider.stages].sort()).toEqual([
+      'analyze.code',
+      'analyze.module',
+      'analyze.service',
+    ].sort());
+    expect(digest(latestPath)).toBe(latestBefore);
+    expect(digest(historyPath)).toBe(historyBefore);
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId, status: 'completed' },
+    });
+  }, 30_000);
+
+  it('resumes the pending architecture work without repeating checkpointed targeted code', async () => {
+    fs.writeFileSync(
+      path.join(workDir, 'src', 'async-order.ts'),
+      "export async function loadOrder() { return await Promise.resolve('ok'); }\n",
+    );
+    await writeProjectConfig(workDir, {
+      enabledCategories: ['bugs', 'architecture'],
+      disabledRules: ['bugs/llm/inconsistent-return'],
+    });
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 't@t',
+    };
+    execSync('git add -A', { cwd: workDir, env });
+    execSync('git -c commit.gpgsign=false commit -q -m targeted-code', { cwd: workDir, env });
+
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new TargetedCodeCheckpointThenLimitProvider(),
+      enabledCategoriesOverride: ['bugs', 'architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    resetAnalyzeRunStorage();
+    const provider = new ResumingDirectClaudeProvider();
+    const resumed = await resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
+      provider,
+    });
+
+    expect(provider.stages).toEqual(['analyze.module']);
+    expect(provider.modelOverrides).toEqual(['claude-sonnet-4-5-20250929']);
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: resumed.analysisId, status: 'completed' },
+      violations: expect.arrayContaining([
+        expect.objectContaining({ title: 'Checkpointed targeted code finding' }),
+      ]),
+    });
+    await expect(readAnalysis(workDir, resumed.filename)).resolves.toMatchObject({
+      usage: [
+        expect.objectContaining({ totalTokens: 120 }),
+        expect.objectContaining({ totalTokens: 120 }),
+        expect.objectContaining({ totalTokens: 120 }),
+      ],
     });
   }, 30_000);
 

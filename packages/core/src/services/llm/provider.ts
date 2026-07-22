@@ -141,6 +141,8 @@ export interface CodeContextSource {
 }
 
 export interface CodeViolationContext {
+  /** Broader certified-analysis configuration/rule compatibility evidence. */
+  analysisInputFingerprint?: string;
   files: { path: string; content: string }[];
   /** Exact source ranges supplied to this work unit and therefore owned by its result. */
   sourceScopes: CodeSourceScope[];

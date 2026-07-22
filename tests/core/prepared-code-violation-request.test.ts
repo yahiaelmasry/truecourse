@@ -72,6 +72,27 @@ describe('prepared code violation requests', () => {
     expect(Object.isFrozen(prepared.ownership.sourceScopes[0].ranges[0])).toBe(true);
   });
 
+  it('uses stable prompt-local source aliases for non-Read code work', () => {
+    const prepared = prepareCodeViolationRequest(targetedContext());
+
+    expect(prepared.sourceBindings).toEqual([
+      { promptPath: 'file-0', runtimePath: 'src/orders.ts' },
+    ]);
+    expect(prepared.prompt).toContain('file-0');
+    expect(prepared.prompt).not.toContain('src/orders.ts');
+  });
+
+  it('includes certified analysis configuration in the code work fingerprint', () => {
+    const base = targetedContext();
+    const changed = { ...targetedContext(), analysisInputFingerprint: 'sha256:changed' };
+    const execution = { provider: 'claude-code', requestedModel: 'sonnet' } as const;
+
+    const first = planCodeViolationWork(base, execution);
+    const second = planCodeViolationWork(changed, execution);
+
+    expect(second.inputFingerprint).not.toBe(first.inputFingerprint);
+  });
+
   it('makes the provider execute the exact prepared targeted request', async () => {
     const context = targetedContext();
     const planned = planCodeViolationWork(context, {
@@ -123,7 +144,7 @@ describe('prepared code violation requests', () => {
         unchangedViolationIds: ['cv-0'],
         newViolations: [{
           ruleKey: 'reliability/llm/async-boundary',
-          filePath: 'src/orders.ts',
+          filePath: 'file-0',
           lineStart: 1,
           lineEnd: 3,
           severity: 'high',

@@ -5,6 +5,7 @@ import type {
   CodeViolationContext,
 } from './provider.js';
 import {
+  bindCodeSourceHeaderAliases,
   prepareCodeViolationRequest,
   type PreparedCodeViolationRequest,
 } from './prepared-code-violation-request.js';
@@ -187,6 +188,7 @@ function canonicalContext(
   const sources = context.sources ? canonicalSources(context, repositoryRoot) : undefined;
 
   return {
+    analysisInputFingerprint: context.analysisInputFingerprint,
     files,
     sourceScopes,
     sources,
@@ -224,7 +226,7 @@ export function planCodeViolationWork(
     repository: fingerprint({
       files: preparedContext.files.map((file) => ({
         path: normalizeRepositoryPath(file.path, repositoryRoot),
-        content: file.content,
+        content: bindCodeSourceHeaderAliases(file.content, request.sourceBindings),
       })).sort((left, right) => compareText(left.path, right.path)),
       sources,
       sourceScopes,
@@ -245,6 +247,7 @@ export function planCodeViolationWork(
       selections: sources.map((source) => source.selection),
       toolPolicy: request.toolPolicy,
       timeoutMs: request.timeoutMs,
+      analysisInputFingerprint: preparedContext.analysisInputFingerprint ?? null,
     }),
     request: fingerprint({
       stage: request.stage,
@@ -263,6 +266,7 @@ export function planCodeViolationWork(
     resultContract: fingerprint({
       resultContractId: request.resultContractId,
       promptAliases: request.bindings.map((binding) => binding.promptId).sort(compareText),
+      sourceAliases: request.sourceBindings.map((binding) => binding.promptPath),
     }),
   });
 
