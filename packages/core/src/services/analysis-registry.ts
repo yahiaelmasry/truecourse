@@ -12,17 +12,9 @@ interface ActiveAnalysis {
 
 const activeAnalyses = new Map<string, ActiveAnalysis>();
 
-/** Register a new analysis. Aborts any existing analysis for the same repo. */
-export function registerAnalysis(repoId: string, analysisId: string): AbortController {
-  // Abort any existing analysis for this repo
-  const existing = activeAnalyses.get(repoId);
-  if (existing) {
-    existing.abortController.abort();
-    for (const child of existing.childProcesses) {
-      if (!child.killed) child.kill('SIGTERM');
-    }
-  }
-
+/** Atomically claim a repository only when no analysis handler owns it. */
+export function tryRegisterAnalysis(repoId: string, analysisId: string): AbortController | null {
+  if (activeAnalyses.has(repoId)) return null;
   const abortController = new AbortController();
   activeAnalyses.set(repoId, {
     analysisId,
@@ -44,7 +36,7 @@ export function unregisterChildProcess(repoId: string, child: ChildProcess): voi
   if (entry) entry.childProcesses.delete(child);
 }
 
-/** Cancel an active analysis. Returns true if an analysis was running. */
+/** Signal an active analysis while its handler retains ownership for cleanup. */
 export function cancelAnalysis(repoId: string): boolean {
   const entry = activeAnalyses.get(repoId);
   if (!entry) return false;
@@ -53,12 +45,12 @@ export function cancelAnalysis(repoId: string): boolean {
   for (const child of entry.childProcesses) {
     if (!child.killed) child.kill('SIGTERM');
   }
-  activeAnalyses.delete(repoId);
   return true;
 }
 
-/** Cleanup when analysis completes normally. */
-export function unregisterAnalysis(repoId: string): void {
+/** Release a repository only for the handler that currently owns it. */
+export function unregisterAnalysis(repoId: string, owner: AbortController): void {
+  if (activeAnalyses.get(repoId)?.abortController !== owner) return;
   activeAnalyses.delete(repoId);
 }
 

@@ -170,7 +170,7 @@ export function createSocketLlmEstimateHandler(repoId: string):
  */
 export type StashConfirmChoice = 'stash' | 'no-stash' | 'cancel';
 
-export function createSocketStashConfirmHandler(repoId: string):
+export function createSocketStashConfirmHandler(repoId: string, signal?: AbortSignal):
   (info: { modifiedCount: number; untrackedCount: number }) => Promise<StashConfirmChoice> {
   return (info) =>
     new Promise<StashConfirmChoice>((resolve) => {
@@ -189,7 +189,13 @@ export function createSocketStashConfirmHandler(repoId: string):
         resolve(data.choice);
       }
 
+      function onAbort() {
+        cleanup();
+        resolve('cancel');
+      }
+
       function cleanup() {
+        signal?.removeEventListener('abort', onAbort);
         for (const [, socket] of io.sockets.sockets) {
           socket.removeListener('analysis:stash-confirm-response', onResponse);
         }
@@ -198,6 +204,8 @@ export function createSocketStashConfirmHandler(repoId: string):
       for (const [, socket] of io.sockets.sockets) {
         socket.on('analysis:stash-confirm-response', onResponse);
       }
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
     });
 }
 

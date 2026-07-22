@@ -33,7 +33,7 @@ import {
 } from '../socket/handlers.js';
 import {
   cancelAnalysis,
-  registerAnalysis,
+  tryRegisterAnalysis,
   unregisterAnalysis,
 } from '@truecourse/core/services/analysis-registry';
 import { createLLMProvider, type LLMProvider } from '@truecourse/core/services/llm/provider';
@@ -51,7 +51,7 @@ import {
   writeLatest,
 } from '@truecourse/core/lib/analysis-store';
 import type { LatestSnapshot } from '@truecourse/core/types/snapshot';
-import { log, popLogger, pushLogger } from '@truecourse/core/lib/logger';
+import { log, withLogger } from '@truecourse/core/lib/logger';
 
 const router: Router = Router();
 
@@ -79,50 +79,54 @@ router.post('/:id/analyses', async (req: Request, res: Response, next: NextFunct
     const effectiveLlmRules = projectConfig.enableLlmRules ?? true;
 
     // Register before the 202 so POST /analyses/cancel can find this run.
-    const abortController = registerAnalysis(id, 'pending');
-
-    res.status(202).json({ message: `${mode === 'diff' ? 'Diff check' : 'Analysis'} started`, repoId: id, mode });
+    const abortController = tryRegisterAnalysis(id, 'pending');
+    if (!abortController) {
+      throw createAppError('An analysis is already running for this repository.', 409);
+    }
 
     const trackerSteps = buildAnalysisSteps(effectiveCategories, effectiveLlmRules);
     const tracker = createSocketTracker(id, trackerSteps);
 
-    pushLogger({
-      filePath: path.join(repo.path, '.truecourse/logs/analyze.log'),
-      tee: process.env.TRUECOURSE_DEV === '1',
-    });
-
     try {
-      if (mode === 'full') {
-        await runFullAnalyze(id, repo, {
-          skipGit,
-          effectiveCategories,
-          effectiveLlmRules,
-          tracker,
-          signal: abortController.signal,
-        });
-      } else {
-        await runDiffAnalyze(id, repo, {
-          tracker,
-          signal: abortController.signal,
-        });
-      }
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        log.info(`[${mode === 'diff' ? 'Diff' : 'Analysis'}] Cancelled for repo ${id}`);
-        emitAnalysisCanceled(id);
-      } else {
-        log.error(
-          `[${mode === 'diff' ? 'Diff' : 'Analysis'}] Failed for repo ${id}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        emitAnalysisProgress(id, {
-          step: 'error',
-          percent: -1,
-          detail: error instanceof Error ? error.message : `${mode === 'diff' ? 'Diff check' : 'Analysis'} failed`,
-        });
-      }
+      await withLogger({
+        filePath: path.join(repo.path, '.truecourse/logs/analyze.log'),
+        tee: process.env.TRUECOURSE_DEV === '1',
+      }, async () => {
+        res.status(202).json({ message: `${mode === 'diff' ? 'Diff check' : 'Analysis'} started`, repoId: id, mode });
+
+        try {
+          if (mode === 'full') {
+            await runFullAnalyze(id, repo, {
+              skipGit,
+              effectiveCategories,
+              effectiveLlmRules,
+              tracker,
+              signal: abortController.signal,
+            });
+          } else {
+            await runDiffAnalyze(id, repo, {
+              tracker,
+              signal: abortController.signal,
+            });
+          }
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') {
+            log.info(`[${mode === 'diff' ? 'Diff' : 'Analysis'}] Cancelled for repo ${id}`);
+            emitAnalysisCanceled(id);
+          } else {
+            log.error(
+              `[${mode === 'diff' ? 'Diff' : 'Analysis'}] Failed for repo ${id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            emitAnalysisProgress(id, {
+              step: 'error',
+              percent: -1,
+              detail: error instanceof Error ? error.message : `${mode === 'diff' ? 'Diff check' : 'Analysis'} failed`,
+            });
+          }
+        }
+      });
     } finally {
-      unregisterAnalysis(id);
-      popLogger();
+      unregisterAnalysis(id, abortController);
     }
   } catch (error) {
     next(error);
@@ -291,6 +295,7 @@ interface StartRunOptions {
 async function resolveStashDecisionForRoute(
   repoId: string,
   repoPath: string,
+  signal: AbortSignal,
 ): Promise<'stash' | 'no-stash' | 'cancel'> {
   let modifiedCount = 0;
   let untrackedCount = 0;
@@ -309,11 +314,11 @@ async function resolveStashDecisionForRoute(
     return 'stash';
   }
 
-  return createSocketStashConfirmHandler(repoId)({ modifiedCount, untrackedCount });
+  return createSocketStashConfirmHandler(repoId, signal)({ modifiedCount, untrackedCount });
 }
 
 async function runFullAnalyze(id: string, repo: RegistryEntry, opts: StartRunOptions): Promise<void> {
-  const stashDecision = await resolveStashDecisionForRoute(id, repo.path);
+  const stashDecision = await resolveStashDecisionForRoute(id, repo.path, opts.signal);
   if (stashDecision === 'cancel') {
     emitAnalysisCanceled(id);
     return;

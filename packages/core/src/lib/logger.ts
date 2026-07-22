@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
  * Pluggable diagnostics logger. Internal events (`[Pipeline]`, `[LLM]`, `[CLI]`,
@@ -13,8 +14,8 @@ import path from 'node:path';
  *     `setLogTransport`.
  *
  * Tests configure nothing; the silent fallback drops messages so stdout stays
- * clean. `pushLogger`/`popLogger` temporarily route a request's logs into another
- * file (OSS analyze runs) — a file-transport concept.
+ * clean. `withLogger` routes one async request's logs into an isolated file
+ * transport and flushes it before the request releases ownership.
  */
 
 const MAX_LOG_SIZE = 10 * 1024 * 1024; // 10MB
@@ -74,12 +75,39 @@ export function rotateLog(filePath: string): void {
 
 export class FileLogTransport implements LogTransport {
   private readonly stream: fs.WriteStream;
+  private streamError: Error | null = null;
 
   constructor(private readonly config: LoggerConfig) {
     fs.mkdirSync(path.dirname(config.filePath), { recursive: true });
     rotateLog(config.filePath);
     this.stream = fs.createWriteStream(config.filePath, { flags: 'a' });
+    this.stream.on('error', (error) => {
+      this.streamError = error;
+    });
     this.stream.write(`\n--- ${new Date().toISOString()} ---\n`);
+  }
+
+  /** Wait until the OS has opened the file, or surface the open failure. */
+  waitUntilOpen(): Promise<void> {
+    if (!this.stream.pending) {
+      return this.streamError ? Promise.reject(this.streamError) : Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const onOpen = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const cleanup = () => {
+        this.stream.removeListener('open', onOpen);
+        this.stream.removeListener('error', onError);
+      };
+      this.stream.once('open', onOpen);
+      this.stream.once('error', onError);
+    });
   }
 
   write(level: LogLevel, message: string): void {
@@ -105,9 +133,24 @@ export class FileLogTransport implements LogTransport {
 // ---------------------------------------------------------------------------
 
 const stack: LogTransport[] = [];
+const scopedLogger = new AsyncLocalStorage<LoggerScope | null>();
+const activeScopes = new Set<LoggerScope>();
+
+export interface LoggerScope {
+  readonly transport: LogTransport;
+  readonly previous: LoggerScope | null;
+}
 
 function active(): LogTransport | null {
+  const scope = nearestActiveScope(scopedLogger.getStore() ?? null);
+  if (scope) return scope.transport;
   return stack.length > 0 ? stack[stack.length - 1] : null;
+}
+
+function nearestActiveScope(scope: LoggerScope | null): LoggerScope | null {
+  let current = scope;
+  while (current && !activeScopes.has(current)) current = current.previous;
+  return current;
 }
 
 function clearStack(): void {
@@ -126,16 +169,33 @@ export function setLogTransport(transport: LogTransport): void {
   stack.push(transport);
 }
 
-/** Temporarily route logs into another file (OSS analyze run). */
-export function pushLogger(config: LoggerConfig): void {
-  stack.push(new FileLogTransport(config));
-}
-
-export function popLogger(): void {
-  void stack.pop()?.close?.();
+/** Run one async operation with an isolated file logger, then flush it. */
+export async function withLogger<T>(config: LoggerConfig, run: () => Promise<T>): Promise<T> {
+  const transport = new FileLogTransport(config);
+  try {
+    await transport.waitUntilOpen();
+  } catch (error) {
+    await transport.close();
+    throw error;
+  }
+  const scope = Object.freeze({
+    transport,
+    previous: nearestActiveScope(scopedLogger.getStore() ?? null),
+  });
+  activeScopes.add(scope);
+  try {
+    return await scopedLogger.run(scope, run);
+  } finally {
+    activeScopes.delete(scope);
+    await scope.transport.close?.();
+  }
 }
 
 export async function closeLogger(): Promise<void> {
+  const scopes = [...activeScopes];
+  activeScopes.clear();
+  scopedLogger.enterWith(null);
+  for (const scope of scopes) await scope.transport.close?.();
   while (stack.length > 0) {
     await stack.pop()!.close?.();
   }
