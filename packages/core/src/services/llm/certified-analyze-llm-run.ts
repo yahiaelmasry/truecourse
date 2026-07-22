@@ -7,6 +7,7 @@ import {
   admitAnalyzeRunResumeExecution,
   checkpointAnalyzeRunWork,
   type AnalyzeRunView,
+  type AnalyzeRunCheckpointEvidence,
   type AnalyzeRunSource,
   type AnalyzeRunExecutionCompletion,
   type AnalyzeRunCheckpointWriter,
@@ -227,7 +228,18 @@ export interface CertifiedAnalyzeLlmExecution {
   readonly completion: AnalyzeRunExecutionCompletion;
 }
 
-export interface CertifiedAnalyzeLlmResumeExecution extends CertifiedAnalyzeLlmExecution {}
+export interface AnalyzeLlmCheckpointUsageEntry {
+  readonly workId: string;
+  readonly inputFingerprint: string;
+  readonly checkpointedAt: string;
+  readonly attemptId: string;
+  readonly usage: Readonly<AnalyzeLlmExecutionUsage>;
+}
+
+export interface CertifiedAnalyzeLlmResumeExecution extends CertifiedAnalyzeLlmExecution {
+  /** One canonical, attempt-ID-deduplicated entry for every reused or newly paid call. */
+  readonly usageLedger: readonly AnalyzeLlmCheckpointUsageEntry[];
+}
 
 export interface AnalyzeLlmPlanInput {
   readonly runId: string;
@@ -497,6 +509,7 @@ export function certifyAnalyzeLlmRun(
       return Object.freeze({
         results: Object.freeze(results),
         completion: certifyAnalyzeRunExecutionCompletion(completed.certification),
+        usageLedger: buildResumeUsageLedger(certifiedWork, completed.checkpoints),
       });
     },
     async execute(
@@ -812,6 +825,48 @@ export function certifyAnalyzeLlmRun(
 
 function incompatible(reason: AnalyzeLlmResumeIncompatibility): AnalyzeLlmResumeCompatibility {
   return Object.freeze({ compatible: false, reason });
+}
+
+function buildResumeUsageLedger(
+  orderedWork: readonly CertifiedAnalyzeLlmWork[],
+  checkpoints: readonly AnalyzeRunCheckpointEvidence[],
+): readonly AnalyzeLlmCheckpointUsageEntry[] {
+  const byWorkId = new Map(checkpoints.map((item) => [item.workId, item]));
+  const attemptIds = new Set<string>();
+  const ledger = orderedWork.map((work) => {
+    const item = byWorkId.get(work.workId);
+    if (!item || item.usage === null || item.inputFingerprint !== work.inputFingerprint) {
+      throw new AnalyzeLlmPlanError(
+        'result-not-certified',
+        `Analyze resume usage is incomplete for ${work.workId}`,
+        work.family,
+        work.domain,
+      );
+    }
+    if (attemptIds.has(item.attemptId)) {
+      throw new AnalyzeLlmPlanError(
+        'result-not-certified',
+        `Analyze resume usage repeats provider attempt ${item.attemptId}`,
+        work.family,
+        work.domain,
+      );
+    }
+    attemptIds.add(item.attemptId);
+    return Object.freeze({
+      workId: work.workId,
+      inputFingerprint: work.inputFingerprint,
+      checkpointedAt: item.checkpointedAt,
+      attemptId: item.attemptId,
+      usage: Object.freeze({ ...item.usage }),
+    });
+  });
+  if (checkpoints.length !== orderedWork.length || byWorkId.size !== orderedWork.length) {
+    throw new AnalyzeLlmPlanError(
+      'result-not-certified',
+      'Analyze resume usage does not match the certified work plan',
+    );
+  }
+  return Object.freeze(ledger);
 }
 
 function incompatibleInspection(

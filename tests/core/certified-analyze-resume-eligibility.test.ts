@@ -385,6 +385,26 @@ describe('certified analyze resume eligibility', () => {
       expect.objectContaining({ work: expect.objectContaining({ workId: original.databaseWorkId }) }),
     ]));
     expect(resumed.completion).toEqual(expect.any(Object));
+    expect(resumed.usageLedger.map(({ workId, checkpointedAt, attemptId }) => ({
+      workId,
+      checkpointedAt,
+      attemptId,
+    }))).toEqual([
+      {
+        workId: rebuilt.manifest.work[0]!.workId,
+        checkpointedAt: rebuilt.manifest.work[0]!.workId === original.codeWorkId
+          ? '2026-07-19T02:00:02.000Z'
+          : '2026-07-19T02:00:06.000Z',
+        attemptId: `resume:${rebuilt.manifest.work[0]!.workId}`,
+      },
+      {
+        workId: rebuilt.manifest.work[1]!.workId,
+        checkpointedAt: rebuilt.manifest.work[1]!.workId === original.codeWorkId
+          ? '2026-07-19T02:00:02.000Z'
+          : '2026-07-19T02:00:06.000Z',
+        attemptId: `resume:${rebuilt.manifest.work[1]!.workId}`,
+      },
+    ]);
     await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
       revision: 7,
       state: 'running',

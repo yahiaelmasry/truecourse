@@ -191,6 +191,14 @@ export interface AnalyzeRunWorkCheckpoint {
   usage: AnalyzeLlmExecutionUsage | null;
 }
 
+export interface AnalyzeRunCheckpointEvidence {
+  readonly workId: string;
+  readonly inputFingerprint: string;
+  readonly checkpointedAt: string;
+  readonly attemptId: string;
+  readonly usage: Readonly<AnalyzeLlmExecutionUsage> | null;
+}
+
 export interface BeginFinalizeAnalyzeRunCommand {
   /** Every sealed work item has returned a successfully correlated result in this attempt. */
   runId: string;
@@ -920,6 +928,17 @@ export type AnalyzeRunPlanAdmission<T> =
       }>>;
     };
 
+export type AnalyzeRunResumeAdmission<T> =
+  | { readonly admitted: false }
+  | {
+      readonly admitted: true;
+      readonly execution: Promise<Readonly<{
+        result: T;
+        certification: AnalyzeRunExecutionCertification;
+        checkpoints: readonly AnalyzeRunCheckpointEvidence[];
+      }>>;
+    };
+
 /**
  * @internal
  * Validate durable state and synchronously admit provider work in the same
@@ -1283,7 +1302,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
   admittedAt: string,
   validate: () => void,
   admit: (checkpointWriter: AnalyzeRunCheckpointWriter) => Promise<T>,
-): Promise<AnalyzeRunPlanAdmission<T>> {
+): Promise<AnalyzeRunResumeAdmission<T>> {
   if ((typeof receipt !== 'object' && typeof receipt !== 'function') || receipt === null) {
     return { admitted: false };
   }
@@ -1416,7 +1435,11 @@ export async function admitAnalyzeRunResumeExecution<T>(
         revision: completed.revision,
         workKey: activation.workKey,
       });
-      return Object.freeze({ result, certification });
+      return Object.freeze({
+        result,
+        certification,
+        checkpoints: completedCheckpointEvidence(completed.plan.work),
+      });
     }, (error) => {
       checkpointBinding!.active = false;
       throw error;
@@ -1433,6 +1456,27 @@ export async function admitAnalyzeRunResumeExecution<T>(
     }
     throw error;
   }
+}
+
+function completedCheckpointEvidence(
+  work: readonly StoredAnalyzeRunWork[],
+): readonly AnalyzeRunCheckpointEvidence[] {
+  return Object.freeze(work.map((item) => {
+    if (item.state !== 'succeeded-checkpointed') {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze work ${item.workId} has no durable completion checkpoint`,
+      );
+    }
+    return Object.freeze({
+      workId: item.workId,
+      inputFingerprint: item.inputFingerprint,
+      checkpointedAt: item.checkpoint.checkpointedAt,
+      attemptId: item.checkpoint.attemptId,
+      usage: item.checkpoint.usage === null
+        ? null
+        : Object.freeze({ ...item.checkpoint.usage }),
+    });
+  }));
 }
 
 async function readActiveCompletedBaselineFingerprint(
