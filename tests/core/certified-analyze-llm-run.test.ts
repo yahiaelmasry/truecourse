@@ -918,6 +918,10 @@ describe('certified analyze LLM run', () => {
         expect(stored).toMatchObject({ revision: expectedRevision });
         stored = next;
       },
+      async compareAndSwapLatest(_receivedRepoKey, _runId, expectedRevision, _attempt, _latest, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = next;
+      },
     };
     setAnalyzeRunStorage(storage);
     let execution = { provider: 'claude-code', requestedModel: 'opus[1m]' };

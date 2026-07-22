@@ -94,7 +94,9 @@ repairs any interrupted step without replacing a newer completed descendant.
 The certified executor writes each accepted result and its usage evidence to
 the attempted-run journal before reporting that work item successful. Eligible
 journaled architecture runs therefore preserve paid successes, but reuse and
-Resume are not enabled yet. Schema-v1 through schema-v4 journals remain
+Resume are not enabled yet. The journal can atomically activate an exact latest
+blocked attempt after certified compatibility checks, but provider execution is
+not admitted from that state yet. Schema-v1 through schema-v4 journals remain
 readable and normalize safely to schema v5 when a current lifecycle command
 writes them. Historical schema-v3 runs from before durable execution admission
 are normalized to the admitted revision lineage without rewriting the journal

@@ -17,7 +17,11 @@ import {
   validateCompletedAnalysisPromotion,
   type CompletedAnalysisPromotion,
 } from './completed-analysis-promotion.js';
-import { buildAnalysisFilename, getAnalysisStore } from './analysis-store.js';
+import {
+  activeCompletedBaselineId,
+  buildAnalysisFilename,
+  getAnalysisStore,
+} from './analysis-store.js';
 import { getRegistryStore } from '../config/registry.js';
 import type { HistoryEntry } from '../types/snapshot.js';
 import {
@@ -34,6 +38,10 @@ import {
 } from './analyze-run-work-checkpoint-certification.js';
 import { installAnalyzeRunResumeCandidateReader } from './analyze-run-resume-candidate.js';
 import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execution-evidence.js';
+import {
+  inspectAnalyzeRunResumeActivationCertification,
+  type AnalyzeRunResumeActivationCertification,
+} from './analyze-run-resume-activation-certification.js';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
@@ -80,6 +88,7 @@ export interface SealAnalyzeRunPlanCommand {
 
 declare const analyzeRunPlanActivationBrand: unique symbol;
 declare const analyzeRunCheckpointWriterBrand: unique symbol;
+declare const analyzeRunResumePlanActivationBrand: unique symbol;
 
 /**
  * In-process proof that the journal durably sealed one exact analyze work plan.
@@ -92,6 +101,10 @@ export type AnalyzeRunPlanActivation = Readonly<{
 
 export type AnalyzeRunCheckpointWriter = Readonly<{
   [analyzeRunCheckpointWriterBrand]: true;
+}>;
+
+export type AnalyzeRunResumePlanActivation = Readonly<{
+  [analyzeRunResumePlanActivationBrand]: true;
 }>;
 
 const analyzeRunPlanActivations = new WeakMap<object, {
@@ -116,6 +129,18 @@ const analyzeRunCheckpointWriters = new WeakMap<object, {
   workKey: string;
   sealedAt: string;
   active: boolean;
+}>();
+
+const analyzeRunResumePlanActivations = new WeakMap<object, {
+  storage: AnalyzeRunStorage;
+  repoKey: string;
+  runId: string;
+  revision: number;
+  workKey: string;
+  pendingWorkIds: readonly string[];
+  reusedWorkIds: readonly string[];
+  executionPin: AnalyzeRunResumeExecutionPin;
+  attemptSequence: number;
 }>();
 
 const preparedAnalyzeRunCompletions = new WeakMap<object, {
@@ -176,6 +201,26 @@ export interface PrepareAnalyzeRunFinalizationCommand {
   promotion: CompletedAnalysisPromotion;
   projection: CompletedAnalysisProjectionIntent;
 }
+
+export interface ActivateAnalyzeRunResumeCommand extends Omit<BeginAnalyzeRunCommand, 'kind'> {
+  kind: 'activate-resume';
+  activatedAt: string;
+  work: readonly { readonly workId: string; readonly inputFingerprint: string }[];
+  reusedWorkIds: readonly string[];
+  pendingWorkIds: readonly string[];
+  executionPin: Readonly<AnalyzeRunResumeExecutionPin>;
+  observed: Readonly<{
+    runRevision: number;
+    attemptSequence: number;
+    latestAttemptSequence: number;
+    completedBaselineFingerprint: string | null;
+  }>;
+}
+
+export type ActivateAnalyzeRunResumeResult = Readonly<{
+  view: AnalyzeRunView;
+  activation: AnalyzeRunResumePlanActivation;
+}>;
 
 export interface AnalyzeRunResumeExecutionPin {
   provider: string;
@@ -354,6 +399,13 @@ export class AnalyzeRunRevisionConflictError extends Error {
   }
 }
 
+export class AnalyzeRunLatestAttemptConflictError extends Error {
+  constructor(runId: string) {
+    super(`Analyze run ${runId} is no longer the latest attempted run`);
+    this.name = 'AnalyzeRunLatestAttemptConflictError';
+  }
+}
+
 export class InvalidAnalyzeRunTransitionError extends Error {
   constructor(message: string) {
     super(message);
@@ -377,6 +429,15 @@ export interface AnalyzeRunStorage {
     repoKey: string,
     runId: string,
     expectedRevision: number,
+    next: StoredAnalyzeRun,
+  ): Promise<void>;
+  /** Atomically compare the target revision and semantic latest attempt before writing. */
+  compareAndSwapLatest(
+    repoKey: string,
+    runId: string,
+    expectedRevision: number,
+    expectedAttemptSequence: number,
+    expectedLatestAttemptSequence: number,
     next: StoredAnalyzeRun,
   ): Promise<void>;
 }
@@ -463,6 +524,34 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
       if (!current) throw new AnalyzeRunNotFoundError(runId);
       if (current.revision !== expectedRevision) {
         throw new AnalyzeRunRevisionConflictError(runId, expectedRevision, current.revision);
+      }
+      atomicWriteJson(runPath(canonicalPath, runId), next);
+    });
+  }
+
+  async compareAndSwapLatest(
+    repoPath: string,
+    runId: string,
+    expectedRevision: number,
+    expectedAttemptSequence: number,
+    expectedLatestAttemptSequence: number,
+    next: StoredAnalyzeRun,
+  ): Promise<void> {
+    const canonicalPath = canonicalRepoPath(repoPath);
+    await this.serialize(canonicalPath, async () => {
+      const runs = readAllRuns(canonicalPath);
+      const current = runs.find((run) => run.runId === runId);
+      if (!current) throw new AnalyzeRunNotFoundError(runId);
+      if (current.revision !== expectedRevision) {
+        throw new AnalyzeRunRevisionConflictError(runId, expectedRevision, current.revision);
+      }
+      const latest = latestStoredRun(runs);
+      if (
+        current.attemptSequence !== expectedAttemptSequence
+        || latest.runId !== runId
+        || latest.attemptSequence !== expectedLatestAttemptSequence
+      ) {
+        throw new AnalyzeRunLatestAttemptConflictError(runId);
       }
       atomicWriteJson(runPath(canonicalPath, runId), next);
     });
@@ -949,6 +1038,250 @@ export async function admitAnalyzeRunPlanExecution<T>(
   }
 }
 
+/**
+ * Atomically activate one exact latest blocked attempt for certified resume.
+ * This transition does not admit or call a provider. The caller must retain
+ * the repository lifecycle lock through the later admission/finalization flow.
+ */
+export async function activateAnalyzeRunResume(
+  repoKey: string,
+  certification: AnalyzeRunResumeActivationCertification,
+): Promise<ActivateAnalyzeRunResumeResult> {
+  const command = inspectAnalyzeRunResumeActivationCertification(certification);
+  if (!command) {
+    throw new InvalidAnalyzeRunTransitionError('Analyze resume activation is not certified');
+  }
+  const storage = activeStorage;
+  const durableRepoKey = activationScopeKey(repoKey, storage);
+  const runId = validateRunId(command.runId);
+  const current = await storage.read(durableRepoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+  const latest = await storage.inspectLatest(durableRepoKey);
+  assertAnalyzeRunStorage(storage);
+  const recoveringActivated = current.status.state === 'running'
+    && current.executionAttempt.number > 1
+    && current.executionAttempt.resume?.admission === 'activated';
+  const blockedStatus = current.status.state === 'blocked' ? current.status : null;
+  if (
+    (!blockedStatus && !recoveringActivated)
+    || current.plan.state !== 'sealed'
+    || current.finalizationIntent !== null
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot activate analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+  if (
+    latest?.runId !== current.runId
+    || latest.attemptSequence !== current.attemptSequence
+    || command.observed.runRevision !== current.revision
+    || command.observed.attemptSequence !== current.attemptSequence
+    || command.observed.latestAttemptSequence !== latest.attemptSequence
+  ) {
+    throw new AnalyzeRunLatestAttemptConflictError(runId);
+  }
+  const expectedIdentity = {
+    candidateAnalysisId: requireNonEmpty(command.candidateAnalysisId, 'candidateAnalysisId'),
+    startedAt: validateTimestamp(command.startedAt, 'startedAt'),
+    source: validateSource(command.source),
+    branch: validateNullableString(command.branch, 'branch'),
+    commitHash: validateNullableString(command.commitHash, 'commitHash'),
+    completedBaselineId: validateNullableString(
+      command.completedBaselineId,
+      'completedBaselineId',
+    ),
+  };
+  if (!isDeepStrictEqual(expectedIdentity, {
+    candidateAnalysisId: current.candidateAnalysisId,
+    startedAt: current.startedAt,
+    source: current.source,
+    branch: current.branch,
+    commitHash: current.commitHash,
+    completedBaselineId: current.completedBaselineId,
+  })) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} resume identity changed before activation`,
+    );
+  }
+  if (activationWorkKey(command.work) !== activationWorkKey(current.plan.work)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} sealed work changed before resume activation`,
+    );
+  }
+  const pendingWorkIds = current.plan.work
+    .filter((work) => work.state === 'pending')
+    .map((work) => work.workId);
+  const reusedWorkIds = current.plan.work
+    .filter((work) => work.state === 'succeeded-checkpointed')
+    .map((work) => work.workId);
+  if (
+    current.plan.work.some((work) => work.state === 'succeeded-uncheckpointed')
+    || !isDeepStrictEqual([...command.pendingWorkIds].sort(), [...pendingWorkIds].sort())
+    || !isDeepStrictEqual([...command.reusedWorkIds].sort(), [...reusedWorkIds].sort())
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} resume work partition changed before activation`,
+    );
+  }
+  const executionPin: AnalyzeRunResumeExecutionPin = {
+    provider: requireNonEmpty(command.executionPin.provider, 'executionPin.provider'),
+    requestedModel: validateNullableString(
+      command.executionPin.requestedModel,
+      'executionPin.requestedModel',
+    ),
+    resolvedModel: requireNonEmpty(
+      command.executionPin.resolvedModel,
+      'executionPin.resolvedModel',
+    ),
+  };
+  if (
+    executionPin.resolvedModel.trim() !== executionPin.resolvedModel
+    || executionPin.provider.trim() !== executionPin.provider
+    || (executionPin.requestedModel !== null
+      && executionPin.requestedModel.trim() !== executionPin.requestedModel)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError('Resume execution pin contains surrounding whitespace');
+  }
+  if (
+    recoveringActivated
+    && !isDeepStrictEqual(current.executionAttempt.resume?.executionPin, executionPin)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} activated execution pin changed before recovery`,
+    );
+  }
+
+  const analysisStore = getAnalysisStore();
+  const baselineFingerprint = await readActiveCompletedBaselineFingerprint(
+    analysisStore,
+    durableRepoKey,
+    current.completedBaselineId,
+  );
+  if (
+    getAnalysisStore() !== analysisStore
+    || baselineFingerprint !== command.observed.completedBaselineFingerprint
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} completed baseline changed before activation`,
+    );
+  }
+  const requestedActivationAt = canonicalTimestamp(command.activatedAt, 'activatedAt');
+  const activatedAt = recoveringActivated
+    ? current.executionAttempt.activatedAt
+    : requestedActivationAt;
+  if (
+    recoveringActivated
+      ? requestedActivationAt !== activatedAt
+      : Date.parse(activatedAt) < Date.parse(current.updatedAt)
+        || Date.parse(activatedAt) < Date.parse(blockedStatus!.blockedAt)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} resume activation does not match its durable chronology`,
+    );
+  }
+  const next: StoredAnalyzeRun = recoveringActivated
+    ? current
+    : {
+        ...current,
+        schemaVersion: SCHEMA_VERSION,
+        revision: current.executionAttempt.number === 1
+          ? 4 + reusedWorkIds.length
+          : current.revision + 1,
+        updatedAt: activatedAt,
+        status: { state: 'running' },
+        executionAttempt: {
+          number: current.executionAttempt.number + 1,
+          activatedAt,
+          resume: {
+            admission: 'activated',
+            admittedAt: null,
+            resumedFrom: {
+              reason: 'provider-session-limit',
+              resetHint: blockedStatus!.resetHint,
+              blockedAt: blockedStatus!.blockedAt,
+            },
+            executionPin,
+          },
+        },
+      };
+
+  const baselineFingerprintBeforeCas = await readActiveCompletedBaselineFingerprint(
+    analysisStore,
+    durableRepoKey,
+    current.completedBaselineId,
+  );
+  if (
+    activeStorage !== storage
+    || getAnalysisStore() !== analysisStore
+    || baselineFingerprintBeforeCas !== baselineFingerprint
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} storage or completed baseline changed before activation`,
+    );
+  }
+  if (recoveringActivated) {
+    const currentBeforeReceipt = await storage.read(durableRepoKey, runId);
+    assertAnalyzeRunStorage(storage);
+    const latestBeforeReceipt = await storage.inspectLatest(durableRepoKey);
+    assertAnalyzeRunStorage(storage);
+    if (
+      currentBeforeReceipt?.revision !== current.revision
+      || latestBeforeReceipt?.runId !== runId
+      || latestBeforeReceipt.attemptSequence !== current.attemptSequence
+    ) {
+      throw new AnalyzeRunLatestAttemptConflictError(runId);
+    }
+  } else {
+    await storage.compareAndSwapLatest(
+      durableRepoKey,
+      runId,
+      current.revision,
+      current.attemptSequence,
+      latest.attemptSequence,
+      next,
+    );
+  }
+  assertAnalyzeRunStorage(storage);
+  const activation = Object.freeze({}) as AnalyzeRunResumePlanActivation;
+  analyzeRunResumePlanActivations.set(activation, {
+    storage,
+    repoKey: durableRepoKey,
+    runId,
+    revision: next.revision,
+    workKey: activationWorkKey(current.plan.work),
+    pendingWorkIds: Object.freeze([...pendingWorkIds]),
+    reusedWorkIds: Object.freeze([...reusedWorkIds]),
+    executionPin,
+    attemptSequence: next.attemptSequence,
+  });
+  return Object.freeze({ view: toView(next), activation });
+}
+
+async function readActiveCompletedBaselineFingerprint(
+  store: ReturnType<typeof getAnalysisStore>,
+  repoKey: string,
+  expectedBaselineId: string | null,
+): Promise<string | null> {
+  const latest = await store.readLatest(repoKey);
+  if (latest === null) {
+    if (expectedBaselineId !== null) {
+      throw new InvalidAnalyzeRunTransitionError('Completed baseline disappeared before resume');
+    }
+    return null;
+  }
+  let baselineId: string;
+  try {
+    baselineId = activeCompletedBaselineId(latest);
+  } catch {
+    throw new InvalidAnalyzeRunTransitionError('Completed baseline is invalid before resume');
+  }
+  if (baselineId !== expectedBaselineId) {
+    throw new InvalidAnalyzeRunTransitionError('Completed baseline changed before resume');
+  }
+  return fingerprint(latest);
+}
+
 export async function readAnalyzeRun(
   repoKey: string,
   selector: 'latest-attempt' | { runId: string },
@@ -1285,6 +1618,11 @@ async function failRun(
       `Cannot fail analyze run ${runId} from ${current.status.state}`,
     );
   }
+  if (current.executionAttempt.resume?.admission === 'activated') {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot fail analyze run ${runId} before resumed execution is durably admitted`,
+    );
+  }
   if (!isRecord(command.error)) {
     throw new InvalidAnalyzeRunTransitionError(`Analyze run ${runId} has an invalid public error`);
   }
@@ -1337,6 +1675,11 @@ async function blockRun(
   if (current.status.state !== 'running' || current.plan.state !== 'sealed') {
     throw new InvalidAnalyzeRunTransitionError(
       `Cannot block analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+  if (current.executionAttempt.resume?.admission === 'activated') {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot block analyze run ${runId} before resumed execution is durably admitted`,
     );
   }
 
@@ -1491,6 +1834,10 @@ function validateTimestamp(value: unknown, field: string): string {
     throw new Error(`${field} must be a valid timestamp`);
   }
   return value;
+}
+
+function canonicalTimestamp(value: unknown, field: string): string {
+  return new Date(Date.parse(validateTimestamp(value, field))).toISOString();
 }
 
 function validateSource(value: unknown): AnalyzeRunSource {

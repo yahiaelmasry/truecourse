@@ -8,8 +8,10 @@ import {
   type StoredAnalyzeRun,
   AnalyzeRunAlreadyExistsError,
   AnalyzeRunJournalCorruptError,
+  AnalyzeRunLatestAttemptConflictError,
   AnalyzeRunRevisionConflictError,
   InvalidAnalyzeRunTransitionError,
+  activateAnalyzeRunResume,
   beginFinalizeAnalyzeRun,
   dispatchAnalyzeRun,
   prepareAnalyzeRunFinalization,
@@ -18,6 +20,8 @@ import {
   sealAnalyzeRunPlan,
   setAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
+import { certifyAnalyzeRunResumeActivation } from '../../packages/core/src/lib/analyze-run-resume-activation-certification.js';
+import { fingerprint } from '../../packages/core/src/lib/canonical-json.js';
 import {
   certifyPreparedAnalyzeRunFinalization,
   completePreparedAnalyzeRunFinalization,
@@ -214,6 +218,11 @@ describe('analyze run journal', () => {
         expect(stored).toMatchObject({ runId, revision: expectedRevision });
         stored = next;
       },
+      async compareAndSwapLatest(receivedRepoKey, runId, expectedRevision, _attempt, _latest, next) {
+        expect(receivedRepoKey).toBe(repoKey);
+        expect(stored).toMatchObject({ runId, revision: expectedRevision });
+        stored = next;
+      },
     };
     setAnalyzeRunStorage(storage);
 
@@ -266,6 +275,10 @@ describe('analyze run journal', () => {
         writesB += 1;
         storedB = next;
       },
+      async compareAndSwapLatest(_key, _runId, _revision, _attempt, _latest, next) {
+        writesB += 1;
+        storedB = next;
+      },
     };
     const storageA: AnalyzeRunStorage = {
       async createLatest(_key, run) {
@@ -282,6 +295,10 @@ describe('analyze run journal', () => {
       async readLatest() { return storedA; },
       async inspectLatest() { return storedA; },
       async compareAndSwap(_key, _runId, _revision, next) {
+        writesA += 1;
+        storedA = next;
+      },
+      async compareAndSwapLatest(_key, _runId, _revision, _attempt, _latest, next) {
         writesA += 1;
         storedA = next;
       },
@@ -660,6 +677,16 @@ describe('analyze run journal', () => {
       async readLatest() { return stored; },
       async inspectLatest() { return stored; },
       async compareAndSwap(_key, _runId, expectedRevision, next) {
+        if (stored?.revision !== expectedRevision) {
+          throw new AnalyzeRunRevisionConflictError(
+            next.runId,
+            expectedRevision,
+            stored?.revision ?? -1,
+          );
+        }
+        stored = next;
+      },
+      async compareAndSwapLatest(_key, _runId, expectedRevision, _attempt, _latest, next) {
         if (stored?.revision !== expectedRevision) {
           throw new AnalyzeRunRevisionConflictError(
             next.runId,
@@ -1176,6 +1203,292 @@ describe('analyze run journal', () => {
       });
     expect(fs.readFileSync(file)).toEqual(bytesBefore);
   });
+
+  it('atomically activates the exact latest blocked partition without touching completed truth', async () => {
+    const baseline = finalizationPayload('activation-baseline').promotion.latest;
+    const truecourseDir = path.join(repoPath, '.truecourse');
+    fs.mkdirSync(truecourseDir, { recursive: true });
+    const latestPath = path.join(truecourseDir, 'LATEST.json');
+    fs.writeFileSync(latestPath, JSON.stringify(baseline));
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'activate-partial-run',
+      candidateAnalysisId: 'activate-partial-analysis',
+      startedAt: '2026-07-19T01:38:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'activation-commit',
+      completedBaselineId: baseline.analysis.id,
+    });
+    const work = [
+      { workId: 'analyze:v1:pending', inputFingerprint: `sha256:${'a'.repeat(64)}` },
+      { workId: 'analyze:v1:reused', inputFingerprint: `sha256:${'b'.repeat(64)}` },
+    ];
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'activate-partial-run',
+      sealedAt: '2026-07-19T01:38:01.000Z',
+      work,
+    });
+    const runPath = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'activate-partial-run.json',
+    );
+    const stored = JSON.parse(fs.readFileSync(runPath, 'utf8')) as Record<string, any>;
+    const result = { violations: [] };
+    const reused = stored.plan.work.find((item: Record<string, unknown>) =>
+      item.workId === 'analyze:v1:reused');
+    Object.assign(reused, {
+      state: 'succeeded-checkpointed',
+      checkpoint: {
+        checkpointedAt: '2026-07-19T01:38:02.000Z',
+        attemptId: 'attempt:reused',
+        resultContractId: 'result:v1',
+        resultFingerprint: fingerprint(result),
+        result,
+        usage: null,
+      },
+    });
+    stored.revision = 4;
+    stored.updatedAt = '2026-07-19T01:38:03.000Z';
+    stored.status = {
+      state: 'blocked',
+      reason: 'provider-session-limit',
+      resetHint: 'resets at 3am',
+      blockedAt: '2026-07-19T01:38:03.000Z',
+    };
+    fs.writeFileSync(runPath, JSON.stringify(stored));
+    resetAnalyzeRunStorage();
+    const latestAttemptPath = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'LATEST_ATTEMPT.json',
+    );
+    const completedBefore = fs.readFileSync(latestPath);
+    const attemptedBefore = fs.readFileSync(latestAttemptPath);
+
+    const activated = await activateAnalyzeRunResume(repoPath, certifyAnalyzeRunResumeActivation({
+      kind: 'activate-resume',
+      runId: 'activate-partial-run',
+      candidateAnalysisId: 'activate-partial-analysis',
+      startedAt: '2026-07-19T01:38:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'activation-commit',
+      completedBaselineId: baseline.analysis.id,
+      activatedAt: '2026-07-19T03:38:04+02:00',
+      work,
+      reusedWorkIds: ['analyze:v1:reused'],
+      pendingWorkIds: ['analyze:v1:pending'],
+      executionPin: {
+        provider: 'claude-code',
+        requestedModel: 'opus[1m]',
+        resolvedModel: 'claude-opus-4-8',
+      },
+      observed: {
+        runRevision: 4,
+        attemptSequence: 1,
+        latestAttemptSequence: 1,
+        completedBaselineFingerprint: fingerprint(baseline),
+      },
+    }));
+
+    expect(activated.view).toMatchObject({
+      schemaVersion: 5,
+      revision: 5,
+      state: 'running',
+      updatedAt: '2026-07-19T01:38:04.000Z',
+      counts: { total: 2, pending: 1, succeeded: 1 },
+      executionAttempt: {
+        number: 2,
+        activatedAt: '2026-07-19T01:38:04.000Z',
+        resume: {
+          admission: 'activated',
+          admittedAt: null,
+          resumedFrom: {
+            resetHint: 'resets at 3am',
+            blockedAt: '2026-07-19T01:38:03.000Z',
+          },
+          executionPin: { resolvedModel: 'claude-opus-4-8' },
+        },
+      },
+    });
+    expect(fs.readFileSync(latestPath)).toEqual(completedBefore);
+    expect(fs.readFileSync(latestAttemptPath)).toEqual(attemptedBefore);
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'block',
+      runId: 'activate-partial-run',
+      blockedAt: '2026-07-19T01:38:05.000Z',
+      resetHint: 'later',
+    })).rejects.toThrow(/before resumed execution is durably admitted/);
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'activate-partial-run',
+      failedAt: '2026-07-19T01:38:05.000Z',
+      error: { code: 'NOT_ADMITTED', message: 'Not admitted.' },
+    })).rejects.toThrow(/before resumed execution is durably admitted/);
+
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId: 'activate-partial-run' }))
+      .resolves.toEqual(activated.view);
+  });
+
+  it('rejects forged activation proof and a run that is no longer the latest attempt', async () => {
+    await expect(activateAnalyzeRunResume(
+      repoPath,
+      {} as Parameters<typeof activateAnalyzeRunResume>[1],
+    )).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'stale-activation-run',
+      candidateAnalysisId: 'stale-activation-analysis',
+      startedAt: '2026-07-19T01:39:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'stale-activation-commit',
+      completedBaselineId: null,
+    });
+    const work = [{ workId: 'analyze:v1:stale', inputFingerprint: `sha256:${'d'.repeat(64)}` }];
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      runId: 'stale-activation-run',
+      sealedAt: '2026-07-19T01:39:01.000Z',
+      work,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'block',
+      runId: 'stale-activation-run',
+      blockedAt: '2026-07-19T01:39:02.000Z',
+      resetHint: 'later',
+    });
+    const certification = certifyAnalyzeRunResumeActivation({
+      kind: 'activate-resume',
+      runId: 'stale-activation-run',
+      candidateAnalysisId: 'stale-activation-analysis',
+      startedAt: '2026-07-19T01:39:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'stale-activation-commit',
+      completedBaselineId: null,
+      activatedAt: '2026-07-19T01:39:03.000Z',
+      work,
+      reusedWorkIds: [],
+      pendingWorkIds: ['analyze:v1:stale'],
+      executionPin: {
+        provider: 'claude-code',
+        requestedModel: 'opus[1m]',
+        resolvedModel: 'claude-opus-4-8',
+      },
+      observed: {
+        runRevision: 2,
+        attemptSequence: 1,
+        latestAttemptSequence: 1,
+        completedBaselineFingerprint: null,
+      },
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'newer-attempt',
+      candidateAnalysisId: 'newer-analysis',
+      startedAt: '2026-07-19T01:39:03.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'newer-commit',
+      completedBaselineId: null,
+    });
+
+    await expect(activateAnalyzeRunResume(repoPath, certification))
+      .rejects.toBeInstanceOf(AnalyzeRunLatestAttemptConflictError);
+    await expect(readAnalyzeRun(repoPath, { runId: 'stale-activation-run' }))
+      .resolves.toMatchObject({ state: 'blocked', revision: 2 });
+  });
+
+  it.each([[1, 2], [2, 2], [3, 3]] as const)(
+    'activates a schema-v%s blocked run into the canonical admitted-lineage revision',
+    async (schemaVersion, observedRevision) => {
+      const runId = `activate-schema-${schemaVersion}`;
+      const work = [{
+        workId: `analyze:v1:schema-${schemaVersion}`,
+        inputFingerprint: `sha256:${String(schemaVersion).repeat(64)}`,
+      }];
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId,
+        candidateAnalysisId: `${runId}-analysis`,
+        startedAt: '2026-07-19T01:39:10.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: `schema-${schemaVersion}-commit`,
+        completedBaselineId: null,
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'seal-plan',
+        runId,
+        sealedAt: '2026-07-19T01:39:11.000Z',
+        work,
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'block',
+        runId,
+        blockedAt: '2026-07-19T01:39:12.000Z',
+        resetHint: 'later',
+      });
+      const file = path.join(
+        repoPath,
+        '.truecourse',
+        'analyses',
+        'runs',
+        `${runId}.json`,
+      );
+      const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+      stored.schemaVersion = schemaVersion;
+      delete stored.executionAttempt;
+      if (schemaVersion === 1) delete stored.finalizationIntent;
+      fs.writeFileSync(file, JSON.stringify(stored));
+      resetAnalyzeRunStorage();
+
+      const activated = await activateAnalyzeRunResume(repoPath, certifyAnalyzeRunResumeActivation({
+        kind: 'activate-resume',
+        runId,
+        candidateAnalysisId: `${runId}-analysis`,
+        startedAt: '2026-07-19T01:39:10.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: `schema-${schemaVersion}-commit`,
+        completedBaselineId: null,
+        activatedAt: '2026-07-19T01:39:13.000Z',
+        work,
+        reusedWorkIds: [],
+        pendingWorkIds: [work[0]!.workId],
+        executionPin: {
+          provider: 'claude-code',
+          requestedModel: 'opus[1m]',
+          resolvedModel: 'claude-opus-4-8',
+        },
+        observed: {
+          runRevision: observedRevision,
+          attemptSequence: 1,
+          latestAttemptSequence: 1,
+          completedBaselineFingerprint: null,
+        },
+      }));
+
+      expect(activated.view).toMatchObject({
+        schemaVersion: 5,
+        revision: 4,
+        state: 'running',
+        executionAttempt: { number: 2, resume: { admission: 'activated' } },
+      });
+      resetAnalyzeRunStorage();
+      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toEqual(activated.view);
+    },
+  );
 
   it.each([
     ['activated', 4, null, '2026-07-19T01:37:03.000Z'],
