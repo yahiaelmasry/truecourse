@@ -211,6 +211,7 @@ describe('certified analyze resume eligibility', () => {
             executionPin: {
               provider: 'claude-code',
               requestedModel: 'sonnet',
+              modelSelection: 'resolved',
               resolvedModel,
             },
           },
@@ -280,6 +281,7 @@ describe('certified analyze resume eligibility', () => {
       {
         provider: 'claude-code',
         requestedModel: 'sonnet',
+        modelSelection: 'resolved',
         resolvedModel,
       },
       '2026-07-19T04:00:05+02:00',
@@ -320,6 +322,7 @@ describe('certified analyze resume eligibility', () => {
     const pin = {
       provider: 'claude-code',
       requestedModel: 'sonnet',
+      modelSelection: 'resolved' as const,
       resolvedModel,
     };
 

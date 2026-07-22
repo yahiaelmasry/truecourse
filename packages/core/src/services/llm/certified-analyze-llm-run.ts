@@ -422,6 +422,7 @@ export function certifyAnalyzeLlmRun(
         executionPin: {
           provider: execution.provider,
           requestedModel: execution.requestedModel,
+          modelSelection: 'resolved',
           resolvedModel: compatibility.observed.resolvedModel,
         },
         observed: {
@@ -461,6 +462,7 @@ export function certifyAnalyzeLlmRun(
       const executionPin = Object.freeze({
         provider: execution.provider,
         requestedModel: execution.requestedModel,
+        modelSelection: 'resolved' as const,
         resolvedModel: planned.resolvedModel,
       });
       const validate = () => {
@@ -628,6 +630,7 @@ export function certifyAnalyzeLlmRun(
       && !isDeepStrictEqual(candidate.executionAttempt.resume?.executionPin, {
         provider: execution.provider,
         requestedModel: execution.requestedModel,
+        modelSelection: 'resolved',
         resolvedModel,
       })
     ) {
