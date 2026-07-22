@@ -32,6 +32,29 @@ export const AnalyzeRepoSchema = z.discriminatedUnion('mode', [
 
 export type AnalyzeRepoInput = z.infer<typeof AnalyzeRepoSchema>
 
+const AnalyzeRearmEvidenceSchema = z.object({
+  runId: z.string().min(1),
+  runRevision: z.number().int().nonnegative(),
+  executionEpoch: z.object({
+    kind: z.union([z.literal('initial'), z.literal('resume')]),
+    attemptNumber: z.number().int().positive(),
+    activatedAt: z.string().datetime(),
+  }),
+  admittedAt: z.string().datetime(),
+  pendingWorkCount: z.number().int().nonnegative(),
+})
+
+/** The client must echo every durable field; the server compares it with a fresh Core offer. */
+export const AnalyzeRearmRequestSchema = z.object({
+  consent: z.object({
+    evidence: AnalyzeRearmEvidenceSchema,
+    acceptedRisk: z.literal('repeat-up-to-pending-provider-calls'),
+    acceptedMaxRepeatProviderCalls: z.number().int().nonnegative().safe(),
+  }),
+})
+
+export type AnalyzeRearmRequest = z.infer<typeof AnalyzeRearmRequestSchema>
+
 export const GenerateViolationsSchema = z.object({
   analysisId: z.string().uuid().optional(),
 })

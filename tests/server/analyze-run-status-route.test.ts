@@ -102,6 +102,7 @@ describe('dashboard analyze-run status route', () => {
           requiresLatestAttempt: true,
           requiresRevalidation: true,
         },
+        rearm: null,
         startOver: {
           available: false,
           reason: 'recovery-required',
@@ -117,6 +118,59 @@ describe('dashboard analyze-run status route', () => {
     expect(readAnalyzeRunStatus).toHaveBeenCalledWith(fixture.repoPath);
     expect(fs.readFileSync(getRegistryPath())).toEqual(registryBefore);
     expect(snapshotTree(path.join(fixture.repoPath, '.truecourse'))).toEqual(repositoryBefore);
+  });
+
+  it('relays the Core-certified ambiguous-rearm offer verbatim without deriving one', async () => {
+    const offer = {
+      scope: 'structural' as const,
+      mode: 'rearm-ambiguous-execution' as const,
+      requiresLatestAttempt: true as const,
+      requiresRevalidation: true as const,
+      evidence: {
+        runId: 'attempt-2',
+        runRevision: 7,
+        executionEpoch: {
+          kind: 'resume' as const,
+          attemptNumber: 2,
+          activatedAt: '2026-07-22T08:31:00.000Z',
+        },
+        admittedAt: '2026-07-22T08:32:00.000Z',
+        pendingWorkCount: 40,
+      },
+      checkpointedWorkCount: 60,
+      maxRepeatProviderCalls: 40,
+      requiredAcknowledgement: 'possible-duplicate-provider-charges' as const,
+    };
+    readAnalyzeRunStatus.mockResolvedValueOnce({
+      latestAttempt: { ...attemptedRun({ state: 'blocked', resumeAvailable: true }), rearm: offer },
+      activeCompletedAnalysis: {
+        analysisId: 'completed-analysis', createdAt: '2026-07-21T09:00:00.000Z', branch: 'main', commitHash: 'abc123',
+      },
+    });
+
+    const response = await request(app)
+      .get(`/api/repos/${fixture.project.slug}/analyses/status`)
+      .expect(200);
+
+    expect(response.body.latestAttempt.rearm).toEqual(offer);
+  });
+
+  it('does not infer an offer merely because Resume identifies an ambiguous execution', async () => {
+    readAnalyzeRunStatus.mockResolvedValueOnce({
+      latestAttempt: {
+        ...attemptedRun({ state: 'blocked', resumeReason: 'resume-execution-ambiguous' }),
+        rearm: null,
+      },
+      activeCompletedAnalysis: {
+        analysisId: 'completed-analysis', createdAt: '2026-07-21T09:00:00.000Z', branch: 'main', commitHash: 'abc123',
+      },
+    });
+
+    const response = await request(app)
+      .get(`/api/repos/${fixture.project.slug}/analyses/status`)
+      .expect(200);
+
+    expect(response.body.latestAttempt.rearm).toBeNull();
   });
 
   it.each([

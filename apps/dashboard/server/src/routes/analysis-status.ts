@@ -1,6 +1,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import type {
   AnalyzeRunResumeStatus,
+  AnalyzeRunAmbiguousRearmOffer,
   AnalyzeRunStartOverStatus,
   AnalyzeRunStatusResponse,
 } from '@truecourse/shared';
@@ -63,6 +64,7 @@ function toAnalyzeRunStatusResponse(
               }
             : null,
           resume: toResumeStatus(attempt.resume),
+          rearm: attempt.rearm ? toRearmOffer(attempt.rearm) : null,
           startOver: toStartOverStatus(status),
         }
       : null,
@@ -74,6 +76,31 @@ function toAnalyzeRunStatusResponse(
           commitHash: completed.commitHash,
         }
       : null,
+  };
+}
+
+function toRearmOffer(
+  offer: NonNullable<NonNullable<AnalyzeRunStatus['latestAttempt']>['rearm']>,
+): AnalyzeRunAmbiguousRearmOffer {
+  return {
+    scope: offer.scope,
+    mode: offer.mode,
+    requiresLatestAttempt: offer.requiresLatestAttempt,
+    requiresRevalidation: offer.requiresRevalidation,
+    evidence: {
+      runId: offer.evidence.runId,
+      runRevision: offer.evidence.runRevision,
+      executionEpoch: {
+        kind: offer.evidence.executionEpoch.kind,
+        attemptNumber: offer.evidence.executionEpoch.attemptNumber,
+        activatedAt: offer.evidence.executionEpoch.activatedAt,
+      },
+      admittedAt: offer.evidence.admittedAt,
+      pendingWorkCount: offer.evidence.pendingWorkCount,
+    },
+    checkpointedWorkCount: offer.checkpointedWorkCount,
+    maxRepeatProviderCalls: offer.maxRepeatProviderCalls,
+    requiredAcknowledgement: offer.requiredAcknowledgement,
   };
 }
 

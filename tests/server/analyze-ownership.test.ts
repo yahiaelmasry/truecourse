@@ -153,6 +153,15 @@ describe('dashboard analysis ownership', () => {
     expect(isAnalysisActive('repo-resume')).toBe(true);
     unregisterAnalysis('repo-resume', owner!);
   });
+
+  it('does not abort or release protected Analyze Rearm ownership', () => {
+    const owner = tryRegisterAnalysis('repo-rearm', 'run-1', 'rearm');
+    expect(owner).not.toBeNull();
+    expect(cancelAnalysis('repo-rearm')).toBe('protected');
+    expect(owner!.signal.aborted).toBe(false);
+    expect(isAnalysisActive('repo-rearm')).toBe(true);
+    unregisterAnalysis('repo-rearm', owner!);
+  });
 });
 
 function deferred<T>() {

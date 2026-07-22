@@ -49,7 +49,7 @@ export type CancelAnalysisResult = 'canceled' | 'not-found' | 'protected';
 export function cancelAnalysis(repoId: string): CancelAnalysisResult {
   const entry = activeAnalyses.get(repoId);
   if (!entry) return 'not-found';
-  if (entry.mode === 'resume') return 'protected';
+  if (entry.mode === 'resume' || entry.mode === 'rearm') return 'protected';
 
   entry.abortController.abort();
   for (const child of entry.childProcesses) {

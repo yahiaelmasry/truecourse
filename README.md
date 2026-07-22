@@ -125,9 +125,11 @@ repository-lifecycle lock and atomic finalization to an execution-ambiguous
 attempt. Fresh rearm requires the exact durable evidence and accepted maximum
 repeat-call count; already-activated or fully checkpointed response-loss
 recovery does not ask for consent again. An activated recovery executes only
-its pending work; a fully checkpointed recovery makes no provider call. CLI
-and dashboard adapters will expose that bounded consent in separate
-contributions.
+its pending work; a fully checkpointed recovery makes no provider call. The
+CLI exposes that bounded consent. The dashboard server transports the same
+certified offer and accepts an exact echoed consent at its local
+`POST /api/repos/:id/analyses/:runId/rearm` endpoint; the dashboard UI
+confirmation is a separate contribution.
 The read-only `truecourse analyze status` command shows the latest attempted run,
 durable progress, and advisory provider reset hint separately from the active
 completed analysis. A complete timezone-qualified Claude reset hint is also
@@ -153,7 +155,11 @@ retryable failure. The local dashboard exposes the
 latest attempted run and its durable progress separately from the active
 completed analysis. Its exact-run Resume action revalidates saved inputs before
 checkpoint reuse, reports progress and provider reset failures, and protects
-admitted execution from unsafe cancellation. The CLI will not silently replace incomplete paid work:
+admitted execution from unsafe cancellation. Its local rearm endpoint accepts
+only the exact current Core-certified evidence and duplicate-charge bound; it
+rejects stale state before any provider admission and is protected from unsafe
+cancellation after admission. The dashboard UI confirmation remains a later
+contribution. The CLI will not silently replace incomplete paid work:
 resumable attempts direct the user toward recovery, execution-ambiguous
 attempts fail closed, and starting over requires exact acknowledgement with
 `--abandon-attempt <run-id>`. The local dashboard applies the same core-owned
