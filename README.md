@@ -99,7 +99,12 @@ exact latest blocked attempt after compatibility checks, but provider execution
 is not yet wired into the production Resume flow. The journal's internal
 admission boundary durably records `executing` and revalidates the exact
 provider/model pin before and after that write, before allowing pending work to
-start. Schema-v1 through schema-v4 journals remain
+start. The certified runner can then replay checkpointed results, execute only
+pending work, and recover with zero calls after the final checkpoint; production
+analysis reconstruction and CLI Resume wiring remain later dependencies. A
+crash in an admitted attempt while work is still pending fails closed as
+ambiguous rather than guessing whether an uncheckpointed provider call ran.
+Schema-v1 through schema-v4 journals remain
 readable and normalize safely to schema v5 when a current lifecycle command
 writes them. Historical schema-v3 runs from before durable execution admission
 are normalized to the admitted revision lineage without rewriting the journal

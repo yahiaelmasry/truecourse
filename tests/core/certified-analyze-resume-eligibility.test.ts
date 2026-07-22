@@ -346,6 +346,11 @@ describe('certified analyze resume eligibility', () => {
       revision: 6,
       executionAttempt: { resume: { admission: 'executing' } },
     });
+    resetAnalyzeRunStorage();
+    await expect(rebuiltRun().rebuilt.inspectResumeCompatibility(identity)).resolves.toEqual({
+      compatible: false,
+      reason: 'resume-execution-ambiguous',
+    });
     await expect(admitAnalyzeRunResumeExecution(
       activated.activation,
       repoPath,
@@ -357,6 +362,115 @@ describe('certified analyze resume eligibility', () => {
       () => undefined,
       async () => [],
     )).resolves.toEqual({ admitted: false });
+  });
+
+  it('executes only pending work and returns checkpointed results in certified plan order', async () => {
+    const original = await createBlockedRun();
+    const { rebuilt, calls } = rebuiltRun();
+    const completedBefore = fs.readFileSync(latestPath(repoPath));
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected resume activation');
+
+    const resumed = await rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    );
+
+    expect(calls()).toBe(1);
+    expect(resumed.results.map(({ work }) => work.workId)).toEqual(
+      rebuilt.manifest.work.map(({ workId }) => workId),
+    );
+    expect(resumed.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ work: expect.objectContaining({ workId: original.codeWorkId }) }),
+      expect.objectContaining({ work: expect.objectContaining({ workId: original.databaseWorkId }) }),
+    ]));
+    expect(resumed.completion).toEqual(expect.any(Object));
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      revision: 7,
+      state: 'running',
+      counts: { total: 2, pending: 0, succeeded: 2 },
+      executionAttempt: { number: 2, resume: { admission: 'executing' } },
+    });
+    expect(fs.readFileSync(latestPath(repoPath))).toEqual(completedBefore);
+  });
+
+  it('finishes an all-checkpointed blocked run without another provider call', async () => {
+    await createBlockedRun({ databaseSucceeds: true });
+    const { rebuilt, calls } = rebuiltRun();
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected resume activation');
+    expect(activated.counts).toEqual({ total: 2, reused: 2, pending: 0 });
+
+    await expect(rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).resolves.toMatchObject({ results: expect.any(Array), completion: expect.any(Object) });
+    expect(calls()).toBe(0);
+  });
+
+  it('recovers after the final resumed checkpoint without repeating provider work', async () => {
+    await createBlockedRun();
+    const first = rebuiltRun();
+    const firstActivation = await first.rebuilt.activateResume(
+      identity,
+      '2026-07-19T02:00:04.000Z',
+    );
+    if (!firstActivation.activated) throw new Error('Expected resume activation');
+    await first.rebuilt.executeResume(
+      firstActivation.activation,
+      '2026-07-19T02:00:05.000Z',
+    );
+    expect(first.calls()).toBe(1);
+    const completedCheckpointBytes = fs.readFileSync(runFile());
+
+    resetAnalyzeRunStorage();
+    const recovered = rebuiltRun();
+    const recoveredActivation = await recovered.rebuilt.activateResume(
+      identity,
+      '2026-07-19T03:00:00.000Z',
+    );
+    expect(recoveredActivation).toMatchObject({
+      activated: true,
+      counts: { total: 2, reused: 2, pending: 0 },
+      view: { revision: 7 },
+    });
+    if (!recoveredActivation.activated) throw new Error('Expected recovered activation');
+    await expect(recovered.rebuilt.executeResume(
+      recoveredActivation.activation,
+      '2026-07-19T03:00:01.000Z',
+    )).resolves.toMatchObject({ results: expect.any(Array), completion: expect.any(Object) });
+    expect(recovered.calls()).toBe(0);
+    expect(fs.readFileSync(runFile())).toEqual(completedCheckpointBytes);
+  });
+
+  it('rejects a pending result that does not prove the activated concrete model', async () => {
+    await createBlockedRun();
+    let providerCalls = 0;
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: { provider: 'claude-code', requestedModel: 'sonnet' },
+      resumeExecution: pinnedResumeExecution(),
+      async execute(work) {
+        providerCalls += 1;
+        const outcome = successfulOutcome(work);
+        return {
+          ...outcome,
+          usage: outcome.usage && { ...outcome.usage, resolvedModel: 'claude-sonnet-other' },
+        };
+      },
+    };
+    const rebuilt = certifyAnalyzeLlmRun(planInput(), adapter);
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected resume activation');
+
+    await expect(rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).rejects.toMatchObject({ code: 'result-not-certified' });
+    expect(providerCalls).toBe(1);
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      revision: 6,
+      counts: { pending: 1, succeeded: 1 },
+    });
   });
 
   it.each([
@@ -805,7 +919,7 @@ function rebuiltRun(
     execution: { provider: 'claude-code', requestedModel: 'sonnet' },
     async execute(work) {
       providerCalls += 1;
-      return successfulOutcome(work);
+      return { ...successfulOutcome(work), completedAt: '2026-07-19T02:00:06.000Z' };
     },
   };
   if (resumeModel !== null) {

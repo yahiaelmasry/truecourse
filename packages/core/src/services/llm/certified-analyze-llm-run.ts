@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   activateAnalyzeRunResume,
   admitAnalyzeRunPlanExecution,
+  admitAnalyzeRunResumeExecution,
   checkpointAnalyzeRunWork,
   type AnalyzeRunView,
   type AnalyzeRunSource,
@@ -135,6 +136,11 @@ export interface CertifiedAnalyzeLlmRun {
     identity: AnalyzeLlmResumeIdentity,
     activatedAt: string,
   ): Promise<AnalyzeLlmResumeActivationResult>;
+  executeResume(
+    activation: AnalyzeRunResumePlanActivation,
+    admittedAt: string,
+    observer?: AnalyzeLlmWorkProgressObserver,
+  ): Promise<CertifiedAnalyzeLlmResumeExecution>;
   execute(
     activation: AnalyzeRunPlanActivation,
     observer?: AnalyzeLlmWorkProgressObserver,
@@ -166,7 +172,8 @@ export type AnalyzeLlmResumeIncompatibility =
   | 'checkpoint-execution-changed'
   | 'checkpoint-model-unverified'
   | 'duplicate-checkpoint-attempt'
-  | 'activated-execution-changed';
+  | 'activated-execution-changed'
+  | 'resume-execution-ambiguous';
 
 export type AnalyzeLlmResumeCompatibility =
   | Readonly<{
@@ -205,6 +212,11 @@ export type AnalyzeLlmResumeActivationResult =
 interface AnalyzeLlmResumeInspection {
   readonly compatibility: AnalyzeLlmResumeCompatibility;
   readonly durableActivatedAt: string | null;
+  readonly reused: readonly Readonly<{
+    work: CertifiedAnalyzeLlmWork;
+    result: unknown;
+  }>[];
+  readonly pending: readonly CertifiedAnalyzeLlmWork[];
 }
 
 export interface CertifiedAnalyzeLlmExecution {
@@ -214,6 +226,8 @@ export interface CertifiedAnalyzeLlmExecution {
   }[];
   readonly completion: AnalyzeRunExecutionCompletion;
 }
+
+export interface CertifiedAnalyzeLlmResumeExecution extends CertifiedAnalyzeLlmExecution {}
 
 export interface AnalyzeLlmPlanInput {
   readonly runId: string;
@@ -360,6 +374,11 @@ export function certifyAnalyzeLlmRun(
   });
   const certifiedWork = Object.freeze([...work]);
   let executed = false;
+  const resumeExecutions = new WeakMap<object, Readonly<{
+    reused: AnalyzeLlmResumeInspection['reused'];
+    pending: AnalyzeLlmResumeInspection['pending'];
+    resolvedModel: string;
+  }>>();
 
   return Object.freeze({
     manifest,
@@ -400,11 +419,84 @@ export function certifyAnalyzeLlmRun(
           completedBaselineFingerprint: compatibility.observed.completedBaselineFingerprint,
         },
       }));
+      resumeExecutions.set(activated.activation, Object.freeze({
+        reused: inspection.reused,
+        pending: inspection.pending,
+        resolvedModel: compatibility.observed.resolvedModel,
+      }));
       return Object.freeze({
         activated: true as const,
         view: activated.view,
         counts: compatibility.counts,
         activation: activated.activation,
+      });
+    },
+    async executeResume(
+      activation: AnalyzeRunResumePlanActivation,
+      admittedAt: string,
+      observer?: AnalyzeLlmWorkProgressObserver,
+    ) {
+      if (executed) {
+        throw new AnalyzeLlmPlanError('already-executed', 'Certified analyze LLM run already executed');
+      }
+      const planned = resumeExecutions.get(activation);
+      if (!planned) {
+        throw new AnalyzeLlmPlanError(
+          'plan-not-activated',
+          'Certified analyze resume was not activated by this plan',
+        );
+      }
+      const executionPin = Object.freeze({
+        provider: execution.provider,
+        requestedModel: execution.requestedModel,
+        resolvedModel: planned.resolvedModel,
+      });
+      const validate = () => {
+        assertExecutionMatches(execution, adapter.execution);
+        assertResumeExecutionMatches(adapter, execution, planned.resolvedModel);
+      };
+      const admission = await admitAnalyzeRunResumeExecution(
+        activation,
+        journalKey,
+        runId,
+        manifest.work,
+        planned.pending.map((item) => item.workId),
+        executionPin,
+        admittedAt,
+        validate,
+        (checkpointWriter) => {
+          executed = true;
+          return executeCertifiedWork(
+            planned.pending,
+            observer,
+            checkpointWriter,
+            planned.resolvedModel,
+          );
+        },
+      );
+      if (!admission.admitted) {
+        throw new AnalyzeLlmPlanError(
+          'plan-not-activated',
+          'Certified analyze resume activation is stale or invalid',
+        );
+      }
+      resumeExecutions.delete(activation);
+      const completed = await admission.execution;
+      const combined = [...planned.reused, ...completed.result];
+      const byWorkId = new Map(combined.map((item) => [item.work.workId, item]));
+      const results = certifiedWork.map((item) => {
+        const result = byWorkId.get(item.workId);
+        if (!result) {
+          throw new AnalyzeLlmPlanError(
+            'plan-not-activated',
+            `Certified analyze resume omitted work ${item.workId}`,
+          );
+        }
+        return Object.freeze({ work: result.work, result: result.result });
+      });
+      return Object.freeze({
+        results: Object.freeze(results),
+        completion: certifyAnalyzeRunExecutionCompletion(completed.certification),
       });
     },
     async execute(
@@ -424,7 +516,7 @@ export function certifyAnalyzeLlmRun(
         },
         (checkpointWriter) => {
           executed = true;
-          return executeCertifiedWork(observer, checkpointWriter);
+          return executeCertifiedWork(certifiedWork, observer, checkpointWriter);
         },
       );
       if (!admission.admitted) {
@@ -451,10 +543,24 @@ export function certifyAnalyzeLlmRun(
     const recoveringActivated = candidate.state === 'running'
       && candidate.executionAttempt.number > 1
       && candidate.executionAttempt.resume?.admission === 'activated';
+    const recoveringCompletedExecution = candidate.state === 'running'
+      && candidate.executionAttempt.number > 1
+      && candidate.executionAttempt.resume?.admission === 'executing'
+      && candidate.plan !== 'unsealed'
+      && candidate.plan.work.every((work) => work.state === 'succeeded-checkpointed');
+    if (
+      candidate.state === 'running'
+      && candidate.executionAttempt.number > 1
+      && candidate.executionAttempt.resume?.admission === 'executing'
+      && !recoveringCompletedExecution
+    ) {
+      return incompatibleInspection('resume-execution-ambiguous');
+    }
     if (
       (
         (candidate.state !== 'blocked' || candidate.blocked === null)
         && !recoveringActivated
+        && !recoveringCompletedExecution
       )
       || candidate.plan === 'unsealed'
     ) {
@@ -505,7 +611,7 @@ export function certifyAnalyzeLlmRun(
     }
     const resolvedModel = resumeExecution.resolvedModel;
     if (
-      recoveringActivated
+      (recoveringActivated || recoveringCompletedExecution)
       && !isDeepStrictEqual(candidate.executionAttempt.resume?.executionPin, {
         provider: execution.provider,
         requestedModel: execution.requestedModel,
@@ -630,18 +736,24 @@ export function certifyAnalyzeLlmRun(
     });
     return Object.freeze({
       compatibility,
-      durableActivatedAt: recoveringActivated ? candidate.executionAttempt.activatedAt : null,
+      durableActivatedAt: recoveringActivated || recoveringCompletedExecution
+        ? candidate.executionAttempt.activatedAt
+        : null,
+      reused: Object.freeze(reused),
+      pending: Object.freeze(pending),
     });
   }
 
   async function executeCertifiedWork(
+    items: readonly CertifiedAnalyzeLlmWork[],
     observer?: AnalyzeLlmWorkProgressObserver,
     checkpointWriter?: AnalyzeRunCheckpointWriter,
+    expectedResolvedModel?: string,
   ): Promise<readonly {
     readonly work: CertifiedAnalyzeLlmWork;
     readonly result: unknown;
   }[]> {
-    const settled = await Promise.allSettled(certifiedWork.map(async (item) => {
+    const settled = await Promise.allSettled(items.map(async (item) => {
       let started = false;
       let ok = false;
       let startNotification = Promise.resolve();
@@ -657,7 +769,12 @@ export function certifyAnalyzeLlmRun(
             );
           },
         });
-        const certified = certifyExecutionOutcome(item, outcome, execution);
+        const certified = certifyExecutionOutcome(
+          item,
+          outcome,
+          execution,
+          expectedResolvedModel,
+        );
         if (!checkpointWriter) {
           throw new AnalyzeLlmPlanError('plan-not-activated', 'Analyze checkpoint writer is missing');
         }
@@ -703,6 +820,8 @@ function incompatibleInspection(
   return Object.freeze({
     compatibility: incompatible(reason),
     durableActivatedAt: null,
+    reused: Object.freeze([]),
+    pending: Object.freeze([]),
   });
 }
 
@@ -772,6 +891,7 @@ function certifyExecutionOutcome(
   work: CertifiedAnalyzeLlmWork,
   outcome: AnalyzeLlmExecutionOutcome,
   execution: Readonly<LlmWorkExecutionIntent>,
+  expectedResolvedModel?: string,
 ): AnalyzeLlmExecutionOutcome {
   const matches = (
     outcome !== null &&
@@ -800,6 +920,14 @@ function certifyExecutionOutcome(
     throw new AnalyzeLlmPlanError(
       'result-not-certified',
       `Analyze ${work.family} usage does not match its certified execution intent`,
+      work.family,
+      work.domain,
+    );
+  }
+  if (expectedResolvedModel && usage?.resolvedModel !== expectedResolvedModel) {
+    throw new AnalyzeLlmPlanError(
+      'result-not-certified',
+      `Analyze ${work.family} result does not prove the activated resume model`,
       work.family,
       work.domain,
     );
@@ -959,6 +1087,19 @@ function assertExecutionMatches(
     throw new AnalyzeLlmPlanError(
       'provider-not-certifiable',
       'Analyze LLM execution intent changed after certification',
+    );
+  }
+}
+
+function assertResumeExecutionMatches(
+  adapter: AnalyzeLlmExecutionAdapter,
+  execution: Readonly<LlmWorkExecutionIntent>,
+  resolvedModel: string,
+): void {
+  if (!resumeExecutionMatches(adapter, execution, resolvedModel)) {
+    throw new AnalyzeLlmPlanError(
+      'provider-not-certifiable',
+      'Analyze LLM resume model pin changed after activation',
     );
   }
 }
