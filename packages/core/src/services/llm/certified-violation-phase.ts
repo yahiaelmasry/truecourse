@@ -110,6 +110,7 @@ export async function executeCertifiedViolationPhase(
       kind: 'seal-plan',
       runId: input.run.runId,
       sealedAt,
+      execution: input.adapter.execution,
       work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
         workId,
         inputFingerprint,

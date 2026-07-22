@@ -96,6 +96,7 @@ async function certifySuccessfulExecution(
   }, adapter);
   const activation = await sealAnalyzeRunPlan(repository, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
     runId,
     sealedAt,
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -318,6 +319,7 @@ describe('analyze run journal', () => {
 
     await expect(sealAnalyzeRunPlan(repoKey, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'storage-swap-run',
       sealedAt: '2026-07-19T00:40:01.000Z',
       work: [{ workId: 'analyze:v1:swap', inputFingerprint: `sha256:${'c'.repeat(64)}` }],
@@ -347,7 +349,7 @@ describe('analyze run journal', () => {
     });
 
     expect(begun).toEqual({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 0,
       runId: 'run-2026-07-19',
       candidateAnalysisId: 'analysis-2026-07-19',
@@ -396,6 +398,7 @@ describe('analyze run journal', () => {
       kind: 'seal-plan',
       runId: 'run-with-plan',
       sealedAt: '2026-07-19T01:00:01.000Z',
+      execution: { provider: 'claude-code', requestedModel: 'sonnet' },
       work: [
         { workId: 'analyze:v1:service', inputFingerprint: `sha256:${'a'.repeat(64)}` },
         { workId: 'analyze:v1:module', inputFingerprint: `sha256:${'b'.repeat(64)}` },
@@ -418,6 +421,20 @@ describe('analyze run journal', () => {
 
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(sealed);
+    const stored = JSON.parse(fs.readFileSync(path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'run-with-plan.json',
+    ), 'utf8'));
+    expect(stored).toMatchObject({
+      schemaVersion: 7,
+      plan: {
+        state: 'sealed',
+        execution: { provider: 'claude-code', requestedModel: 'sonnet' },
+      },
+    });
   });
 
   it('preserves valid offset timestamp text across v4 reads and legacy normalization', async () => {
@@ -433,6 +450,7 @@ describe('analyze run journal', () => {
     });
     const sealed = await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'offset-timestamp-run',
       sealedAt: '2026-07-19T02:00:01+02:00',
       work: [{ workId: 'analyze:v1:offset', inputFingerprint: `sha256:${'e'.repeat(64)}` }],
@@ -456,7 +474,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'offset-timestamp-run' }))
       .resolves.toMatchObject({
-        schemaVersion: 6,
+        schemaVersion: 7,
         updatedAt: '2026-07-19T02:00:01+02:00',
         executionAttempt: { number: 1, activatedAt: '2026-07-19T02:00:00+02:00', resume: null },
       });
@@ -554,7 +572,7 @@ describe('analyze run journal', () => {
       ...payload,
     });
     expect(prepared).toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 5,
       state: 'finalizing',
       finalization: {
@@ -946,13 +964,13 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 3,
       state: 'finalizing',
       finalization: { persistence: 'unprepared', preparedAt: null },
     });
     expect(JSON.parse(fs.readFileSync(pointerFile, 'utf8'))).toEqual({
-      schemaVersion: 6,
+      schemaVersion: 7,
       runId: 'legacy-finalizing-run',
     });
     await expect(prepareAnalyzeRunFinalization(repoPath, {
@@ -960,12 +978,12 @@ describe('analyze run journal', () => {
       preparedAt: '2026-07-19T01:35:03.000Z',
       ...finalizationPayload('legacy-finalizing-analysis'),
     })).resolves.toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 4,
       finalization: { persistence: 'prepared' },
     });
     expect(JSON.parse(fs.readFileSync(runFile, 'utf8'))).toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 4,
       finalizationIntent: { preparedAt: '2026-07-19T01:35:03.000Z' },
     });
@@ -987,7 +1005,7 @@ describe('analyze run journal', () => {
       .resolves.toMatchObject({ revision: 5, state: 'completed' });
   });
 
-  it('migrates a schema-v1 finalizing failure to a readable schema-v6 revision', async () => {
+  it('migrates a schema-v1 finalizing failure to a readable schema-v7 revision', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'legacy-finalizing-failure',
@@ -1031,10 +1049,10 @@ describe('analyze run journal', () => {
       runId: 'legacy-finalizing-failure',
       failedAt: '2026-07-19T01:36:03.000Z',
       error: { code: 'FINALIZE_FAILED', message: 'Legacy finalization failed.' },
-    })).resolves.toMatchObject({ schemaVersion: 6, revision: 4, state: 'failed' });
+    })).resolves.toMatchObject({ schemaVersion: 7, revision: 4, state: 'failed' });
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-failure' }))
-      .resolves.toMatchObject({ schemaVersion: 6, revision: 4, state: 'failed' });
+      .resolves.toMatchObject({ schemaVersion: 7, revision: 4, state: 'failed' });
   });
 
   it.each([[1, 2], [2, 2], [3, 3]] as const)(
@@ -1052,6 +1070,7 @@ describe('analyze run journal', () => {
       });
       await dispatchAnalyzeRun(repoPath, {
         kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
         runId: 'legacy-blocked-attempt',
         sealedAt: '2026-07-19T01:36:01.000Z',
         work: [{ workId: 'analyze:v1:legacy', inputFingerprint: `sha256:${'d'.repeat(64)}` }],
@@ -1079,7 +1098,7 @@ describe('analyze run journal', () => {
 
       await expect(readAnalyzeRun(repoPath, { runId: 'legacy-blocked-attempt' }))
         .resolves.toMatchObject({
-          schemaVersion: 6,
+          schemaVersion: 7,
           revision: normalizedRevision,
           state: 'blocked',
           executionAttempt: {
@@ -1098,7 +1117,7 @@ describe('analyze run journal', () => {
     ['prepared', 4, 5],
     ['completed', 5, 6],
   ] as const)(
-    'normalizes the pre-admission schema-v3 %s lineage to the admitted schema-v6 revision',
+    'normalizes the pre-admission schema-v3 %s lineage to the admitted schema-v7 revision',
     async (state, legacyRevision, normalizedRevision) => {
       const candidateAnalysisId = `schema-v3-${state}-analysis`;
       const runId = `schema-v3-${state}`;
@@ -1158,7 +1177,7 @@ describe('analyze run journal', () => {
       resetAnalyzeRunStorage();
 
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
-        schemaVersion: 6,
+        schemaVersion: 7,
         revision: normalizedRevision,
         state: state === 'prepared' ? 'finalizing' : state,
         executionAttempt: { number: 1, activatedAt: startedAt, resume: null },
@@ -1167,7 +1186,7 @@ describe('analyze run journal', () => {
     },
   );
 
-  it('normalizes a schema-v4 execution attempt to schema v6 without rewriting it', async () => {
+  it('normalizes a schema-v4 execution attempt to schema v7 without rewriting it', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'schema-v4-attempt',
@@ -1194,7 +1213,7 @@ describe('analyze run journal', () => {
 
     await expect(readAnalyzeRun(repoPath, { runId: 'schema-v4-attempt' }))
       .resolves.toMatchObject({
-        schemaVersion: 6,
+        schemaVersion: 7,
         executionAttempt: {
           number: 1,
           activatedAt: '2026-07-19T01:36:30.000Z',
@@ -1226,6 +1245,7 @@ describe('analyze run journal', () => {
     ];
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'activate-partial-run',
       sealedAt: '2026-07-19T01:38:01.000Z',
       work,
@@ -1300,7 +1320,7 @@ describe('analyze run journal', () => {
     }));
 
     expect(activated.view).toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 5,
       state: 'running',
       updatedAt: '2026-07-19T01:38:04.000Z',
@@ -1358,6 +1378,7 @@ describe('analyze run journal', () => {
     const work = [{ workId: 'analyze:v1:stale', inputFingerprint: `sha256:${'d'.repeat(64)}` }];
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'stale-activation-run',
       sealedAt: '2026-07-19T01:39:01.000Z',
       work,
@@ -1412,7 +1433,7 @@ describe('analyze run journal', () => {
   });
 
   it.each([[1, 2], [2, 2], [3, 3]] as const)(
-    'activates a schema-v%s blocked run into the canonical admitted-lineage revision',
+    'refuses to activate a schema-v%s blocked run without bound execution intent',
     async (schemaVersion, observedRevision) => {
       const runId = `activate-schema-${schemaVersion}`;
       const work = [{
@@ -1431,6 +1452,7 @@ describe('analyze run journal', () => {
       });
       await dispatchAnalyzeRun(repoPath, {
         kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
         runId,
         sealedAt: '2026-07-19T01:39:11.000Z',
         work,
@@ -1454,8 +1476,9 @@ describe('analyze run journal', () => {
       if (schemaVersion === 1) delete stored.finalizationIntent;
       fs.writeFileSync(file, JSON.stringify(stored));
       resetAnalyzeRunStorage();
+      const before = fs.readFileSync(file);
 
-      const activated = await activateAnalyzeRunResume(repoPath, certifyAnalyzeRunResumeActivation({
+      await expect(activateAnalyzeRunResume(repoPath, certifyAnalyzeRunResumeActivation({
         kind: 'activate-resume',
         runId,
         candidateAnalysisId: `${runId}-analysis`,
@@ -1480,16 +1503,13 @@ describe('analyze run journal', () => {
           latestAttemptSequence: 1,
           completedBaselineFingerprint: null,
         },
-      }));
-
-      expect(activated.view).toMatchObject({
-        schemaVersion: 6,
-        revision: 4,
-        state: 'running',
-        executionAttempt: { number: 2, resume: { admission: 'activated' } },
+      }))).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+      expect(fs.readFileSync(file)).toEqual(before);
+      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+        schemaVersion: 7,
+        revision: observedRevision,
+        state: 'blocked',
       });
-      resetAnalyzeRunStorage();
-      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toEqual(activated.view);
     },
   );
 
@@ -1514,6 +1534,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: `reserved-${admission}`,
       sealedAt: '2026-07-19T01:37:01.000Z',
       work: [{ workId: 'analyze:v1:reserved', inputFingerprint: `sha256:${'c'.repeat(64)}` }],
@@ -1554,7 +1575,7 @@ describe('analyze run journal', () => {
 
     await expect(readAnalyzeRun(repoPath, { runId: `reserved-${admission}` }))
       .resolves.toMatchObject({
-        schemaVersion: 6,
+        schemaVersion: 7,
         revision,
         state: 'running',
         executionAttempt: {
@@ -1572,7 +1593,7 @@ describe('analyze run journal', () => {
     expect(fs.readFileSync(file)).toEqual(bytesBefore);
   });
 
-  it('rejects a schema-v6 run whose resume admission chronology is impossible', async () => {
+  it('rejects a schema-v7 run whose resume admission chronology is impossible', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'unreachable-attempt',
@@ -1585,6 +1606,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'unreachable-attempt',
       sealedAt: '2026-07-19T01:37:01.000Z',
       work: [{ workId: 'analyze:v1:unreachable', inputFingerprint: `sha256:${'c'.repeat(64)}` }],
@@ -1664,6 +1686,94 @@ describe('analyze run journal', () => {
       runId: 'exact-finalize-run',
       finalizingAt: '2026-07-19T01:40:02.000Z',
     }, execution.completion)).resolves.toMatchObject({ revision: 4, state: 'finalizing' });
+  });
+
+  it('rejects finalization when hosted storage changes execution during the finalization write', async () => {
+    const repoKey = 'hosted:finalization-execution-write-drift';
+    let stored: StoredAnalyzeRun | null = null;
+    const storage: AnalyzeRunStorage = {
+      async createLatest(_key, run) {
+        stored = { ...run, attemptSequence: 1 };
+        return stored;
+      },
+      async read(_key, runId) { return stored?.runId === runId ? stored : null; },
+      async readLatest() { return stored; },
+      async inspectLatest() { return stored; },
+      async compareAndSwap(_key, _runId, expectedRevision, next) {
+        if (stored?.revision !== expectedRevision) {
+          throw new AnalyzeRunRevisionConflictError(
+            next.runId,
+            expectedRevision,
+            stored?.revision ?? -1,
+          );
+        }
+        stored = next.status.state === 'finalizing' && next.plan.state === 'sealed'
+          ? {
+              ...next,
+              plan: {
+                ...next.plan,
+                execution: { provider: 'claude-code', requestedModel: 'sonnet' },
+              },
+            }
+          : next;
+      },
+    };
+    setAnalyzeRunStorage(storage);
+    await dispatchAnalyzeRun(repoKey, {
+      kind: 'begin',
+      runId: 'finalization-execution-write-drift',
+      candidateAnalysisId: 'finalization-execution-write-drift-analysis',
+      startedAt: '2026-07-19T01:45:00.000Z',
+      source: 'hosted',
+      branch: 'main',
+      commitHash: 'finalization-execution-write-drift-commit',
+      completedBaselineId: null,
+    });
+    const execution = await certifySuccessfulExecution(
+      repoKey,
+      'finalization-execution-write-drift',
+      '2026-07-19T01:45:01.000Z',
+    );
+
+    await expect(beginFinalizeAnalyzeRun(repoKey, {
+      runId: 'finalization-execution-write-drift',
+      finalizingAt: '2026-07-19T01:45:02.000Z',
+    }, execution.completion)).rejects.toThrow(/sealed execution changed during finalization/);
+    expect(stored).toMatchObject({
+      revision: 4,
+      status: { state: 'finalizing' },
+      plan: { execution: { provider: 'claude-code', requestedModel: 'sonnet' } },
+    });
+  });
+
+  it.each([
+    { provider: ' claude-code', requestedModel: 'opus[1m]' },
+    { provider: 'claude-code', requestedModel: '' },
+    { provider: 'claude-code', requestedModel: 'opus[1m] ' },
+  ])('refuses to seal an execution intent that cannot be resumed: %j', async (execution) => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'invalid-execution-intent-run',
+      candidateAnalysisId: 'invalid-execution-intent-analysis',
+      startedAt: '2026-07-19T01:50:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'invalid-execution-intent-commit',
+      completedBaselineId: null,
+    });
+
+    await expect(dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      execution,
+      runId: 'invalid-execution-intent-run',
+      sealedAt: '2026-07-19T01:50:01.000Z',
+      work: [{
+        workId: 'analyze:v1:invalid-execution-intent',
+        inputFingerprint: `sha256:${'8'.repeat(64)}`,
+      }],
+    })).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+    await expect(readAnalyzeRun(repoPath, { runId: 'invalid-execution-intent-run' }))
+      .resolves.toMatchObject({ revision: 0, plan: 'unsealed' });
   });
 
   it('records a finalization failure without forgetting successful checkpointed calls', async () => {
@@ -1764,6 +1874,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'blocked-run',
       sealedAt: '2026-07-19T02:00:01.000Z',
       work: [
@@ -1911,6 +2022,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'failed-after-plan-run',
       sealedAt: '2026-07-19T02:45:01.000Z',
       work: [{ workId: 'analyze:v1:code', inputFingerprint: `sha256:${'5'.repeat(64)}` }],
@@ -1946,6 +2058,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId,
       sealedAt: '2026-07-19T02:50:01.000Z',
       work: [{ workId: 'analyze:v1:reserved', inputFingerprint: `sha256:${'a'.repeat(64)}` }],
@@ -2028,6 +2141,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'backdated-plan-run',
       sealedAt: '2026-07-19T03:04:59.000Z',
       work: [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'7'.repeat(64)}` }],
@@ -2063,6 +2177,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'impossible-running-history-run',
       sealedAt: '2026-07-19T03:10:01.000Z',
       work: [{ workId: 'analyze:v1:database', inputFingerprint: `sha256:${'8'.repeat(64)}` }],
@@ -2122,6 +2237,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'impossible-sealed-failure-revision-run',
       sealedAt: '2026-07-19T03:30:01.000Z',
       work: [{ workId: 'analyze:v1:module', inputFingerprint: `sha256:${'6'.repeat(64)}` }],
@@ -2240,12 +2356,14 @@ describe('analyze run journal', () => {
     const outcomes = await Promise.allSettled([
       dispatchAnalyzeRun(repoPath, {
         kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
         runId: 'concurrent-run',
         sealedAt: '2026-07-19T03:00:01.000Z',
         work: [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'d'.repeat(64)}` }],
       }),
       dispatchAnalyzeRun(repoPath, {
         kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
         runId: 'concurrent-run',
         sealedAt: '2026-07-19T03:00:02.000Z',
         work: [{ workId: 'analyze:v1:module', inputFingerprint: `sha256:${'e'.repeat(64)}` }],
@@ -2305,7 +2423,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, command)).resolves.toEqual(begun);
     expect(JSON.parse(fs.readFileSync(latestAttemptPath, 'utf8'))).toEqual({
-      schemaVersion: 6,
+      schemaVersion: 7,
       runId: command.runId,
     });
   });
@@ -2331,7 +2449,7 @@ describe('analyze run journal', () => {
     })).rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
     expect(fs.existsSync(path.join(runsPath, 'must-not-mask-third-run.json'))).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(runsPath, 'LATEST_ATTEMPT.json'), 'utf8'))).toEqual({
-      schemaVersion: 6,
+      schemaVersion: 7,
       runId: 'missing-second-run',
     });
   });
@@ -2397,7 +2515,7 @@ describe('analyze run journal', () => {
       'runs',
       'LATEST_ATTEMPT.json',
     ), 'utf8'))).toEqual({
-      schemaVersion: 6,
+      schemaVersion: 7,
       runId: second.runId,
     });
 
@@ -2437,6 +2555,7 @@ describe('analyze run journal', () => {
     await dispatchAnalyzeRun(repoPath, begin);
     const sealed = await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: begin.runId,
       sealedAt: '2026-07-19T09:20:01.000Z',
       work: [{ workId: 'analyze:v1:database', inputFingerprint: `sha256:${'3'.repeat(64)}` }],
@@ -2459,6 +2578,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'empty-plan-run',
       sealedAt: '2026-07-19T09:30:01.000Z',
       work: [],
@@ -2545,12 +2665,14 @@ describe('analyze run journal', () => {
     const outcomes = await Promise.allSettled([
       dispatchAnalyzeRun(repoPath, {
         kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
         runId: 'aliased-concurrent-run',
         sealedAt: '2026-07-19T11:00:01.000Z',
         work: [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'1'.repeat(64)}` }],
       }),
       dispatchAnalyzeRun(`${repoPath}${path.sep}.`, {
         kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
         runId: 'aliased-concurrent-run',
         sealedAt: '2026-07-19T11:00:02.000Z',
         work: [{ workId: 'analyze:v1:module', inputFingerprint: `sha256:${'2'.repeat(64)}` }],
@@ -2576,6 +2698,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'corrupt-work-run',
       sealedAt: '2026-07-19T05:00:01.000Z',
       work: [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'f'.repeat(64)}` }],
@@ -2597,6 +2720,45 @@ describe('analyze run journal', () => {
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).rejects.toBeInstanceOf(
       AnalyzeRunJournalCorruptError,
     );
+  });
+
+  it('reports persisted execution intent with surrounding whitespace as journal corruption', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'corrupt-execution-whitespace-run',
+      candidateAnalysisId: 'corrupt-execution-whitespace-analysis',
+      startedAt: '2026-07-19T05:10:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'execution-whitespace-commit',
+      completedBaselineId: null,
+    });
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
+      runId: 'corrupt-execution-whitespace-run',
+      sealedAt: '2026-07-19T05:10:01.000Z',
+      work: [{
+        workId: 'analyze:v1:execution-whitespace',
+        inputFingerprint: `sha256:${'9'.repeat(64)}`,
+      }],
+    });
+    const file = path.join(
+      repoPath,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'corrupt-execution-whitespace-run.json',
+    );
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+      plan: { execution: { provider: string } };
+    };
+    stored.plan.execution.provider = ' claude-code';
+    fs.writeFileSync(file, JSON.stringify(stored));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, { runId: 'corrupt-execution-whitespace-run' }))
+      .rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
   });
 
   it('rejects a persisted blocked run whose certified plan was never sealed', async () => {
@@ -2645,6 +2807,7 @@ describe('analyze run journal', () => {
     });
     await dispatchAnalyzeRun(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'corrupt-empty-plan-run',
       sealedAt: '2026-07-19T11:30:01.000Z',
       work: [{ workId: 'analyze:v1:code', inputFingerprint: `sha256:${'4'.repeat(64)}` }],

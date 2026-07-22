@@ -45,7 +45,7 @@ import {
   type PlannedServiceViolationWork,
 } from './service-work-planner.js';
 import type { LlmWorkExecutionIntent } from './work-identity.js';
-import { fingerprint } from './work-identity.js';
+import { fingerprint, validateLlmWorkExecutionIntent } from './work-identity.js';
 
 export type AnalyzeLlmWorkFamily = 'code' | 'database' | 'service' | 'module';
 export type AnalyzeLlmWorkMode = 'normal' | 'lifecycle';
@@ -612,6 +612,12 @@ export function certifyAnalyzeLlmRun(
     if (
       currentExecution.provider !== execution.provider
       || currentExecution.requestedModel !== execution.requestedModel
+    ) {
+      return incompatibleInspection('checkpoint-execution-changed');
+    }
+    if (
+      candidate.plan.execution === null
+      || !isDeepStrictEqual(candidate.plan.execution, execution)
     ) {
       return incompatibleInspection('checkpoint-execution-changed');
     }
@@ -1262,23 +1268,14 @@ function validateAggregateDomain(
 }
 
 function validateExecution(execution: Readonly<LlmWorkExecutionIntent>): Readonly<LlmWorkExecutionIntent> {
-  if (
-    typeof execution.provider !== 'string' ||
-    execution.provider.length === 0 ||
-    execution.provider === 'transport:unverified' ||
-    (execution.requestedModel !== null && (
-      typeof execution.requestedModel !== 'string' || execution.requestedModel.length === 0
-    ))
-  ) {
+  try {
+    return validateLlmWorkExecutionIntent(execution);
+  } catch {
     throw new AnalyzeLlmPlanError(
       'provider-not-certifiable',
       'Analyze LLM provider/model intent is not certifiable',
     );
   }
-  return Object.freeze({
-    provider: execution.provider,
-    requestedModel: execution.requestedModel,
-  });
 }
 
 function validateRunId(runId: string): string {

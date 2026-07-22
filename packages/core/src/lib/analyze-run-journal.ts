@@ -38,6 +38,7 @@ import {
 } from './analyze-run-work-checkpoint-certification.js';
 import { installAnalyzeRunResumeCandidateReader } from './analyze-run-resume-candidate.js';
 import type { AnalyzeLlmExecutionUsage } from '../services/llm/analyze-llm-execution-evidence.js';
+import { validateLlmWorkExecutionIntent } from '../services/llm/work-identity.js';
 import {
   inspectAnalyzeRunResumeActivationCertification,
   type AnalyzeRunResumeActivationCertification,
@@ -45,7 +46,8 @@ import {
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 6 as const;
+const SCHEMA_VERSION = 7 as const;
+const REQUESTED_MODEL_PIN_SCHEMA_VERSION = 6 as const;
 const RESUME_ADMISSION_SCHEMA_VERSION = 5 as const;
 const EXECUTION_ATTEMPT_SCHEMA_VERSION = 4 as const;
 const CHECKPOINT_SCHEMA_VERSION = 3 as const;
@@ -56,12 +58,13 @@ const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
 
 function isSupportedSchemaVersion(
   value: unknown,
-): value is 1 | 2 | 3 | 4 | 5 | 6 {
+): value is 1 | 2 | 3 | 4 | 5 | 6 | 7 {
   return value === LEGACY_SCHEMA_VERSION
     || value === PREVIOUS_SCHEMA_VERSION
     || value === CHECKPOINT_SCHEMA_VERSION
     || value === EXECUTION_ATTEMPT_SCHEMA_VERSION
     || value === RESUME_ADMISSION_SCHEMA_VERSION
+    || value === REQUESTED_MODEL_PIN_SCHEMA_VERSION
     || value === SCHEMA_VERSION;
 }
 
@@ -82,10 +85,16 @@ export interface SealAnalyzeRunPlanCommand {
   kind: 'seal-plan';
   runId: string;
   sealedAt: string;
+  execution: AnalyzeRunExecutionIntent;
   work: Array<{
     workId: string;
     inputFingerprint: string;
   }>;
+}
+
+export interface AnalyzeRunExecutionIntent {
+  provider: string;
+  requestedModel: string | null;
 }
 
 declare const analyzeRunPlanActivationBrand: unique symbol;
@@ -116,6 +125,7 @@ const analyzeRunPlanActivations = new WeakMap<object, {
   runId: string;
   revision: number;
   workKey: string;
+  execution: AnalyzeRunExecutionIntent;
   cacheKey: string;
   claimed: boolean;
 }>();
@@ -129,6 +139,7 @@ const analyzeRunCheckpointWriters = new WeakMap<object, {
   repoKey: string;
   runId: string;
   workKey: string;
+  execution: AnalyzeRunExecutionIntent;
   sealedAt: string;
   active: boolean;
 }>();
@@ -139,6 +150,7 @@ const analyzeRunResumePlanActivations = new WeakMap<object, {
   runId: string;
   revision: number;
   workKey: string;
+  execution: AnalyzeRunExecutionIntent;
   pendingWorkIds: readonly string[];
   reusedWorkIds: readonly string[];
   executionPin: AnalyzeRunResumeExecutionPin;
@@ -367,7 +379,12 @@ export interface StoredAnalyzeRun {
   finalizationIntent: StoredAnalyzeRunFinalizationIntent | null;
   plan:
     | { state: 'unsealed' }
-    | { state: 'sealed'; sealedAt: string; work: StoredAnalyzeRunWork[] };
+    | {
+        state: 'sealed';
+        sealedAt: string;
+        execution: AnalyzeRunExecutionIntent | null;
+        work: StoredAnalyzeRunWork[];
+      };
 }
 
 export type NewStoredAnalyzeRun = Omit<StoredAnalyzeRun, 'attemptSequence'>;
@@ -384,6 +401,7 @@ interface ParsedLatestAttemptPointer {
     | typeof CHECKPOINT_SCHEMA_VERSION
     | typeof EXECUTION_ATTEMPT_SCHEMA_VERSION
     | typeof RESUME_ADMISSION_SCHEMA_VERSION
+    | typeof REQUESTED_MODEL_PIN_SCHEMA_VERSION
     | typeof SCHEMA_VERSION;
   runId: string;
 }
@@ -485,7 +503,7 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
           0,
         ) + 1,
       };
-      atomicWriteJson(file, stored);
+      atomicWriteJson(file, serializeStoredRun(stored));
       writeLatestPointer(canonicalPath, stored.runId);
       return stored;
     });
@@ -542,7 +560,7 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
       if (current.revision !== expectedRevision) {
         throw new AnalyzeRunRevisionConflictError(runId, expectedRevision, current.revision);
       }
-      atomicWriteJson(runPath(canonicalPath, runId), next);
+      atomicWriteJson(runPath(canonicalPath, runId), serializeStoredRun(next));
     });
   }
 
@@ -570,7 +588,7 @@ class FileAnalyzeRunStorage implements AnalyzeRunStorage {
       ) {
         throw new AnalyzeRunLatestAttemptConflictError(runId);
       }
-      atomicWriteJson(runPath(canonicalPath, runId), next);
+      atomicWriteJson(runPath(canonicalPath, runId), serializeStoredRun(next));
     });
   }
 
@@ -617,6 +635,9 @@ installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
     ? 'unsealed' as const
     : Object.freeze({
         sealedAt: current.plan.sealedAt,
+        execution: current.plan.execution === null
+          ? null
+          : Object.freeze({ ...current.plan.execution }),
         work: Object.freeze(current.plan.work.map((item) => Object.freeze(
           item.state === 'succeeded-checkpointed'
             ? {
@@ -864,13 +885,17 @@ export async function sealAnalyzeRunPlan(
   const durableRepoKey = activationScopeKey(repoKey, storage);
   const runId = validateRunId(command.runId);
   const expectedWork = normalizeSealPlanWork(command, runId);
+  const expectedExecution = normalizeSealPlanExecution(command.execution);
   let stored = await storage.read(durableRepoKey, runId);
   assertAnalyzeRunStorage(storage);
   if (
     stored?.status.state === 'running' &&
     stored.plan.state === 'sealed'
   ) {
-    if (activationWorkKey(stored.plan.work) !== activationWorkKey(expectedWork)) {
+    if (
+      activationWorkKey(stored.plan.work) !== activationWorkKey(expectedWork)
+      || !isDeepStrictEqual(stored.plan.execution, expectedExecution)
+    ) {
       throw new InvalidAnalyzeRunTransitionError(
         `Analyze run ${runId} already has a different sealed manifest`,
       );
@@ -889,18 +914,28 @@ export async function sealAnalyzeRunPlan(
   if (
     !stored ||
     stored.status.state !== 'running' ||
-    stored.plan.state !== 'sealed'
+    stored.plan.state !== 'sealed' ||
+    stored.revision !== 1 ||
+    activationWorkKey(stored.plan.work) !== activationWorkKey(expectedWork) ||
+    !isDeepStrictEqual(stored.plan.execution, expectedExecution)
   ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${command.runId} sealed plan changed during activation`,
+    );
+  }
+  if (stored.plan.execution === null) {
     throw new AnalyzeRunJournalCorruptError(
-      `Analyze run ${command.runId} was not sealed and running after plan activation`,
+      `Analyze run ${command.runId} has no bound sealed execution intent`,
     );
   }
   const workKey = activationWorkKey(stored.plan.work);
+  const execution = Object.freeze({ ...stored.plan.execution });
   const cacheKey = JSON.stringify([
     durableRepoKey,
     stored.runId,
     stored.revision,
     workKey,
+    execution,
   ]);
   let receipts = analyzeRunPlanActivationReceipts.get(storage);
   if (!receipts) {
@@ -918,6 +953,7 @@ export async function sealAnalyzeRunPlan(
     runId: stored.runId,
     revision: stored.revision,
     workKey,
+    execution,
     cacheKey,
     claimed: false,
   });
@@ -982,6 +1018,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
     stored?.status.state === 'running' &&
     stored.plan.state === 'sealed' &&
     stored.revision === activation.revision &&
+    isDeepStrictEqual(stored.plan.execution, activation.execution) &&
     activation.workKey === activationWorkKey(stored.plan.work)
   );
   if (!stillExecutable || !stored || stored.plan.state !== 'sealed') return { admitted: false };
@@ -995,6 +1032,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
     repoKey: string;
     runId: string;
     workKey: string;
+    execution: AnalyzeRunExecutionIntent;
     sealedAt: string;
     active: boolean;
   } | undefined;
@@ -1010,6 +1048,20 @@ export async function admitAnalyzeRunPlanExecution<T>(
       admitted,
     );
     assertAnalyzeRunStorage(storage);
+    const durablyAdmitted = await storage.read(activation.repoKey, activation.runId);
+    assertAnalyzeRunStorage(storage);
+    if (
+      !durablyAdmitted
+      || durablyAdmitted.status.state !== 'running'
+      || durablyAdmitted.plan.state !== 'sealed'
+      || durablyAdmitted.revision !== admitted.revision
+      || !isDeepStrictEqual(durablyAdmitted.plan.execution, activation.execution)
+      || activation.workKey !== activationWorkKey(durablyAdmitted.plan.work)
+    ) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${activation.runId} sealed execution changed during provider admission`,
+      );
+    }
     validate();
     const checkpointWriter = Object.freeze({}) as AnalyzeRunCheckpointWriter;
     checkpointBinding = {
@@ -1017,7 +1069,8 @@ export async function admitAnalyzeRunPlanExecution<T>(
       repoKey: activation.repoKey,
       runId: activation.runId,
       workKey: activation.workKey,
-      sealedAt: stored.plan.sealedAt,
+      execution: activation.execution,
+      sealedAt: durablyAdmitted.plan.sealedAt,
       active: true,
     };
     analyzeRunCheckpointWriters.set(checkpointWriter, checkpointBinding);
@@ -1032,6 +1085,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
         !completed
         || completed.status.state !== 'running'
         || completed.plan.state !== 'sealed'
+        || !isDeepStrictEqual(completed.plan.execution, activation.execution)
         || completed.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
         || activation.workKey !== activationWorkKey(completed.plan.work)
       ) {
@@ -1045,6 +1099,7 @@ export async function admitAnalyzeRunPlanExecution<T>(
         runId: activation.runId,
         revision: completed.revision,
         workKey: activation.workKey,
+        execution: activation.execution,
       });
       return Object.freeze({ result, certification });
     }, (error) => {
@@ -1158,13 +1213,7 @@ export async function activateAnalyzeRunResume(
       `Analyze run ${runId} resume work partition changed before activation`,
     );
   }
-  const executionPinBase = {
-    provider: requireNonEmpty(command.executionPin.provider, 'executionPin.provider'),
-    requestedModel: validateNullableString(
-      command.executionPin.requestedModel,
-      'executionPin.requestedModel',
-    ),
-  };
+  const executionPinBase = normalizeExecutionIntent(command.executionPin);
   const executionPin: AnalyzeRunResumeExecutionPin = command.executionPin.modelSelection === 'requested'
     && command.executionPin.resolvedModel === null
     ? { ...executionPinBase, modelSelection: 'requested', resolvedModel: null }
@@ -1183,12 +1232,18 @@ export async function activateAnalyzeRunResume(
   if (
     (executionPin.modelSelection === 'resolved'
       && executionPin.resolvedModel.trim() !== executionPin.resolvedModel)
-    || executionPin.provider.trim() !== executionPin.provider
-    || (executionPin.requestedModel !== null
-      && executionPin.requestedModel.trim() !== executionPin.requestedModel)
   ) {
     throw new InvalidAnalyzeRunTransitionError('Resume execution pin contains surrounding whitespace');
   }
+  if (
+    current.plan.execution === null
+    || !isDeepStrictEqual(current.plan.execution, executionPinBase)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} sealed execution changed before resume activation`,
+    );
+  }
+  const sealedExecution = Object.freeze({ ...current.plan.execution });
   if (
     recoveringDurableAttempt
     && !isDeepStrictEqual(current.executionAttempt.resume?.executionPin, executionPin)
@@ -1289,6 +1344,13 @@ export async function activateAnalyzeRunResume(
     );
   }
   assertAnalyzeRunStorage(storage);
+  const activatedStored = await storage.read(durableRepoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!activatedStored || !isDeepStrictEqual(activatedStored, next)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} durable state changed during resume activation`,
+    );
+  }
   const activation = Object.freeze({}) as AnalyzeRunResumePlanActivation;
   analyzeRunResumePlanActivations.set(activation, {
     storage,
@@ -1296,6 +1358,7 @@ export async function activateAnalyzeRunResume(
     runId,
     revision: next.revision,
     workKey: activationWorkKey(current.plan.work),
+    execution: sealedExecution,
     pendingWorkIds: Object.freeze([...pendingWorkIds]),
     reusedWorkIds: Object.freeze([...reusedWorkIds]),
     executionPin,
@@ -1353,6 +1416,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
     && stored.attemptSequence === activation.attemptSequence
     && stored.executionAttempt.resume?.admission === 'activated'
     && isDeepStrictEqual(stored.executionAttempt.resume.executionPin, activation.executionPin)
+    && isDeepStrictEqual(stored.plan.execution, activation.execution)
     && activation.workKey === activationWorkKey(stored.plan.work)
     && isDeepStrictEqual([...activation.pendingWorkIds].sort(), [...durablePending].sort())
     && isDeepStrictEqual([...activation.reusedWorkIds].sort(), [...durableReused].sort());
@@ -1363,6 +1427,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
     && stored.attemptSequence === activation.attemptSequence
     && stored.executionAttempt.resume?.admission === 'executing'
     && isDeepStrictEqual(stored.executionAttempt.resume.executionPin, activation.executionPin)
+    && isDeepStrictEqual(stored.plan.execution, activation.execution)
     && activation.workKey === activationWorkKey(stored.plan.work)
     && durablePending.length === 0
     && activation.pendingWorkIds.length === 0
@@ -1404,6 +1469,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
     repoKey: string;
     runId: string;
     workKey: string;
+    execution: AnalyzeRunExecutionIntent;
     sealedAt: string;
     active: boolean;
   } | undefined;
@@ -1419,6 +1485,13 @@ export async function admitAnalyzeRunResumeExecution<T>(
       );
       assertAnalyzeRunStorage(storage);
     }
+    const durablyExecuting = await storage.read(activation.repoKey, activation.runId);
+    assertAnalyzeRunStorage(storage);
+    if (!durablyExecuting || !isDeepStrictEqual(durablyExecuting, executing)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${activation.runId} sealed execution changed during resume admission`,
+      );
+    }
     validate();
     const checkpointWriter = Object.freeze({}) as AnalyzeRunCheckpointWriter;
     checkpointBinding = {
@@ -1426,7 +1499,10 @@ export async function admitAnalyzeRunResumeExecution<T>(
       repoKey: activation.repoKey,
       runId: activation.runId,
       workKey: activation.workKey,
-      sealedAt: stored.plan.sealedAt,
+      execution: activation.execution,
+      sealedAt: durablyExecuting.plan.state === 'sealed'
+        ? durablyExecuting.plan.sealedAt
+        : stored.plan.sealedAt,
       active: true,
     };
     analyzeRunCheckpointWriters.set(checkpointWriter, checkpointBinding);
@@ -1440,6 +1516,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
         !completed
         || completed.status.state !== 'running'
         || completed.plan.state !== 'sealed'
+        || !isDeepStrictEqual(completed.plan.execution, activation.execution)
         || completed.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
         || activation.workKey !== activationWorkKey(completed.plan.work)
       ) {
@@ -1453,6 +1530,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
         runId: activation.runId,
         revision: completed.revision,
         workKey: activation.workKey,
+        execution: activation.execution,
       });
       return Object.freeze({
         result,
@@ -1585,6 +1663,11 @@ export async function checkpointAnalyzeRunWork(
     if (binding.workKey !== activationWorkKey(current.plan.work)) {
       throw new InvalidAnalyzeRunTransitionError(
         `Analyze run ${runId}'s sealed plan changed after checkpoint admission`,
+      );
+    }
+    if (!isDeepStrictEqual(binding.execution, current.plan.execution)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId}'s sealed execution changed after checkpoint admission`,
       );
     }
     if (Date.parse(checkpoint.checkpointedAt) < Date.parse(current.plan.sealedAt)) {
@@ -1732,6 +1815,7 @@ export async function beginFinalizeAnalyzeRun(
     current.revision === certified.revision + 1 &&
     current.status.finalizingAt === finalizingAt &&
     certified.workKey === activationWorkKey(current.plan.work) &&
+    isDeepStrictEqual(certified.execution, current.plan.execution) &&
     current.plan.work.every((item) => item.state !== 'pending')
   ) {
     certified.claimed = true;
@@ -1746,6 +1830,7 @@ export async function beginFinalizeAnalyzeRun(
     certified.claimed ||
     certified.revision !== current.revision ||
     certified.workKey !== activationWorkKey(current.plan.work) ||
+    !isDeepStrictEqual(certified.execution, current.plan.execution) ||
     current.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
   ) {
     throw new InvalidAnalyzeRunTransitionError(
@@ -1772,7 +1857,14 @@ export async function beginFinalizeAnalyzeRun(
   try {
     await storage.compareAndSwap(repoKey, runId, current.revision, next);
     assertAnalyzeRunStorage(storage);
-    return toView(next);
+    const durablyFinalizing = await storage.read(repoKey, runId);
+    assertAnalyzeRunStorage(storage);
+    if (!durablyFinalizing || !isDeepStrictEqual(durablyFinalizing, next)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} sealed execution changed during finalization`,
+      );
+    }
+    return toView(durablyFinalizing);
   } catch (error) {
     certified.claimed = false;
     throw error;
@@ -1987,6 +2079,7 @@ async function sealPlan(
   }
 
   const work = normalizeSealPlanWork(command, runId);
+  const execution = normalizeSealPlanExecution(command.execution);
 
   const sealedAt = validateTimestamp(command.sealedAt, 'sealedAt');
   if (Date.parse(sealedAt) < Date.parse(current.startedAt)) {
@@ -2001,12 +2094,25 @@ async function sealPlan(
     plan: {
       state: 'sealed',
       sealedAt,
+      execution,
       work,
     },
   };
   await storage.compareAndSwap(repoKey, runId, current.revision, next);
   assertAnalyzeRunStorage(storage);
   return toView(next);
+}
+
+function normalizeSealPlanExecution(execution: unknown): AnalyzeRunExecutionIntent {
+  return normalizeExecutionIntent(execution);
+}
+
+function normalizeExecutionIntent(execution: unknown): AnalyzeRunExecutionIntent {
+  try {
+    return { ...validateLlmWorkExecutionIntent(execution) };
+  } catch {
+    throw new InvalidAnalyzeRunTransitionError('Analyze run has an invalid LLM execution intent');
+  }
 }
 
 function normalizeSealPlanWork(
@@ -2220,6 +2326,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
       value.schemaVersion === CHECKPOINT_SCHEMA_VERSION
       || value.schemaVersion === EXECUTION_ATTEMPT_SCHEMA_VERSION
       || value.schemaVersion === RESUME_ADMISSION_SCHEMA_VERSION
+      || value.schemaVersion === REQUESTED_MODEL_PIN_SCHEMA_VERSION
       || value.schemaVersion === SCHEMA_VERSION
     )
     && !Object.hasOwn(value, 'finalizationIntent')
@@ -2237,7 +2344,10 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
       })()
     : parseStoredFinalizationIntent(value.finalizationIntent, file);
   const startedAt = validateTimestamp(value.startedAt, 'startedAt');
-  const executionAttempt = value.schemaVersion === SCHEMA_VERSION
+  const executionAttempt = (
+    value.schemaVersion === SCHEMA_VERSION
+    || value.schemaVersion === REQUESTED_MODEL_PIN_SCHEMA_VERSION
+  )
     ? parseStoredExecutionAttempt(value.executionAttempt, file)
     : value.schemaVersion === RESUME_ADMISSION_SCHEMA_VERSION
       ? parseStoredSchemaV5ExecutionAttempt(value.executionAttempt, file)
@@ -2828,6 +2938,7 @@ function parseStoredPlan(
       if (
         schemaVersion !== CHECKPOINT_SCHEMA_VERSION
         && schemaVersion !== RESUME_ADMISSION_SCHEMA_VERSION
+        && schemaVersion !== REQUESTED_MODEL_PIN_SCHEMA_VERSION
         && schemaVersion !== SCHEMA_VERSION
       ) {
         throw new AnalyzeRunJournalCorruptError(
@@ -2847,7 +2958,49 @@ function parseStoredPlan(
   return {
     state: 'sealed',
     sealedAt: validateTimestamp(value.sealedAt, 'sealedAt'),
+    execution: schemaVersion === SCHEMA_VERSION
+      ? parseStoredExecutionIntentOrLegacyNull(value, file)
+      : null,
     work,
+  };
+}
+
+function parseStoredExecutionIntentOrLegacyNull(
+  plan: Record<string, unknown>,
+  file: string,
+): AnalyzeRunExecutionIntent | null {
+  if (!Object.hasOwn(plan, 'execution')) {
+    throw new AnalyzeRunJournalCorruptError(`Missing analyze-run execution intent: ${file}`);
+  }
+  if (
+    isRecord(plan.execution)
+    && plan.execution.state === 'legacy-unbound'
+    && Object.keys(plan.execution).length === 1
+  ) {
+    return null;
+  }
+  return parseStoredExecutionIntent(plan.execution, file);
+}
+
+function parseStoredExecutionIntent(
+  value: unknown,
+  file: string,
+): AnalyzeRunExecutionIntent {
+  try {
+    return { ...validateLlmWorkExecutionIntent(value) };
+  } catch {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze-run execution intent: ${file}`);
+  }
+}
+
+function serializeStoredRun(run: StoredAnalyzeRun): StoredAnalyzeRun | Record<string, unknown> {
+  if (run.plan.state !== 'sealed' || run.plan.execution !== null) return run;
+  return {
+    ...run,
+    plan: {
+      ...run.plan,
+      execution: { state: 'legacy-unbound' },
+    },
   };
 }
 

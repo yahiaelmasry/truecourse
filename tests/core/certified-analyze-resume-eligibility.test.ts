@@ -13,11 +13,14 @@ import {
   writeLatest,
 } from '../../packages/core/src/lib/analysis-store.js';
 import {
+  type AnalyzeRunStorage,
+  type StoredAnalyzeRun,
   admitAnalyzeRunResumeExecution,
   dispatchAnalyzeRun,
   readAnalyzeRun,
   resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
+  setAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import {
   certifyAnalyzeLlmRun,
@@ -130,6 +133,7 @@ describe('certified analyze resume eligibility', () => {
     });
     await sealAnalyzeRunPlan(repoPath, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'sonnet' },
       runId,
       sealedAt: '2026-07-19T02:00:01.000Z',
       work: activationPlan.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -310,6 +314,114 @@ describe('certified analyze resume eligibility', () => {
     });
   });
 
+  it.each([
+    ['legacy-unbound marker', { state: 'legacy-unbound' }],
+    ['different provider', { provider: 'other-provider', requestedModel: 'sonnet' }],
+    ['different requested model', { provider: 'claude-code', requestedModel: 'opus' }],
+  ])('does not admit resumed provider work after the sealed execution changes to a %s', async (
+    _case,
+    execution,
+  ) => {
+    await createBlockedRun();
+    const { rebuilt } = rebuiltRun();
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected resume activation');
+    const stored = readStoredRun();
+    stored.plan.execution = execution;
+    writeStoredRun(stored);
+    let providerCalls = 0;
+    const pendingWorkIds = [
+      rebuilt.manifest.work.find((work) => work.family === 'database')!.workId,
+    ];
+
+    await expect(admitAnalyzeRunResumeExecution(
+      activated.activation,
+      repoPath,
+      runId,
+      rebuilt.manifest.work,
+      pendingWorkIds,
+      {
+        provider: 'claude-code',
+        requestedModel: 'sonnet',
+        modelSelection: 'resolved',
+        resolvedModel,
+      },
+      '2026-07-19T02:00:05.000Z',
+      () => undefined,
+      async () => {
+        providerCalls += 1;
+        return [];
+      },
+    )).resolves.toEqual({ admitted: false });
+    expect(providerCalls).toBe(0);
+  });
+
+  it('revalidates sealed execution after the resumed admission write', async () => {
+    let stored: StoredAnalyzeRun | null = null;
+    const storage: AnalyzeRunStorage = {
+      async createLatest(_repoKey, run) {
+        stored = { ...run, attemptSequence: 1 };
+        return stored;
+      },
+      async read(_repoKey, receivedRunId) {
+        return stored?.runId === receivedRunId ? stored : null;
+      },
+      async readLatest() { return stored; },
+      async inspectLatest() { return stored; },
+      async compareAndSwap(_repoKey, _runId, expectedRevision, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = next;
+      },
+      async compareAndSwapLatest(_repoKey, _runId, expectedRevision, _attempt, _latest, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = next.plan.state === 'sealed'
+          && next.executionAttempt.resume?.admission === 'executing'
+          ? {
+              ...next,
+              plan: {
+                ...next.plan,
+                execution: { provider: 'other-provider', requestedModel: 'sonnet' },
+              },
+            }
+          : next;
+      },
+    };
+    setAnalyzeRunStorage(storage);
+    await createBlockedRun();
+    const { rebuilt } = rebuiltRun();
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected resume activation');
+    let providerCalls = 0;
+    const pendingWorkIds = [
+      rebuilt.manifest.work.find((work) => work.family === 'database')!.workId,
+    ];
+
+    await expect(admitAnalyzeRunResumeExecution(
+      activated.activation,
+      repoPath,
+      runId,
+      rebuilt.manifest.work,
+      pendingWorkIds,
+      {
+        provider: 'claude-code',
+        requestedModel: 'sonnet',
+        modelSelection: 'resolved',
+        resolvedModel,
+      },
+      '2026-07-19T02:00:05.000Z',
+      () => undefined,
+      async () => {
+        providerCalls += 1;
+        return [];
+      },
+    )).rejects.toThrow(/sealed execution changed during resume admission/);
+    expect(providerCalls).toBe(0);
+    expect(stored).toMatchObject({
+      plan: { execution: { provider: 'other-provider' } },
+      executionAttempt: { resume: { admission: 'executing' } },
+    });
+  });
+
   it('leaves a conservative tombstone and makes zero calls when the post-CAS pin check fails', async () => {
     await createBlockedRun();
     const { rebuilt } = rebuiltRun();
@@ -468,6 +580,47 @@ describe('certified analyze resume eligibility', () => {
       '2026-07-19T02:00:05.000Z',
     )).resolves.toMatchObject({ results: expect.any(Array), usageLedger: expect.any(Array) });
     expect(recoveryCalls).toBe(0);
+  });
+
+  it.each([
+    ['provider', { provider: 'other-provider', requestedModel: 'sonnet' }],
+    ['requested model', { provider: 'claude-code', requestedModel: 'opus' }],
+  ])('rejects a changed %s before restarting a zero-checkpoint run', async (_label, execution) => {
+    await createZeroCheckpointBlockedRun();
+    let providerCalls = 0;
+    const rebuilt = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      async execute(work) {
+        providerCalls += 1;
+        return successfulOutcome(work);
+      },
+    });
+    const before = fs.readFileSync(runFile());
+
+    await expect(rebuilt.inspectResumeCompatibility(identity)).resolves.toEqual({
+      compatible: false,
+      reason: 'checkpoint-execution-changed',
+    });
+    expect(providerCalls).toBe(0);
+    expect(fs.readFileSync(runFile())).toEqual(before);
+  });
+
+  it('does not resume a legacy zero-checkpoint plan without bound execution intent', async () => {
+    await createZeroCheckpointBlockedRun();
+    const stored = readStoredRun();
+    stored.schemaVersion = 6;
+    delete stored.plan.execution;
+    writeStoredRun(stored);
+    resetAnalyzeRunStorage();
+    const { rebuilt, calls } = rebuiltRun();
+    const before = fs.readFileSync(runFile());
+
+    await expect(rebuilt.inspectResumeCompatibility(identity)).resolves.toEqual({
+      compatible: false,
+      reason: 'checkpoint-execution-changed',
+    });
+    expect(calls()).toBe(0);
+    expect(fs.readFileSync(runFile())).toEqual(before);
   });
 
   it('does not checkpoint a zero-checkpoint bootstrap result without concrete model evidence', async () => {
@@ -1144,6 +1297,7 @@ async function createBlockedArchitectureRun(analysisInputFingerprint: string): P
   });
   const activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'sonnet' },
     runId,
     sealedAt: '2026-07-19T02:00:01.000Z',
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -1178,6 +1332,7 @@ async function createZeroCheckpointBlockedRun(): Promise<void> {
   });
   const activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'sonnet' },
     runId,
     sealedAt: '2026-07-19T02:00:01.000Z',
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -1218,6 +1373,7 @@ async function createBlockedRun(
   });
   const activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'sonnet' },
     runId,
     sealedAt: '2026-07-19T02:00:01.000Z',
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({

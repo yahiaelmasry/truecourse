@@ -15,6 +15,10 @@ export interface AnalyzeRunExecutionBinding {
   readonly runId: string;
   readonly revision: number;
   readonly workKey: string;
+  readonly execution: Readonly<{
+    provider: string;
+    requestedModel: string | null;
+  }>;
   claimed: boolean;
 }
 
@@ -26,7 +30,11 @@ export function issueAnalyzeRunExecutionCertification(
   binding: Omit<AnalyzeRunExecutionBinding, 'claimed'>,
 ): AnalyzeRunExecutionCertification {
   const certification = Object.freeze({}) as AnalyzeRunExecutionCertification;
-  certifications.set(certification, { ...binding, claimed: false });
+  certifications.set(certification, {
+    ...binding,
+    execution: Object.freeze({ ...binding.execution }),
+    claimed: false,
+  });
   return certification;
 }
 

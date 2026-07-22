@@ -45,6 +45,7 @@ beforeEach(async () => {
   });
   activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'sonnet' },
     runId: 'checkpoint-run',
     sealedAt: '2026-07-19T04:00:01.000Z',
     work,
@@ -117,7 +118,7 @@ describe('durable analyze-run work checkpoints', () => {
     await expect(execution).rejects.toBe(stopAfterCheckpoint);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 6,
+      schemaVersion: 7,
       revision: 3,
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
@@ -150,6 +151,7 @@ describe('durable analyze-run work checkpoints', () => {
       revision: 3,
       state: 'running',
       plan: {
+        execution: { provider: 'claude-code', requestedModel: 'sonnet' },
         work: [
           {
             state: 'succeeded-checkpointed',
@@ -176,6 +178,117 @@ describe('durable analyze-run work checkpoints', () => {
         ],
       },
     });
+  });
+
+  it('reads a schema-v6 sealed plan as legacy execution intent without rewriting it', async () => {
+    const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
+      schemaVersion: number;
+      plan: { execution?: unknown };
+    };
+    stored.schemaVersion = 6;
+    delete stored.plan.execution;
+    fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
+    const before = fs.readFileSync(runFile());
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, { runId: 'checkpoint-run' })).resolves.toMatchObject({
+      schemaVersion: 7,
+    });
+    await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).resolves.toMatchObject({
+      plan: { execution: null },
+    });
+    expect(fs.readFileSync(runFile())).toEqual(before);
+  });
+
+  it('marks a schema-v6 sealed plan as legacy-unbound when a lifecycle write migrates it', async () => {
+    const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
+      schemaVersion: number;
+      plan: { execution?: unknown };
+    };
+    stored.schemaVersion = 6;
+    delete stored.plan.execution;
+    fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
+
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'fail',
+      runId: 'checkpoint-run',
+      failedAt: '2026-07-19T04:00:02.000Z',
+      error: { code: 'LEGACY_EXECUTION_UNBOUND', message: 'Legacy execution cannot be admitted.' },
+    });
+
+    const migrated = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
+      schemaVersion: number;
+      plan: { execution: unknown };
+    };
+    expect(migrated).toMatchObject({
+      schemaVersion: 7,
+      plan: { execution: { state: 'legacy-unbound' } },
+    });
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).resolves.toMatchObject({
+      plan: { execution: null },
+    });
+  });
+
+  it.each([
+    ['omits', undefined],
+    ['sets null for', null],
+  ])('rejects a schema-v7 sealed plan that %s its execution intent', async (_case, execution) => {
+    const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
+      plan: { execution?: unknown };
+    };
+    if (execution === undefined) delete stored.plan.execution;
+    else stored.plan.execution = execution;
+    fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).rejects.toBeInstanceOf(
+      AnalyzeRunJournalCorruptError,
+    );
+  });
+
+  it('does not let a repeated seal replace the durable provider or requested model', async () => {
+    await expect(sealAnalyzeRunPlan(repoPath, {
+      kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus' },
+      runId: 'checkpoint-run',
+      sealedAt: '2026-07-19T04:00:01.000Z',
+      work,
+    })).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).resolves.toMatchObject({
+      plan: { execution: { provider: 'claude-code', requestedModel: 'sonnet' } },
+    });
+  });
+
+  it.each([
+    ['legacy-unbound marker', { state: 'legacy-unbound' }],
+    ['different provider', { provider: 'other-provider', requestedModel: 'sonnet' }],
+    ['different requested model', { provider: 'claude-code', requestedModel: 'opus' }],
+  ])('does not admit initial provider work after the sealed execution changes to a %s', async (
+    _case,
+    execution,
+  ) => {
+    const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
+      plan: { execution: unknown };
+    };
+    stored.plan.execution = execution;
+    fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
+    let providerCalls = 0;
+
+    await expect(admitAnalyzeRunPlanExecution(
+      activation,
+      repoPath,
+      'checkpoint-run',
+      work,
+      () => undefined,
+      async () => {
+        providerCalls += 1;
+        return [];
+      },
+    )).resolves.toEqual({ admitted: false });
+    expect(providerCalls).toBe(0);
   });
 
   it('rejects forged checkpoint proof and leaves the admitted plan pending', async () => {
