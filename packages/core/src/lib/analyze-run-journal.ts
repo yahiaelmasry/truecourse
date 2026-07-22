@@ -45,7 +45,8 @@ import {
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 5 as const;
+const SCHEMA_VERSION = 6 as const;
+const RESUME_ADMISSION_SCHEMA_VERSION = 5 as const;
 const EXECUTION_ATTEMPT_SCHEMA_VERSION = 4 as const;
 const CHECKPOINT_SCHEMA_VERSION = 3 as const;
 const LEGACY_SCHEMA_VERSION = 1 as const;
@@ -55,11 +56,12 @@ const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
 
 function isSupportedSchemaVersion(
   value: unknown,
-): value is 1 | 2 | 3 | 4 | 5 {
+): value is 1 | 2 | 3 | 4 | 5 | 6 {
   return value === LEGACY_SCHEMA_VERSION
     || value === PREVIOUS_SCHEMA_VERSION
     || value === CHECKPOINT_SCHEMA_VERSION
     || value === EXECUTION_ATTEMPT_SCHEMA_VERSION
+    || value === RESUME_ADMISSION_SCHEMA_VERSION
     || value === SCHEMA_VERSION;
 }
 
@@ -232,11 +234,15 @@ export type ActivateAnalyzeRunResumeResult = Readonly<{
   activation: AnalyzeRunResumePlanActivation;
 }>;
 
-export interface AnalyzeRunResumeExecutionPin {
+interface AnalyzeRunResumeExecutionBasePin {
   provider: string;
   requestedModel: string | null;
-  resolvedModel: string;
 }
+
+export type AnalyzeRunResumeExecutionPin = AnalyzeRunResumeExecutionBasePin & (
+  | { modelSelection: 'requested'; resolvedModel: null }
+  | { modelSelection: 'resolved'; resolvedModel: string }
+);
 
 export interface AnalyzeRunExecutionAttempt {
   number: number;
@@ -377,6 +383,7 @@ interface ParsedLatestAttemptPointer {
     | typeof PREVIOUS_SCHEMA_VERSION
     | typeof CHECKPOINT_SCHEMA_VERSION
     | typeof EXECUTION_ATTEMPT_SCHEMA_VERSION
+    | typeof RESUME_ADMISSION_SCHEMA_VERSION
     | typeof SCHEMA_VERSION;
   runId: string;
 }
@@ -1151,19 +1158,31 @@ export async function activateAnalyzeRunResume(
       `Analyze run ${runId} resume work partition changed before activation`,
     );
   }
-  const executionPin: AnalyzeRunResumeExecutionPin = {
+  const executionPinBase = {
     provider: requireNonEmpty(command.executionPin.provider, 'executionPin.provider'),
     requestedModel: validateNullableString(
       command.executionPin.requestedModel,
       'executionPin.requestedModel',
     ),
-    resolvedModel: requireNonEmpty(
-      command.executionPin.resolvedModel,
-      'executionPin.resolvedModel',
-    ),
   };
+  const executionPin: AnalyzeRunResumeExecutionPin = command.executionPin.modelSelection === 'requested'
+    && command.executionPin.resolvedModel === null
+    ? { ...executionPinBase, modelSelection: 'requested', resolvedModel: null }
+    : command.executionPin.modelSelection === 'resolved'
+      ? {
+          ...executionPinBase,
+          modelSelection: 'resolved',
+          resolvedModel: requireNonEmpty(
+            command.executionPin.resolvedModel,
+            'executionPin.resolvedModel',
+          ),
+        }
+      : (() => {
+          throw new InvalidAnalyzeRunTransitionError('Invalid resume model selection');
+        })();
   if (
-    executionPin.resolvedModel.trim() !== executionPin.resolvedModel
+    (executionPin.modelSelection === 'resolved'
+      && executionPin.resolvedModel.trim() !== executionPin.resolvedModel)
     || executionPin.provider.trim() !== executionPin.provider
     || (executionPin.requestedModel !== null
       && executionPin.requestedModel.trim() !== executionPin.requestedModel)
@@ -2200,6 +2219,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     (
       value.schemaVersion === CHECKPOINT_SCHEMA_VERSION
       || value.schemaVersion === EXECUTION_ATTEMPT_SCHEMA_VERSION
+      || value.schemaVersion === RESUME_ADMISSION_SCHEMA_VERSION
       || value.schemaVersion === SCHEMA_VERSION
     )
     && !Object.hasOwn(value, 'finalizationIntent')
@@ -2219,6 +2239,8 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const startedAt = validateTimestamp(value.startedAt, 'startedAt');
   const executionAttempt = value.schemaVersion === SCHEMA_VERSION
     ? parseStoredExecutionAttempt(value.executionAttempt, file)
+    : value.schemaVersion === RESUME_ADMISSION_SCHEMA_VERSION
+      ? parseStoredSchemaV5ExecutionAttempt(value.executionAttempt, file)
     : value.schemaVersion === EXECUTION_ATTEMPT_SCHEMA_VERSION
       ? parseStoredSchemaV4ExecutionAttempt(value.executionAttempt, file)
       : { number: 1, activatedAt: startedAt, resume: null };
@@ -2608,19 +2630,30 @@ function parseStoredExecutionAttempt(
     value.resume.resumedFrom.blockedAt,
     'executionAttempt.resume.resumedFrom.blockedAt',
   );
-  const executionPin: AnalyzeRunResumeExecutionPin = {
+  const pinBase = {
     provider: requireNonEmpty(value.resume.executionPin.provider, 'executionPin.provider'),
     requestedModel: validateNullableString(
       value.resume.executionPin.requestedModel,
       'executionPin.requestedModel',
     ),
-    resolvedModel: requireNonEmpty(
+  };
+  let executionPin: AnalyzeRunResumeExecutionPin;
+  if (
+    value.resume.executionPin.modelSelection === 'requested'
+    && value.resume.executionPin.resolvedModel === null
+  ) {
+    executionPin = { ...pinBase, modelSelection: 'requested', resolvedModel: null };
+  } else if (value.resume.executionPin.modelSelection === 'resolved') {
+    const resolvedModel = requireNonEmpty(
       value.resume.executionPin.resolvedModel,
       'executionPin.resolvedModel',
-    ),
-  };
-  if (executionPin.resolvedModel.trim() !== executionPin.resolvedModel) {
-    throw new AnalyzeRunJournalCorruptError(`Invalid resolved resume model: ${file}`);
+    );
+    if (resolvedModel.trim() !== resolvedModel) {
+      throw new AnalyzeRunJournalCorruptError(`Invalid resolved resume model: ${file}`);
+    }
+    executionPin = { ...pinBase, modelSelection: 'resolved', resolvedModel };
+  } else {
+    throw new AnalyzeRunJournalCorruptError(`Invalid resume model selection: ${file}`);
   }
   if (
     Date.parse(blockedAt) > Date.parse(activatedAt)
@@ -2642,6 +2675,28 @@ function parseStoredExecutionAttempt(
       executionPin,
     },
   };
+}
+
+function parseStoredSchemaV5ExecutionAttempt(
+  value: unknown,
+  file: string,
+): StoredAnalyzeRun['executionAttempt'] {
+  if (!isRecord(value) || value.number === 1) {
+    return parseStoredExecutionAttempt(value, file);
+  }
+  if (!isRecord(value.resume) || !isRecord(value.resume.executionPin)) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid schema-v5 execution attempt: ${file}`);
+  }
+  return parseStoredExecutionAttempt({
+    ...value,
+    resume: {
+      ...value.resume,
+      executionPin: {
+        ...value.resume.executionPin,
+        modelSelection: 'resolved',
+      },
+    },
+  }, file);
 }
 
 function parseStoredSchemaV4ExecutionAttempt(
@@ -2770,7 +2825,11 @@ function parseStoredPlan(
       inputFingerprint: validateFingerprint(item.inputFingerprint),
     };
     if (state === 'succeeded-checkpointed') {
-      if (schemaVersion !== CHECKPOINT_SCHEMA_VERSION && schemaVersion !== SCHEMA_VERSION) {
+      if (
+        schemaVersion !== CHECKPOINT_SCHEMA_VERSION
+        && schemaVersion !== RESUME_ADMISSION_SCHEMA_VERSION
+        && schemaVersion !== SCHEMA_VERSION
+      ) {
         throw new AnalyzeRunJournalCorruptError(
           `Schema-v${schemaVersion} run contains checkpoint state: ${file}`,
         );

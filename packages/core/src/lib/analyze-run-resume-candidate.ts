@@ -50,8 +50,10 @@ export interface AnalyzeRunResumeCandidate {
       executionPin: Readonly<{
         provider: string;
         requestedModel: string | null;
-        resolvedModel: string;
-      }>;
+      } & (
+        | { modelSelection: 'requested'; resolvedModel: null }
+        | { modelSelection: 'resolved'; resolvedModel: string }
+      )>;
     }>;
   }>;
   readonly blocked: null | Readonly<{

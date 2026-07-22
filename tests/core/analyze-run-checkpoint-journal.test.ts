@@ -117,7 +117,7 @@ describe('durable analyze-run work checkpoints', () => {
     await expect(execution).rejects.toBe(stopAfterCheckpoint);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 5,
+      schemaVersion: 6,
       revision: 3,
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
