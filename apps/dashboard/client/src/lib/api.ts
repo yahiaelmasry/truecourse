@@ -11,6 +11,7 @@ import type {
   GuardScenarioInventory,
   GuardScenarioSource,
   GuardStaleness,
+  AnalyzeRunStatusResponse,
 } from '@truecourse/shared';
 import type { LlmEstimateData } from '@/hooks/useSocket';
 import { getServerUrl } from './server-url';
@@ -247,6 +248,10 @@ export type AnalysisUsageRow = {
 
 export function getAnalyses(repoId: string): Promise<AnalysisSummary[]> {
   return fetchApi<AnalysisSummary[]>(`/api/repos/${repoId}/analyses`);
+}
+
+export function getAnalyzeRunStatus(repoId: string): Promise<AnalyzeRunStatusResponse> {
+  return fetchApi<AnalyzeRunStatusResponse>(`/api/repos/${repoId}/analyses/status`);
 }
 
 export function getAnalysisUsage(repoId: string, analysisId: string): Promise<AnalysisUsageRow[]> {
@@ -1188,4 +1193,3 @@ export function deleteSpecConflictResolution(
     { method: 'DELETE', body: JSON.stringify(payload) },
   );
 }
-

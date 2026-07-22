@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import { Loader2, Trash2, Coins } from 'lucide-react';
 import type { AnalysisSummary } from '@/lib/api';
+import type { AnalyzeRunStatusResponse } from '@truecourse/shared';
 import { UsageDetailPanel } from './UsageDetailPanel';
+import { AnalysisRunStatusCard } from './AnalysisRunStatusCard';
 
 type AnalysesPanelProps = {
   analyses: AnalysisSummary[];
@@ -11,6 +13,9 @@ type AnalysesPanelProps = {
   onSelectAnalysis: (analysisId: string | null) => void;
   onDeleteAnalysis: (analysisId: string) => Promise<void>;
   repoId: string;
+  runStatus: AnalyzeRunStatusResponse | null;
+  runStatusLoading: boolean;
+  runStatusError: string | null;
 };
 
 const severityColors: Record<string, string> = {
@@ -98,6 +103,9 @@ export function AnalysesPanel({
   onSelectAnalysis,
   onDeleteAnalysis,
   repoId,
+  runStatus,
+  runStatusLoading,
+  runStatusError,
 }: AnalysesPanelProps) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [usageAnalysisId, setUsageAnalysisId] = useState<string | null>(null);
@@ -120,14 +128,6 @@ export function AnalysesPanel({
     );
   }
 
-  if (analyses.length === 0) {
-    return (
-      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-        No analyses yet. Run an analysis to see results here.
-      </div>
-    );
-  }
-
   return (
     <div className="h-full overflow-auto p-4">
       <div className="mb-4 flex items-center gap-4">
@@ -135,8 +135,37 @@ export function AnalysesPanel({
         <span className="text-sm text-muted-foreground">{analyses.length} total</span>
       </div>
 
-      <div className="rounded-lg border border-border overflow-hidden">
-        <table className="w-full text-sm">
+      {runStatusError && (
+        <div
+          className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs text-muted-foreground"
+          role="alert"
+        >
+          {runStatus
+            ? 'Unable to refresh attempted-run status; showing the last saved status.'
+            : 'Attempted-run status is unavailable. Completed analysis history remains unchanged.'}{' '}
+          {runStatusError}
+        </div>
+      )}
+
+      {runStatus ? (
+        <AnalysisRunStatusCard status={runStatus} />
+      ) : runStatusLoading ? (
+        <div
+          className="mb-4 flex h-24 items-center justify-center rounded-lg border border-border"
+          role="status"
+          aria-label="Loading attempted-run status"
+        >
+          <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+        </div>
+      ) : null}
+
+      {analyses.length === 0 ? (
+        <div className="flex h-48 items-center justify-center rounded-lg border border-border text-sm text-muted-foreground">
+          No completed analyses yet. Run an analysis to see results here.
+        </div>
+      ) : (
+        <div className="rounded-lg border border-border overflow-hidden">
+          <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-border bg-muted/50 text-left text-xs text-muted-foreground">
               <th className="px-4 py-2.5 font-medium">Date</th>
@@ -280,8 +309,9 @@ export function AnalysesPanel({
               );
             })}
           </tbody>
-        </table>
-      </div>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

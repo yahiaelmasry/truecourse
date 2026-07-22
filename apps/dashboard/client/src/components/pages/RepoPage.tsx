@@ -4,7 +4,7 @@ import { useParams, Navigate, useNavigate, useSearchParams } from 'react-router-
 import { Loader2, AlertCircle, Wifi, WifiOff, X, Workflow, Database, Check, CircleX, FlaskConical, FlaskConicalOff, PauseCircle, Network } from 'lucide-react';
 import { Header } from '@/components/layout/Header';
 import { LeftSidebar, type LeftTab } from '@/components/layout/LeftSidebar';
-import { useEdition } from '@/contexts/CapabilityContext';
+import { useEdition, useVerifiedCapability } from '@/contexts/CapabilityContext';
 import { useVisibleTabsForSection } from '@/navigation/registry';
 import { EeRepoChrome } from '@/ee/EeRepoChrome';
 import { RepoSettings } from '@/ee/RepoSettings';
@@ -78,6 +78,7 @@ import { useSocket } from '@/hooks/useSocket';
 import { useViolations } from '@/hooks/useViolations';
 import { useDiffCheck } from '@/hooks/useDiffCheck';
 import { useAnalysisList } from '@/hooks/useAnalysisList';
+import { useAnalyzeRunStatus } from '@/hooks/useAnalyzeRunStatus';
 import { useCodeViolationSummary } from '@/hooks/useCodeViolationSummary';
 import { useFlows } from '@/hooks/useFlows';
 import { Button } from '@/components/ui/button';
@@ -169,6 +170,7 @@ function RepoPageInner() {
   // Enterprise shows ONLY Code Quality on the repo page (no left rail), as a
   // curated horizontal tab bar. Analytics leads and is the default.
   const isEe = useEdition() === 'enterprise';
+  const hasVerifiedLocalFilesystem = useVerifiedCapability('local-filesystem');
   // PR view (EE): `?pr=N` re-scopes the page to a pull request — the code
   // quality view shows the gate's stored PR violation diff. Resolved from the
   // repo's gate runs (latest run per PR).
@@ -276,6 +278,12 @@ function RepoPageInner() {
   const violations = emptyViolations ? [] : rawViolations;
   const allViolations = emptyViolations ? [] : rawAllViolations;
   const { analyses, refetch: refetchAnalyses } = useAnalysisList(repoId);
+  const {
+    status: analyzeRunStatus,
+    isLoading: analyzeRunStatusLoading,
+    error: analyzeRunStatusError,
+    refetch: refetchAnalyzeRunStatus,
+  } = useAnalyzeRunStatus(repoId, hasVerifiedLocalFilesystem && leftTab === 'analyses');
   const graphAnalysisId = isDiffMode && diffResult?.diffAnalysisId
     ? diffResult.diffAnalysisId
     : selectedAnalysisId ?? undefined;
@@ -521,6 +529,7 @@ function RepoPageInner() {
       refetchAnalyses();
       refetchCodeViolationSummary();
       refetchFlows();
+      void refetchAnalyzeRunStatus();
       // Refresh repo so `lastAnalyzed` updates — this drives the transition
       // out of the welcome empty state.
       api.getRepo(repoId).then(setRepo).catch(() => {});
@@ -528,9 +537,14 @@ function RepoPageInner() {
     const unsub2 = onEvent('analysis:canceled', () => {
       setIsAnalyzing(false);
       setIsCancelling(false);
+      void refetchAnalyzeRunStatus();
     });
     return () => { unsub1(); unsub2(); };
-  }, [onEvent, refetchGraph, refetchAnalyses, refetchCodeViolationSummary, refetchFlows, repoId]);
+  }, [onEvent, refetchGraph, refetchAnalyses, refetchCodeViolationSummary, refetchFlows, refetchAnalyzeRunStatus, repoId]);
+
+  useEffect(() => {
+    if (analysisProgress?.step === 'error') void refetchAnalyzeRunStatus();
+  }, [analysisProgress?.step, refetchAnalyzeRunStatus]);
 
   // Refresh guard/spec staleness after a Scan / guard-generate / guard-run. The
   // server emits `spec:complete` with a kind — the corpus Scan updates its view
@@ -1464,6 +1478,9 @@ function RepoPageInner() {
                 if (isDiffMode) loadDiffCheck();
               }}
               repoId={repoId}
+              runStatus={analyzeRunStatus}
+              runStatusLoading={analyzeRunStatusLoading}
+              runStatusError={analyzeRunStatusError}
             />
           ) : leftTab === 'home' || leftTab === 'analytics' || leftTab === 'violations' ? (
             repo == null ? (

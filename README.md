@@ -409,7 +409,7 @@ truecourse dashboard logs             # Tail dashboard logs (service mode only)
 truecourse dashboard uninstall        # Remove the background service
 ```
 
-- **Code Analysis** — architecture graph, violations list, severity/category analytics, code hotspots, trend over time; toggle rules and silence noisy ones inline.
+- **Code Analysis** — architecture graph, violations list, severity/category analytics, code hotspots, trend over time; toggle rules and silence noisy ones inline. The local Analyses tab shows the latest attempted run separately from the active completed findings baseline, without changing either one.
 - **Guard** — Coverage shows each spec doc's sections with their scenario coverage and walks you through resolving spec conflicts (pick / write custom / mark superseded / include skipped doc); Scenarios lists the committed scenario corpus with the recipe and last-generate summary; Runs shows each run's drifts with per-failure evidence.
 
 ---

@@ -118,6 +118,16 @@ export function useCapability(cap: Capability): boolean {
   return capabilities.has(cap);
 }
 
+/**
+ * Use for calls to capability-restricted server endpoints. Unlike the visual
+ * capability gate, this stays false until discovery succeeds, so community
+ * defaults cannot authorize a hosted request while discovery is pending or failed.
+ */
+export function useVerifiedCapability(cap: Capability): boolean {
+  const { capabilities, isLoading, error } = useContext(CapabilityContext);
+  return !isLoading && error === null && capabilities.has(cap);
+}
+
 /** Full context value — needed only by code that has to branch on edition or
  *  display a loading skeleton. Prefer `useCapability` / `useEdition`. */
 export function useCapabilityContext(): CapabilityContextValue {
