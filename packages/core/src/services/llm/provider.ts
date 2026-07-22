@@ -348,7 +348,7 @@ export type CertifiedAnalyzeLlmProvider = LLMProvider & AnalyzeLlmExecutionAdapt
  */
 export function createLLMProvider(
   transport?: LlmTransport,
-  selectedModel?: string,
+  selectedModel?: string | null,
 ): CertifiedAnalyzeLlmProvider {
   return new ClaudeCodeProvider(transport ?? getDefaultTransport(), selectedModel);
 }

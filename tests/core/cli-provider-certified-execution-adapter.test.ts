@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { LlmTransport } from '../../packages/shared/src/llm/transport.js';
 import { ClaudeCodeProvider } from '../../packages/core/src/services/llm/cli-provider.js';
+import { config } from '../../packages/core/src/config/index.js';
 import {
   createLLMProvider,
   type CodeViolationContext,
@@ -165,6 +166,24 @@ function lifecycleCodeContext(): CodeViolationContext {
 }
 
 describe('CLI certified analyze execution adapter', () => {
+  it('preserves an explicit no-model execution intent for Resume reconstruction', () => {
+    const mutableConfig = config as { claudeCodeModel: string };
+    const previousModel = mutableConfig.claudeCodeModel;
+    mutableConfig.claudeCodeModel = 'ambient-model';
+    try {
+      expect(new ClaudeCodeProvider(undefined, null).execution).toEqual({
+        provider: 'claude-code',
+        requestedModel: null,
+      });
+      expect(createLLMProvider(undefined, null).execution).toEqual({
+        provider: 'claude-code',
+        requestedModel: null,
+      });
+    } finally {
+      mutableConfig.claudeCodeModel = previousModel;
+    }
+  });
+
   it('exposes a certifiable intent only for direct Claude Code execution', () => {
     expect(new ClaudeCodeProvider(undefined, 'opus[1m]').execution).toEqual({
       provider: 'claude-code',

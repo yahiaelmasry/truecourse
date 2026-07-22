@@ -1325,9 +1325,9 @@ export class ClaudeCodeProvider extends BaseCLIProvider {
    * `CLAUDE_CODE_MODEL` and then to passing no `--model` at all — letting
    * Claude Code pick, which is the behavior that predates the picker.
    */
-  private readonly selectedModel?: string;
+  private readonly selectedModel?: string | null;
 
-  constructor(transport?: LlmTransport, selectedModel?: string) {
+  constructor(transport?: LlmTransport, selectedModel?: string | null) {
     super(transport);
     this.selectedModel = selectedModel;
   }
@@ -1352,7 +1352,9 @@ export class ClaudeCodeProvider extends BaseCLIProvider {
   get modelFlag(): string[] {
     // A picked model is a deliberate in-session choice, so it outranks the
     // CLAUDE_CODE_MODEL background default.
-    const model = this.selectedModel || config.claudeCodeModel;
+    const model = this.selectedModel === null
+      ? undefined
+      : this.selectedModel || config.claudeCodeModel;
     return model ? ['--model', model] : [];
   }
 
