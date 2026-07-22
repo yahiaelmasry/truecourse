@@ -107,8 +107,14 @@ selected blocked run, atomically revalidate it, replay its checkpoints, execute
 only pending work, and promote the candidate after complete finalization. The
 read-only `truecourse analyze status` command shows the latest attempted run,
 durable progress, and advisory provider reset hint separately from the active
-completed analysis. Manual CLI and dashboard Resume actions remain later #791
-dependencies. The CLI will not silently replace incomplete paid work:
+completed analysis. The manual CLI Resume action accepts one exact latest run ID,
+revalidates every durable input before reusing saved successful checkpoints,
+executes only pending checks, and promotes the candidate only after complete
+finalization.
+It deliberately installs no graceful SIGINT cancellation handler: an abrupt
+interruption remains durably recoverable or execution-ambiguous instead of
+being mislabeled as a safe retryable failure. Dashboard Resume remains a later
+#791 dependency. The CLI will not silently replace incomplete paid work:
 resumable attempts direct the user toward recovery, execution-ambiguous
 attempts fail closed, and starting over requires exact acknowledgement with
 `--abandon-attempt <run-id>`. Dashboard enforcement follows with its status and
@@ -124,7 +130,7 @@ internal admission boundary durably records `executing` and revalidates the
 exact provider/model pin before and after that write, before allowing pending
 work to start. The certified runner can recover with zero calls after the final
 checkpoint, and a prepared finalization can be replayed without provider work;
-CLI/dashboard Resume wiring remains a later dependency. A
+dashboard Resume wiring remains a later dependency. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
 Resume accounting is derived once from the complete durable checkpoint ledger,
@@ -208,6 +214,7 @@ truecourse analyze --stash            # Pre-approve stashing pending changes (CI
 truecourse analyze --no-stash         # Analyze working tree as-is, no stash
 truecourse analyze --diff             # New/resolved violations from your uncommitted changes
 truecourse analyze status             # Show latest attempted run + active completed analysis
+truecourse analyze resume <run-id>     # Revalidate and resume one exact saved attempt
 truecourse analyze --abandon-attempt <run-id> # Explicitly start over; paid calls may repeat
 truecourse list                       # Show violations from latest analysis
 truecourse list --all                 # Show all violations (no pagination)

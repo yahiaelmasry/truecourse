@@ -4,7 +4,11 @@ import { Command } from "commander";
 import * as p from "@clack/prompts";
 import { runAdd } from "./commands/add.js";
 import { runAnalyze, runAnalyzeDiff } from "./commands/analyze.js";
-import { runAnalyzeStatus } from "./commands/analyze-runs.js";
+import { runAnalyzeResume, runAnalyzeStatus } from "./commands/analyze-runs.js";
+import {
+  AnalysisResumeUnavailableError,
+  AnalysisSessionLimitError,
+} from "@truecourse/core/commands/analyze-in-process";
 import {
   runDashboard,
   runDashboardStop,
@@ -116,6 +120,23 @@ function resolveInstallSkills(
   return undefined;
 }
 
+function explicitAnalyzeOptions(command: Command): string[] {
+  const values = command.opts();
+  const options: Array<{ key: string; flag: string }> = [
+    { key: "diff", flag: "--diff" },
+    { key: "llm", flag: values.llm === false ? "--no-llm" : "--llm" },
+    { key: "llmTransport", flag: "--llm-transport" },
+    { key: "io", flag: "--io" },
+    { key: "stash", flag: values.stash === false ? "--no-stash" : "--stash" },
+    { key: "abandonAttempt", flag: "--abandon-attempt" },
+    { key: "installSkills", flag: "--install-skills" },
+    { key: "skills", flag: "--no-skills" },
+  ];
+  return options
+    .filter(({ key }) => command.getOptionValueSource(key) === "cli")
+    .map(({ flag }) => flag);
+}
+
 const analyzeCmd = program
   .command("analyze")
   .description("Analyze the current repository")
@@ -166,6 +187,38 @@ analyzeCmd
       return;
     }
     await runAnalyzeStatus();
+  });
+
+analyzeCmd
+  .command("resume <run-id>")
+  .description("Resume one exact latest attempted run")
+  .action(async (runId: string, _options, command: Command) => {
+    const parentOptions = command.parent ? explicitAnalyzeOptions(command.parent) : [];
+    if (parentOptions.length > 0) {
+      p.log.error(
+        `Resume cannot be combined with full-analysis options: ${parentOptions.join(", ")}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    p.intro("Resuming analysis");
+    try {
+      await runAnalyzeResume(runId);
+      p.outro("Analysis Resume complete");
+    } catch (error) {
+      if (error instanceof AnalysisSessionLimitError) {
+        p.log.error(
+          `${error.message} Resume paused again. Inspect truecourse analyze status and retry the exact run after the provider reset. The active completed analysis remains canonical.`,
+        );
+      } else if (error instanceof AnalysisResumeUnavailableError) {
+        p.log.error(
+          `${error.message}. No pending provider work was admitted after eligibility failed; inspect truecourse analyze status.`,
+        );
+      } else {
+        p.log.error(error instanceof Error ? error.message : String(error));
+      }
+      process.exitCode = 1;
+    }
   });
 
 program

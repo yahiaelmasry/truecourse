@@ -7,9 +7,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AnalyzeRunStatus } from '../../packages/core/src/commands/analyze-run-status.js';
 import { AnalysisStartBlockedError } from '../../packages/core/src/commands/analyze-in-process.js';
 import {
+  AnalyzeResumeCliError,
   formatAnalysisStartBlockedError,
   formatAnalyzeRunStatus,
   resolveAnalyzeStartExpectation,
+  runAnalyzeResume,
   runAnalyzeStatus,
 } from '../../tools/cli/src/commands/analyze-runs.js';
 
@@ -18,7 +20,7 @@ describe('analyze run CLI status', () => {
     expect(formatAnalyzeRunStatus(blockedStatus())).toEqual([
       'Latest run: run-interrupted · blocked · 1/2 LLM checks complete · 1 pending',
       'Provider reported reset: tomorrow 8pm (Africa/Cairo) (advisory)',
-      'Resume: structurally available after the provider reset and full revalidation; the CLI action is not available in this version',
+      'Resume: truecourse analyze resume run-interrupted after the provider reset (repository, baseline, rules, configuration, prompts/schemas, provider, and model will be revalidated)',
       'Active completed analysis: analysis-completed · 2026-07-19T09:00:00.000Z · main@abc1234',
     ]);
   });
@@ -61,6 +63,339 @@ describe('analyze run CLI status', () => {
     expect(output).toContain('--llm');
     expect(output).toContain('--abandon-attempt <run-id>');
     expect(output).toContain('status');
+    expect(output).toContain('resume');
+  });
+
+  it('registers `truecourse analyze resume <run-id>` as an explicit action', () => {
+    const output = execFileSync(
+      process.execPath,
+      [
+        '--import',
+        createRequire(import.meta.url).resolve('tsx'),
+        path.resolve('tools/cli/src/index.ts'),
+        'analyze',
+        'resume',
+        '--help',
+      ],
+      { encoding: 'utf8', timeout: 30_000 },
+    );
+
+    expect(output).toContain('Usage: truecourse analyze resume [options] <run-id>');
+    expect(output).toContain('Resume one exact latest attempted run');
+  });
+
+  it('rejects every explicit parent full-analysis option for Resume', () => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        createRequire(import.meta.url).resolve('tsx'),
+        path.resolve('tools/cli/src/index.ts'),
+        'analyze',
+        '--no-llm',
+        '--no-stash',
+        '--llm-transport',
+        'agent',
+        '--io',
+        '/tmp/resume-mailbox',
+        '--install-skills',
+        'resume',
+        'run-interrupted',
+        '--abandon-attempt',
+        'run-interrupted',
+      ],
+      { encoding: 'utf8', timeout: 30_000 },
+    );
+
+    expect(result.status).toBe(1);
+    const output = `${result.stdout}\n${result.stderr}`;
+    expect(output).toContain('Resume cannot be combined with full-analysis options');
+    expect(output).toContain('--no-llm');
+    expect(output).toContain('--no-stash');
+    expect(output).toContain('--llm-transport');
+    expect(output).toContain('--io');
+    expect(output).toContain('--install-skills');
+    expect(output).toContain('--abandon-attempt');
+  });
+
+  it('resumes one exact run without probing the provider before core revalidation', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-'));
+    const lines: string[] = [];
+    const resume = vi.fn(async () => ({
+      analysisId: 'analysis-incomplete',
+      filename: 'analysis-incomplete.json',
+      serviceCount: 1,
+      fileCount: 1,
+      architecture: 'monolith',
+      durationMs: 100,
+      violationsSummary: { total: 0, bySeverity: {} },
+    }));
+    const listenersBefore = process.listeners('SIGINT');
+
+    try {
+      await runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        writeLine: (line) => lines.push(line),
+        readStatus: async () => blockedStatus(),
+        registerProject: async () => ({ path: repoPath }) as never,
+        resume,
+      });
+
+      expect(resume).toHaveBeenCalledWith(
+        expect.objectContaining({ path: repoPath }),
+        expect.objectContaining({ runId: 'run-interrupted' }),
+      );
+      expect(resume.mock.calls[0]![1]).not.toHaveProperty('signal');
+      expect(process.listeners('SIGINT')).toEqual(listenersBefore);
+      expect(lines).toContain(
+        'Saved run contains 1 durable successful LLM checkpoint; 1 pending check remains. Active completed analysis analysis-completed stays canonical until Resume finishes.',
+      );
+      expect(lines).toContain(
+        'Revalidating repository, completed baseline, rules, configuration, prompts/schemas, provider, and model before pending work is admitted.',
+      );
+      expect(lines.at(-1)).toBe(
+        'Resume complete: analysis-incomplete is now the active completed analysis.',
+      );
+      expect(lines).toContain('Revalidated and reused 1 successful LLM checkpoint.');
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('does not install a graceful SIGINT handler while provider work is active', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-sigint-'));
+    const listenersBefore = new Set(process.listeners('SIGINT'));
+    let finish!: () => void;
+    const resume = vi.fn(() => new Promise<never>((resolve) => {
+      finish = () => resolve({
+        analysisId: 'analysis-incomplete',
+        filename: 'analysis-incomplete.json',
+        serviceCount: 1,
+        fileCount: 1,
+        architecture: 'monolith',
+        durationMs: 100,
+        violationsSummary: { total: 0, bySeverity: {} },
+      } as never);
+    }));
+
+    try {
+      const running = runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        writeLine: () => undefined,
+        readStatus: async () => blockedStatus(),
+        registerProject: async () => ({ path: repoPath }) as never,
+        resume,
+      });
+      await vi.waitFor(() => expect(resume).toHaveBeenCalledOnce());
+
+      expect(process.listeners('SIGINT').filter((listener) => !listenersBefore.has(listener)))
+        .toEqual([]);
+      finish();
+      await running;
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a fully checkpointed run through the same core Resume path', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-finalize-'));
+    const status = blockedStatus();
+    status.latestAttempt!.state = 'finalizing';
+    status.latestAttempt!.blocked = null;
+    status.latestAttempt!.counts = {
+      total: 2,
+      pending: 0,
+      running: 0,
+      succeeded: 2,
+      failed: 0,
+    };
+    status.latestAttempt!.finalization = {
+      finalizingAt: '2026-07-19T10:00:03.000Z',
+      persistence: 'prepared',
+      preparedAt: '2026-07-19T10:00:04.000Z',
+    };
+    status.activeCompletedAnalysis!.analysisId = status.latestAttempt!.candidateAnalysisId;
+    const resume = vi.fn(async () => ({
+      analysisId: 'analysis-incomplete',
+      filename: 'analysis-incomplete.json',
+      serviceCount: 1,
+      fileCount: 1,
+      architecture: 'monolith',
+      durationMs: 100,
+      violationsSummary: { total: 0, bySeverity: {} },
+    }));
+    const lines: string[] = [];
+
+    try {
+      await runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        writeLine: (line) => lines.push(line),
+        readStatus: async () => status,
+        registerProject: async () => ({ path: repoPath }) as never,
+        resume,
+      });
+
+      expect(resume).toHaveBeenCalledOnce();
+      expect(lines).toContain(
+        'No provider calls are pending; recovering durable execution/finalization state.',
+      );
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a non-latest selected run before registration or execution', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-nonlatest-'));
+    const registerProject = vi.fn();
+    const resume = vi.fn();
+
+    try {
+      await expect(runAnalyzeResume('older-run', {
+        cwd: repoPath,
+        readStatus: async () => blockedStatus(),
+        registerProject,
+        resume,
+      })).rejects.toMatchObject({
+        name: 'AnalyzeResumeCliError',
+        reason: 'not-latest-attempt',
+      });
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects unavailable and superseded runs before provider work', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-unavailable-'));
+    const ambiguous = blockedStatus();
+    ambiguous.latestAttempt!.state = 'running';
+    ambiguous.latestAttempt!.blocked = null;
+    ambiguous.latestAttempt!.resume = {
+      available: false,
+      scope: 'structural',
+      reason: 'resume-execution-ambiguous',
+    };
+    const superseded = blockedStatus();
+    superseded.activeCompletedAnalysis!.analysisId = 'newer-analysis';
+    const registerProject = vi.fn();
+    const resume = vi.fn();
+
+    try {
+      await expect(runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        readStatus: async () => ambiguous,
+        registerProject,
+        resume,
+      })).rejects.toMatchObject({ reason: 'resume-execution-ambiguous' });
+      await expect(runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        readStatus: async () => superseded,
+        registerProject,
+        resume,
+      })).rejects.toMatchObject({ reason: 'completed-analysis-not-active' });
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps raw Resume failures in the local log and returns safe guidance', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-error-'));
+    const raw = 'secret provider stderr /private/repo/token-123';
+
+    try {
+      const error = await runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        writeLine: () => undefined,
+        readStatus: async () => blockedStatus(),
+        registerProject: async () => ({ path: repoPath }) as never,
+        resume: async () => { throw new Error(raw); },
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AnalyzeResumeCliError);
+      expect(error).toMatchObject({ reason: 'execution-failed' });
+      expect((error as Error).message).not.toContain(raw);
+      expect((error as Error).message).toMatch(/local analyze log/i);
+      expect(fs.readFileSync(path.join(repoPath, '.truecourse', 'logs', 'analyze.log'), 'utf8'))
+        .toContain(raw);
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('logs a raw status-read failure locally and returns safe guidance', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-status-error-'));
+    const raw = 'corrupt journal /private/repo/secret-run.json';
+    const registerProject = vi.fn();
+
+    try {
+      const error = await runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        writeLine: () => undefined,
+        readStatus: async () => { throw new Error(raw); },
+        registerProject,
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        name: 'AnalyzeResumeCliError',
+        reason: 'execution-failed',
+      });
+      expect((error as Error).message).not.toContain(raw);
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(repoPath, '.truecourse', 'logs', 'analyze.log'), 'utf8'))
+        .toContain(raw);
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('logs a raw registration failure locally before returning safe guidance', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-register-error-'));
+    const raw = 'registration failed with /private/repo/secret-config.json';
+    const resume = vi.fn();
+
+    try {
+      const error = await runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        writeLine: () => undefined,
+        readStatus: async () => blockedStatus(),
+        registerProject: async () => { throw new Error(raw); },
+        resume,
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        name: 'AnalyzeResumeCliError',
+        reason: 'execution-failed',
+      });
+      expect((error as Error).message).not.toContain(raw);
+      expect(resume).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(repoPath, '.truecourse', 'logs', 'analyze.log'), 'utf8'))
+        .toContain(raw);
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('reports accurately when local diagnostics cannot be configured', async () => {
+    const raw = 'diagnostics path contains secret-token';
+    const readStatus = vi.fn();
+
+    const error = await runAnalyzeResume('run-interrupted', {
+      cwd: '/repo',
+      readStatus,
+      configureDiagnostics: () => { throw new Error(raw); },
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: 'AnalyzeResumeCliError',
+      reason: 'diagnostics-unavailable',
+    });
+    expect((error as Error).message).not.toContain(raw);
+    expect((error as Error).message).toMatch(/could not be configured/i);
+    expect((error as Error).message).not.toMatch(/check the local analyze log/i);
+    expect(readStatus).not.toHaveBeenCalled();
   });
 
   it('rejects abandonment input for a diff analysis', () => {
@@ -164,7 +499,7 @@ describe('analyze run CLI status', () => {
       new AnalysisStartBlockedError('resume-required', 'run-interrupted'),
     );
 
-    expect(message).toContain('CLI Resume is not available in this version');
+    expect(message).toContain('truecourse analyze resume run-interrupted');
     expect(message).toContain('--abandon-attempt run-interrupted');
     expect(message).toMatch(/paid LLM calls may repeat/i);
   });

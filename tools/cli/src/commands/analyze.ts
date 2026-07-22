@@ -410,7 +410,7 @@ export async function runAnalyze(options: AnalyzeOptions = {}): Promise<void> {
     } else if (err instanceof AnalysisSessionLimitError) {
       const run = err.runId ? ` Saved run: ${err.runId}.` : '';
       p.log.error(
-        `${err.message} Inspect attempted-run progress with truecourse analyze status.${run} The CLI Resume action is not available in this version; a later full analysis will not silently replace eligible saved work.`,
+        `${err.message} Inspect attempted-run progress with truecourse analyze status.${run} After the provider reset, Resume the exact saved run with truecourse analyze resume <run-id>; a later full analysis will not silently replace eligible saved work.`,
       );
     } else {
       p.log.error(err instanceof Error ? err.message : String(err));

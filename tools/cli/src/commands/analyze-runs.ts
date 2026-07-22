@@ -1,13 +1,20 @@
+import path from 'node:path';
 import {
   readAnalyzeRunStatus,
   type AnalyzeRunStatus,
   type AnalyzeRunResumeUnavailableReason,
 } from '@truecourse/core/commands/analyze-run-status';
 import {
+  AnalysisResumeUnavailableError,
+  AnalysisSessionLimitError,
   AnalysisStartBlockedError,
+  type AnalyzeInProcessResult,
   type LatestAttemptExpectation,
+  type ResumeAnalyzeInProcessOptions,
 } from '@truecourse/core/commands/analyze-in-process';
 import { resolveRepoDir } from '@truecourse/core/config/paths';
+import type { RegistryEntry } from '@truecourse/core/config/registry';
+import { closeLogger, configureLogger, log } from '@truecourse/core/lib/logger';
 
 export interface AnalyzeStatusOptions {
   cwd?: string;
@@ -22,6 +29,34 @@ export interface AnalyzeStartExpectationOptions {
   confirmAbandon: (message: string) => Promise<boolean>;
 }
 
+export interface AnalyzeResumeOptions extends AnalyzeStatusOptions {
+  readStatus?: typeof readAnalyzeRunStatus;
+  registerProject?: (repoPath: string) => Promise<RegistryEntry>;
+  configureDiagnostics?: typeof configureLogger;
+  resume?: (
+    project: RegistryEntry,
+    options: ResumeAnalyzeInProcessOptions,
+  ) => Promise<AnalyzeInProcessResult>;
+}
+
+export type AnalyzeResumeCliFailureReason =
+  | AnalyzeRunResumeUnavailableReason
+  | 'run-not-found'
+  | 'not-latest-attempt'
+  | 'completed-analysis-not-active'
+  | 'diagnostics-unavailable'
+  | 'execution-failed';
+
+export class AnalyzeResumeCliError extends Error {
+  constructor(
+    readonly reason: AnalyzeResumeCliFailureReason,
+    options?: ErrorOptions,
+  ) {
+    super(resumeCliFailureMessage(reason), options);
+    this.name = 'AnalyzeResumeCliError';
+  }
+}
+
 /** Print the latest attempted run and completed baseline without mutating either. */
 export async function runAnalyzeStatus(options: AnalyzeStatusOptions = {}): Promise<void> {
   const cwd = options.cwd ?? process.cwd();
@@ -29,6 +64,90 @@ export async function runAnalyzeStatus(options: AnalyzeStatusOptions = {}): Prom
   const status = await readAnalyzeRunStatus(repositoryKey);
   const writeLine = options.writeLine ?? console.log;
   for (const line of formatAnalyzeRunStatus(status)) writeLine(line);
+}
+
+/** Resume one exact latest attempted run; core revalidates before provider admission. */
+export async function runAnalyzeResume(
+  runId: string,
+  options: AnalyzeResumeOptions = {},
+): Promise<void> {
+  const cwd = options.cwd ?? process.cwd();
+  const repositoryKey = resolveRepoDir(cwd) ?? cwd;
+  let loggerConfigured = false;
+  try {
+    (options.configureDiagnostics ?? configureLogger)({
+      filePath: path.join(repositoryKey, '.truecourse', 'logs', 'analyze.log'),
+    });
+    loggerConfigured = true;
+  } catch (error) {
+    throw new AnalyzeResumeCliError('diagnostics-unavailable', { cause: error });
+  }
+  try {
+    const readStatus = options.readStatus ?? readAnalyzeRunStatus;
+    const status = await readStatus(repositoryKey);
+    const run = selectAnalyzeResumeRun(status, runId);
+    const writeLine = options.writeLine ?? console.log;
+    const completed = run.counts!.succeeded;
+    const pending = run.counts!.pending;
+    const baseline = status.activeCompletedAnalysis?.analysisId ?? 'none';
+
+    writeLine(`Resume requested for exact run ${runId}.`);
+    writeLine(
+      `Saved run contains ${completed} durable successful LLM ${plural(completed, 'checkpoint')}; ${pending} pending ${plural(pending, 'check')} ${pending === 1 ? 'remains' : 'remain'}. Active completed analysis ${baseline} stays canonical until Resume finishes.`,
+    );
+    if (run.lastProviderLimit) {
+      writeLine(
+        `Provider reset report: ${run.lastProviderLimit.resetHint} (advisory; the provider remains authoritative).`,
+      );
+    }
+    if (pending > 0) {
+      writeLine(
+        'Revalidating repository, completed baseline, rules, configuration, prompts/schemas, provider, and model before pending work is admitted.',
+      );
+    } else {
+      writeLine('No provider calls are pending; recovering durable execution/finalization state.');
+    }
+
+    const register = options.registerProject
+      ?? (await import('@truecourse/core/config/registry')).registerProject;
+    const resume = options.resume
+      ?? (await import('@truecourse/core/commands/analyze-in-process')).resumeAnalyzeInProcess;
+    const project = await register(repositoryKey);
+    const result = await resume(project, {
+      runId,
+      onProgress: (progress) => {
+        if (progress.detail) writeLine(`Resume: ${progress.detail}`);
+      },
+    });
+    if (completed > 0) {
+      writeLine(
+        `Revalidated and reused ${completed} successful LLM ${plural(completed, 'checkpoint')}.`,
+      );
+    }
+    writeLine(`Resume complete: ${result.analysisId} is now the active completed analysis.`);
+  } catch (error) {
+    if (
+      error instanceof AnalyzeResumeCliError
+      || error instanceof AnalysisResumeUnavailableError
+      || error instanceof AnalysisSessionLimitError
+    ) {
+      throw error;
+    }
+    try {
+      log.error(`[CLI] Analysis Resume failed: ${localFailureDiagnostic(error)}`, error);
+    } catch {
+      // Diagnostic failure must not expose or replace the original failure.
+    }
+    throw new AnalyzeResumeCliError('execution-failed', { cause: error });
+  } finally {
+    if (loggerConfigured) {
+      try {
+        await closeLogger();
+      } catch {
+        // Closing diagnostics must not replace the Resume result or failure.
+      }
+    }
+  }
 }
 
 /** Resolve user intent before core atomically rechecks it under the lifecycle lock. */
@@ -101,7 +220,7 @@ export function formatAnalyzeRunStatus(status: AnalyzeRunStatus): string[] {
     } else if (run.resume.available) {
       const timing = run.state === 'blocked' ? ' after the provider reset' : '';
       lines.push(
-        `Resume: structurally available${timing} and full revalidation; the CLI action is not available in this version`,
+        `Resume: truecourse analyze resume ${run.runId}${timing} (repository, baseline, rules, configuration, prompts/schemas, provider, and model will be revalidated)`,
       );
     } else {
       lines.push(`Resume: unavailable — ${resumeUnavailableMessage(run.resume.reason)}`);
@@ -126,9 +245,9 @@ export function formatAnalysisStartBlockedError(error: AnalysisStartBlockedError
   const selected = error.runId ?? 'the previously observed run';
   switch (error.reason) {
     case 'resume-required':
-      return `Saved attempted run ${selected} is structurally resumable. Inspect it with truecourse analyze status. CLI Resume is not available in this version; to explicitly start over, use --abandon-attempt ${selected}. Paid LLM calls may repeat.`;
+      return `Saved attempted run ${selected} is structurally resumable. Run truecourse analyze resume ${selected} to revalidate and reuse completed work. To explicitly start over instead, use --abandon-attempt ${selected}; paid LLM calls may repeat.`;
     case 'recovery-required':
-      return `Saved attempted run ${selected} has durable recovery or finalization work that must finish before another analysis starts. Inspect it with truecourse analyze status. The CLI Resume action is not available in this version; starting over is not offered because completed projections may need repair.`;
+      return `Saved attempted run ${selected} has durable recovery or finalization work that must finish before another analysis starts. Run truecourse analyze resume ${selected}; starting over is not offered because completed projections may need repair.`;
     case 'resume-execution-ambiguous':
       return `Saved attempted run ${selected} may still have an admitted provider call in flight. Starting over is blocked to avoid repeating a paid call.`;
     case 'abandon-confirmation-required':
@@ -153,6 +272,56 @@ function requiresRecoveryBeforeReplacement(status: AnalyzeRunStatus): boolean {
   return (run.resume.available && run.state !== 'blocked')
     || run.state === 'finalizing'
     || run.finalization?.persistence === 'prepared';
+}
+
+function selectAnalyzeResumeRun(
+  status: AnalyzeRunStatus,
+  runId: string,
+): NonNullable<AnalyzeRunStatus['latestAttempt']> {
+  const run = status.latestAttempt;
+  if (run === null) throw new AnalyzeResumeCliError('run-not-found');
+  if (run.runId !== runId) throw new AnalyzeResumeCliError('not-latest-attempt');
+
+  const activeCompletedId = status.activeCompletedAnalysis?.analysisId ?? null;
+  const recoveringPromotedCandidate = run.candidateAnalysisId === activeCompletedId
+    && (run.state === 'finalizing' || run.state === 'completed');
+  if (!recoveringPromotedCandidate && run.completedBaselineId !== activeCompletedId) {
+    throw new AnalyzeResumeCliError('completed-analysis-not-active');
+  }
+  if (run.state !== 'completed' && !run.resume.available) {
+    throw new AnalyzeResumeCliError(run.resume.reason);
+  }
+  if (run.counts === null) throw new AnalyzeResumeCliError('run-not-resumable');
+  return run;
+}
+
+function resumeCliFailureMessage(reason: AnalyzeResumeCliFailureReason): string {
+  switch (reason) {
+    case 'run-not-found':
+      return 'Analyze Resume requires an existing latest attempted run.';
+    case 'not-latest-attempt':
+      return 'Analyze Resume requires the exact latest attempted run; inspect truecourse analyze status and try again.';
+    case 'completed-analysis-not-active':
+      return 'Analyze Resume is unavailable because the completed-analysis baseline changed or disappeared.';
+    case 'diagnostics-unavailable':
+      return 'Analysis Resume could not start because local diagnostics could not be configured. No status revalidation or provider work was attempted.';
+    case 'execution-failed':
+      return 'Analysis Resume failed. Inspect truecourse analyze status; when local diagnostics were available, details were written to the local analyze log. The active completed analysis remains canonical unless status reports completion.';
+    default:
+      return `Analyze Resume is unavailable: ${resumeUnavailableMessage(reason)}`;
+  }
+}
+
+function plural(count: number, noun: string): string {
+  return count === 1 ? noun : `${noun}s`;
+}
+
+function localFailureDiagnostic(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return 'failure could not be formatted';
+  }
 }
 
 function resumeUnavailableMessage(reason: AnalyzeRunResumeUnavailableReason): string {
