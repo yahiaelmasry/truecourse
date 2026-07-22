@@ -13,7 +13,9 @@ import {
   writeLatest,
 } from '../../packages/core/src/lib/analysis-store.js';
 import {
+  admitAnalyzeRunResumeExecution,
   dispatchAnalyzeRun,
+  readAnalyzeRun,
   resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
@@ -256,6 +258,105 @@ describe('certified analyze resume eligibility', () => {
       .resolves.toEqual({ activated: false, reason: 'activated-execution-changed' });
     expect(providerCalls).toBe(0);
     expect(fs.readFileSync(runFile())).toEqual(before);
+  });
+
+  it('durably admits resumed execution before invoking pending work', async () => {
+    await createBlockedRun();
+    const { rebuilt } = rebuiltRun();
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    expect(activated.activated).toBe(true);
+    if (!activated.activated) throw new Error('Expected resume activation');
+    let validationCalls = 0;
+    let admittedCallbacks = 0;
+
+    const admission = await admitAnalyzeRunResumeExecution(
+      activated.activation,
+      repoPath,
+      runId,
+      rebuilt.manifest.work,
+      activated.view.counts!.pending === 1
+        ? [rebuilt.manifest.work.find((work) => work.family === 'database')!.workId]
+        : [],
+      {
+        provider: 'claude-code',
+        requestedModel: 'sonnet',
+        resolvedModel,
+      },
+      '2026-07-19T04:00:05+02:00',
+      () => { validationCalls += 1; },
+      async () => {
+        admittedCallbacks += 1;
+        return [];
+      },
+    );
+
+    expect(admission.admitted).toBe(true);
+    if (!admission.admitted) throw new Error('Expected resume admission');
+    expect(validationCalls).toBe(2);
+    expect(admittedCallbacks).toBe(1);
+    await expect(admission.execution).rejects.toThrow(/did not durably checkpoint every resumed result/);
+    resetAnalyzeRunStorage();
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      revision: 6,
+      state: 'running',
+      updatedAt: '2026-07-19T02:00:05.000Z',
+      executionAttempt: {
+        number: 2,
+        resume: { admission: 'executing', admittedAt: '2026-07-19T02:00:05.000Z' },
+      },
+    });
+  });
+
+  it('leaves a conservative tombstone and makes zero calls when the post-CAS pin check fails', async () => {
+    await createBlockedRun();
+    const { rebuilt } = rebuiltRun();
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected resume activation');
+    let validationCalls = 0;
+    let admittedCallbacks = 0;
+    const pendingWorkIds = [
+      rebuilt.manifest.work.find((work) => work.family === 'database')!.workId,
+    ];
+    const pin = {
+      provider: 'claude-code',
+      requestedModel: 'sonnet',
+      resolvedModel,
+    };
+
+    await expect(admitAnalyzeRunResumeExecution(
+      activated.activation,
+      repoPath,
+      runId,
+      rebuilt.manifest.work,
+      pendingWorkIds,
+      pin,
+      '2026-07-19T02:00:05.000Z',
+      () => {
+        validationCalls += 1;
+        if (validationCalls === 2) throw new Error('resume pin drifted');
+      },
+      async () => {
+        admittedCallbacks += 1;
+        return [];
+      },
+    )).rejects.toThrow('resume pin drifted');
+    expect(validationCalls).toBe(2);
+    expect(admittedCallbacks).toBe(0);
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      revision: 6,
+      executionAttempt: { resume: { admission: 'executing' } },
+    });
+    await expect(admitAnalyzeRunResumeExecution(
+      activated.activation,
+      repoPath,
+      runId,
+      rebuilt.manifest.work,
+      pendingWorkIds,
+      pin,
+      '2026-07-19T02:00:06.000Z',
+      () => undefined,
+      async () => [],
+    )).resolves.toEqual({ admitted: false });
   });
 
   it.each([

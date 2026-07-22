@@ -96,7 +96,10 @@ the attempted-run journal before reporting that work item successful. Eligible
 journaled architecture runs therefore preserve paid successes, but reuse and
 Resume are not enabled yet. The certified planner can atomically activate an
 exact latest blocked attempt after compatibility checks, but provider execution
-is not admitted from that state yet. Schema-v1 through schema-v4 journals remain
+is not yet wired into the production Resume flow. The journal's internal
+admission boundary durably records `executing` and revalidates the exact
+provider/model pin before and after that write, before allowing pending work to
+start. Schema-v1 through schema-v4 journals remain
 readable and normalize safely to schema v5 when a current lifecycle command
 writes them. Historical schema-v3 runs from before durable execution admission
 are normalized to the admitted revision lineage without rewriting the journal

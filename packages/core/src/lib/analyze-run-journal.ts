@@ -141,6 +141,7 @@ const analyzeRunResumePlanActivations = new WeakMap<object, {
   reusedWorkIds: readonly string[];
   executionPin: AnalyzeRunResumeExecutionPin;
   attemptSequence: number;
+  claimed: boolean;
 }>();
 
 const preparedAnalyzeRunCompletions = new WeakMap<object, {
@@ -1254,8 +1255,158 @@ export async function activateAnalyzeRunResume(
     reusedWorkIds: Object.freeze([...reusedWorkIds]),
     executionPin,
     attemptSequence: next.attemptSequence,
+    claimed: false,
   });
   return Object.freeze({ view: toView(next), activation });
+}
+
+/**
+ * Durably admit one activated resume attempt before synchronously starting only
+ * its pending provider work. The execution profile is revalidated on both sides
+ * of the admission CAS so a changed provider/model can never receive a call.
+ */
+export async function admitAnalyzeRunResumeExecution<T>(
+  receipt: AnalyzeRunResumePlanActivation,
+  repoKey: string,
+  runId: string,
+  work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
+  pendingWorkIds: readonly string[],
+  executionPin: Readonly<AnalyzeRunResumeExecutionPin>,
+  admittedAt: string,
+  validate: () => void,
+  admit: (checkpointWriter: AnalyzeRunCheckpointWriter) => Promise<T>,
+): Promise<AnalyzeRunPlanAdmission<T>> {
+  if ((typeof receipt !== 'object' && typeof receipt !== 'function') || receipt === null) {
+    return { admitted: false };
+  }
+  const activation = analyzeRunResumePlanActivations.get(receipt);
+  if (!activation) return { admitted: false };
+  const storage = activeStorage;
+  const ownershipMatches = activation.storage === storage
+    && activation.repoKey === activationScopeKey(repoKey, storage)
+    && activation.runId === runId
+    && activation.workKey === activationWorkKey(work)
+    && isDeepStrictEqual(activation.executionPin, executionPin)
+    && isDeepStrictEqual([...activation.pendingWorkIds].sort(), [...pendingWorkIds].sort());
+  if (!ownershipMatches) return { admitted: false };
+
+  const stored = await storage.read(activation.repoKey, activation.runId);
+  assertAnalyzeRunStorage(storage);
+  const durablePending = stored?.plan.state === 'sealed'
+    ? stored.plan.work.filter((item) => item.state === 'pending').map((item) => item.workId)
+    : [];
+  const durableReused = stored?.plan.state === 'sealed'
+    ? stored.plan.work
+        .filter((item) => item.state === 'succeeded-checkpointed')
+        .map((item) => item.workId)
+    : [];
+  const stillExecutable = stored?.status.state === 'running'
+    && stored.plan.state === 'sealed'
+    && stored.revision === activation.revision
+    && stored.attemptSequence === activation.attemptSequence
+    && stored.executionAttempt.resume?.admission === 'activated'
+    && isDeepStrictEqual(stored.executionAttempt.resume.executionPin, activation.executionPin)
+    && activation.workKey === activationWorkKey(stored.plan.work)
+    && isDeepStrictEqual([...activation.pendingWorkIds].sort(), [...durablePending].sort())
+    && isDeepStrictEqual([...activation.reusedWorkIds].sort(), [...durableReused].sort());
+  if (!stillExecutable || !stored || stored.plan.state !== 'sealed') return { admitted: false };
+  const durableResume = stored.executionAttempt.resume;
+  if (!durableResume || analyzeRunResumePlanActivations.get(receipt) !== activation) {
+    return { admitted: false };
+  }
+  if (activation.claimed) return { admitted: false };
+
+  validate();
+  const canonicalAdmittedAt = canonicalTimestamp(admittedAt, 'admittedAt');
+  if (Date.parse(canonicalAdmittedAt) < Date.parse(stored.updatedAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} execution admission cannot precede its activation`,
+    );
+  }
+  const executing: StoredAnalyzeRun = {
+    ...stored,
+    revision: stored.revision + 1,
+    updatedAt: canonicalAdmittedAt,
+    executionAttempt: {
+      ...stored.executionAttempt,
+      resume: {
+        ...durableResume,
+        admission: 'executing',
+        admittedAt: canonicalAdmittedAt,
+      },
+    },
+  };
+  activation.claimed = true;
+  let checkpointBinding: {
+    storage: AnalyzeRunStorage;
+    repoKey: string;
+    runId: string;
+    workKey: string;
+    sealedAt: string;
+    active: boolean;
+  } | undefined;
+  try {
+    await storage.compareAndSwapLatest(
+      activation.repoKey,
+      activation.runId,
+      stored.revision,
+      activation.attemptSequence,
+      activation.attemptSequence,
+      executing,
+    );
+    assertAnalyzeRunStorage(storage);
+    validate();
+    const checkpointWriter = Object.freeze({}) as AnalyzeRunCheckpointWriter;
+    checkpointBinding = {
+      storage,
+      repoKey: activation.repoKey,
+      runId: activation.runId,
+      workKey: activation.workKey,
+      sealedAt: stored.plan.sealedAt,
+      active: true,
+    };
+    analyzeRunCheckpointWriters.set(checkpointWriter, checkpointBinding);
+    analyzeRunResumePlanActivations.delete(receipt);
+    const admittedExecution = admit(checkpointWriter);
+    const execution = admittedExecution.then(async (result) => {
+      checkpointBinding!.active = false;
+      const completed = await storage.read(activation.repoKey, activation.runId);
+      assertAnalyzeRunStorage(storage);
+      if (
+        !completed
+        || completed.status.state !== 'running'
+        || completed.plan.state !== 'sealed'
+        || completed.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
+        || activation.workKey !== activationWorkKey(completed.plan.work)
+      ) {
+        throw new InvalidAnalyzeRunTransitionError(
+          `Analyze run ${activation.runId} did not durably checkpoint every resumed result`,
+        );
+      }
+      const certification = issueAnalyzeRunExecutionCertification({
+        storage,
+        scopeKey: activationScopeKey(repoKey, storage),
+        runId: activation.runId,
+        revision: completed.revision,
+        workKey: activation.workKey,
+      });
+      return Object.freeze({ result, certification });
+    }, (error) => {
+      checkpointBinding!.active = false;
+      throw error;
+    });
+    return { admitted: true, execution };
+  } catch (error) {
+    if (checkpointBinding) checkpointBinding.active = false;
+    const current = await storage.read(activation.repoKey, activation.runId);
+    assertAnalyzeRunStorage(storage);
+    if (current?.revision === activation.revision) {
+      activation.claimed = false;
+    } else {
+      analyzeRunResumePlanActivations.delete(receipt);
+    }
+    throw error;
+  }
 }
 
 async function readActiveCompletedBaselineFingerprint(
@@ -1318,6 +1469,28 @@ export async function checkpointAnalyzeRunWork(
     if (current.status.state !== 'running' || current.plan.state !== 'sealed') {
       throw new InvalidAnalyzeRunTransitionError(
         `Cannot checkpoint analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+      );
+    }
+    if (
+      current.executionAttempt.number > 1
+      && current.executionAttempt.resume?.admission !== 'executing'
+    ) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Cannot checkpoint analyze run ${runId} before resumed execution is durably admitted`,
+      );
+    }
+    if (Date.parse(checkpoint.checkpointedAt) < Date.parse(current.executionAttempt.activatedAt)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} checkpoint cannot precede its execution attempt`,
+      );
+    }
+    if (
+      current.executionAttempt.number > 1
+      && Date.parse(checkpoint.checkpointedAt)
+        < Date.parse(current.executionAttempt.resume!.admittedAt!)
+    ) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} checkpoint cannot precede resumed execution admission`,
       );
     }
     if (binding.workKey !== activationWorkKey(current.plan.work)) {
