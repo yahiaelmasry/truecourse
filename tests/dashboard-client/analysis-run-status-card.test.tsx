@@ -5,6 +5,7 @@ import { AnalysisRunStatusCard } from '@/components/analyses/AnalysisRunStatusCa
 import { AnalysesPanel } from '@/components/analyses/AnalysesPanel';
 
 const blockedStatus: AnalyzeRunStatusResponse = {
+  activeMode: null,
   latestAttempt: {
     runId: 'run-blocked-123',
     state: 'blocked',

@@ -113,8 +113,9 @@ executes only pending checks, and promotes the candidate only after complete
 finalization.
 It deliberately installs no graceful SIGINT cancellation handler: an abrupt
 interruption remains durably recoverable or execution-ambiguous instead of
-being mislabeled as a safe retryable failure. Dashboard Resume remains a later
-#791 dependency. The local dashboard now exposes the latest attempted run and
+being mislabeled as a safe retryable failure. The local dashboard server exposes
+an exact-run Resume endpoint with protected execution ownership, but the dashboard
+Resume action remains a later #791 dependency. The local dashboard now exposes the latest attempted run and
 its durable progress separately from the active completed analysis, but keeps
 that view informational until dashboard Resume is added. The CLI will not silently replace incomplete paid work:
 resumable attempts direct the user toward recovery, execution-ambiguous

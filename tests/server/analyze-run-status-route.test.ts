@@ -76,6 +76,7 @@ describe('dashboard analyze-run status route', () => {
       .expect(200);
 
     expect(response.body).toEqual({
+      activeMode: null,
       latestAttempt: {
         runId: 'attempt-2',
         state: 'running',

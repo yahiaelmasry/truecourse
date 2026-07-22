@@ -103,6 +103,7 @@ describe('useAnalyzeRunStatus', () => {
 
 function status(state: 'running' | 'blocked'): AnalyzeRunStatusResponse {
   return {
+    activeMode: null,
     latestAttempt: {
       runId: 'run-1',
       state,

@@ -1,4 +1,5 @@
 import type { Server as SocketServer, Socket } from 'socket.io';
+import type { AnalysisActivityMode } from '@truecourse/shared';
 import { getIO } from './index.js';
 import { log } from '@truecourse/core/lib/logger';
 import {
@@ -8,7 +9,8 @@ import {
 import type { LlmEstimate } from '@truecourse/core/commands/analyze-in-process';
 
 // Track in-progress analyses so we can inform clients that join mid-analysis
-const activeAnalyses = new Map<string, AnalysisProgressPayload>();
+type ActiveAnalysisProgress = AnalysisProgressPayload & { mode: AnalysisActivityMode };
+const activeAnalyses = new Map<string, ActiveAnalysisProgress>();
 // Same idea for BL Drift's Spec scan/apply.
 const activeSpec = new Map<string, AnalysisProgressPayload>();
 
@@ -51,23 +53,25 @@ export function setupHandlers(io: SocketServer): void {
 export function createSocketTracker(
   repoId: string,
   stepDefs: { key: string; label: string }[],
+  mode: AnalysisActivityMode = 'analysis',
 ): StepTracker {
-  return new StepTracker((payload) => emitAnalysisProgress(repoId, payload), stepDefs);
+  return new StepTracker((payload) => emitAnalysisProgress(repoId, payload, mode), stepDefs);
 }
 
 export function emitAnalysisProgress(
   repoId: string,
   progress: AnalysisProgressPayload,
+  mode: AnalysisActivityMode = 'analysis',
 ): void {
   // Track progress so we can resend to clients that connect later
   if (progress.step === 'error') {
     activeAnalyses.delete(repoId);
   } else {
-    activeAnalyses.set(repoId, progress);
+    activeAnalyses.set(repoId, { ...progress, mode });
   }
 
   const io = getIO();
-  io.to(`repo:${repoId}`).emit('analysis:progress', { repoId, ...progress });
+  io.to(`repo:${repoId}`).emit('analysis:progress', { repoId, ...progress, mode });
 }
 
 export function emitAnalysisComplete(

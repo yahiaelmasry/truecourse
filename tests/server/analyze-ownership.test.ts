@@ -142,7 +142,16 @@ describe('dashboard analysis ownership', () => {
     unregisterAnalysis('repo-owned', new AbortController());
     expect(tryRegisterAnalysis('repo-owned', 'second')).toBeNull();
     unregisterAnalysis('repo-owned', owner!);
-    expect(cancelAnalysis('repo-owned')).toBe(false);
+    expect(cancelAnalysis('repo-owned')).toBe('not-found');
+  });
+
+  it('does not abort or release protected Resume ownership', () => {
+    const owner = tryRegisterAnalysis('repo-resume', 'run-1', 'resume');
+    expect(owner).not.toBeNull();
+    expect(cancelAnalysis('repo-resume')).toBe('protected');
+    expect(owner!.signal.aborted).toBe(false);
+    expect(isAnalysisActive('repo-resume')).toBe(true);
+    unregisterAnalysis('repo-resume', owner!);
   });
 });
 

@@ -7,6 +7,15 @@ export type AnalyzeRunResumeUnavailableReason =
   | 'run-not-resumable'
   | 'run-completed';
 
+export type AnalysisActivityMode = 'analysis' | 'resume';
+
+export interface AnalyzeResumeAcceptedResponse {
+  message: 'Analysis Resume started';
+  repoId: string;
+  runId: string;
+  mode: 'resume';
+}
+
 export type AnalyzeRunResumeStatus =
   | {
       available: true;
@@ -22,6 +31,8 @@ export type AnalyzeRunResumeStatus =
     };
 
 export interface AnalyzeRunStatusResponse {
+  /** In-process server activity; durable attempted-run state remains authoritative. */
+  activeMode: AnalysisActivityMode | null;
   /** Informational latest attempted run; actions must revalidate it before admission. */
   latestAttempt: {
     runId: string;

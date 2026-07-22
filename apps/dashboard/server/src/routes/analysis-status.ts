@@ -6,6 +6,7 @@ import {
   readAnalyzeRunStatus,
   type AnalyzeRunStatus,
 } from '@truecourse/core/commands/analyze-run-status';
+import { getActiveAnalysisMode } from '@truecourse/core/services/analysis-registry';
 import { getCapabilities } from '../ee-loader.js';
 
 const router: Router = Router();
@@ -17,16 +18,20 @@ router.get('/:id/analyses/status', async (req: Request, res: Response, next: Nex
       throw createAppError('Not found', 404);
     }
     const repo = await resolveProjectForRequest(req.params.id as string);
-    res.json(toAnalyzeRunStatusResponse(await readAnalyzeRunStatus(repo.path)));
+    res.json(toAnalyzeRunStatusResponse(await readAnalyzeRunStatus(repo.path), req.params.id as string));
   } catch (error) {
     next(error);
   }
 });
 
-function toAnalyzeRunStatusResponse(status: AnalyzeRunStatus): AnalyzeRunStatusResponse {
+function toAnalyzeRunStatusResponse(
+  status: AnalyzeRunStatus,
+  repoId: string,
+): AnalyzeRunStatusResponse {
   const attempt = status.latestAttempt;
   const completed = status.activeCompletedAnalysis;
   return {
+    activeMode: getActiveAnalysisMode(repoId),
     latestAttempt: attempt
       ? {
           runId: attempt.runId,

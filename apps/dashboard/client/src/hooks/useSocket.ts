@@ -1,6 +1,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { connectSocket, disconnectSocket, joinRepoRoom, leaveRepoRoom } from '@/lib/socket';
+import type { AnalysisActivityMode } from '@truecourse/shared';
 
 export type StepStatus = 'pending' | 'active' | 'done' | 'error';
 
@@ -14,6 +15,7 @@ export interface AnalysisStep {
 export type AnalysisProgress = {
   step: string;
   percent: number;
+  mode?: AnalysisActivityMode;
   detail?: string;
   steps?: AnalysisStep[];
 };

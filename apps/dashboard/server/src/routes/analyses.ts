@@ -2,7 +2,8 @@
  * All endpoints under the `/api/repos/:id/analyses` noun:
  *
  *   POST   /analyses          — start a run (body: `{mode, skipGit?}`)
- *   POST   /analyses/cancel   — abort the active run (either mode)
+ *   POST   /analyses/cancel   — abort a normal run; admitted Resume is protected
+ *   POST   /analyses/:runId/resume — resume one exact latest attempted run
  *   GET    /analyses/status   — latest attempt + active completed baseline
  *   GET    /analyses          — history list
  *   GET    /analyses/diff     — current diff.json contents
@@ -15,11 +16,18 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import path from 'node:path';
 import { AnalyzeRepoSchema } from '@truecourse/shared';
+import type { AnalyzeResumeAcceptedResponse } from '@truecourse/shared';
 import { createAppError } from '@truecourse/core/lib/errors';
 import { resolveProjectForRequest } from '@truecourse/core/config/current-project';
 import { readProjectConfig } from '@truecourse/core/config/project-config';
 import type { RegistryEntry } from '@truecourse/core/config/registry';
-import { analyzeInProcess } from '@truecourse/core/commands/analyze-in-process';
+import {
+  analyzeInProcess,
+  AnalysisResumeUnavailableError,
+  AnalysisSessionLimitError,
+  resumeAnalyzeInProcess,
+} from '@truecourse/core/commands/analyze-in-process';
+import { readAnalyzeRunStatus } from '@truecourse/core/commands/analyze-run-status';
 import { diffInProcess } from '@truecourse/core/commands/diff-in-process';
 import { buildAnalysisSteps, type StepTracker } from '@truecourse/core/progress';
 import { getGit } from '@truecourse/core/lib/git';
@@ -53,8 +61,120 @@ import {
 } from '@truecourse/core/lib/analysis-store';
 import type { LatestSnapshot } from '@truecourse/core/types/snapshot';
 import { log, withLogger } from '@truecourse/core/lib/logger';
+import { getCapabilities } from '../ee-loader.js';
 
 const router: Router = Router();
+
+// ---------------------------------------------------------------------------
+// POST /api/repos/:id/analyses/:runId/resume — resume one exact latest attempt
+// ---------------------------------------------------------------------------
+
+router.post('/:id/analyses/:runId/resume', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!getCapabilities().includes('local-filesystem')) {
+      throw createAppError('Not found', 404);
+    }
+    const id = req.params.id as string;
+    const runId = req.params.runId as string;
+    const repo = await resolveProjectForRequest(id);
+    const status = await readAnalyzeRunStatus(repo.path);
+    assertResumePreflight(status, runId);
+
+    const projectConfig = await readProjectConfig(repo.path);
+    const tracker = createSocketTracker(
+      id,
+      buildAnalysisSteps(
+        projectConfig.enabledCategories ?? undefined,
+        projectConfig.enableLlmRules ?? true,
+      ),
+      'resume',
+    );
+    const owner = tryRegisterAnalysis(id, runId, 'resume');
+    if (!owner) {
+      throw createAppError('An analysis is already running for this repository.', 409);
+    }
+
+    try {
+      try {
+        await withLogger({
+          filePath: path.join(repo.path, '.truecourse/logs/analyze.log'),
+          tee: process.env.TRUECOURSE_DEV === '1',
+        }, async () => {
+          const accepted: AnalyzeResumeAcceptedResponse = {
+            message: 'Analysis Resume started',
+            repoId: id,
+            runId,
+            mode: 'resume',
+          };
+          res.status(202).json(accepted);
+
+          try {
+            // Deliberately omit an abort signal: admitted Resume calls cannot yet
+            // prove a graceful cancellation stopped every provider-side request.
+            const outcome = await resumeAnalyzeInProcess(repo, { runId, tracker });
+            emitViolationsReady(id, outcome.analysisId);
+            emitAnalysisComplete(id, outcome.analysisId);
+          } catch (error) {
+            log.error(
+              `[Analysis Resume] Failed for repo ${id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+            emitAnalysisProgress(id, {
+              step: 'error',
+              percent: -1,
+              detail: resumeFailureDetail(error),
+            }, 'resume');
+          }
+        });
+      } catch (error) {
+        if (!res.headersSent) throw error;
+        log.error(
+          `[Analysis Resume] Post-acceptance cleanup failed for repo ${id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    } finally {
+      unregisterAnalysis(id, owner);
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+function assertResumePreflight(
+  status: Awaited<ReturnType<typeof readAnalyzeRunStatus>>,
+  runId: string,
+): void {
+  const attempt = status.latestAttempt;
+  if (!attempt || attempt.runId !== runId) {
+    throw createAppError('The selected attempted run is no longer the latest. Refresh run status.', 409);
+  }
+  const activeCompletedId = status.activeCompletedAnalysis?.analysisId ?? null;
+  if (
+    activeCompletedId !== attempt.completedBaselineId
+    && activeCompletedId !== attempt.candidateAnalysisId
+  ) {
+    throw createAppError('The active completed analysis changed. Refresh run status before resuming.', 409);
+  }
+  const completedRetry = attempt.state === 'completed'
+    && !attempt.resume.available
+    && attempt.resume.reason === 'run-completed'
+    && activeCompletedId === attempt.candidateAnalysisId;
+  if (!attempt.resume.available && !completedRetry) {
+    throw createAppError(
+      `Analyze Resume is unavailable for the selected run (${attempt.resume.reason}). Refresh run status.`,
+      409,
+    );
+  }
+}
+
+function resumeFailureDetail(error: unknown): string {
+  if (error instanceof AnalysisSessionLimitError) {
+    return `${error.message} Resume paused again; refresh Latest run for durable progress and reset information.`;
+  }
+  if (error instanceof AnalysisResumeUnavailableError) {
+    return `Resume failed production revalidation (${error.reason}). Refresh Latest run before trying again.`;
+  }
+  return 'Analysis Resume failed. Refresh Latest run for durable status and check the local analyze log for details.';
+}
 
 // ---------------------------------------------------------------------------
 // POST /api/repos/:id/analyses — start a run (mode: 'full' | 'diff')
@@ -141,8 +261,14 @@ router.post('/:id/analyses', async (req: Request, res: Response, next: NextFunct
 router.post('/:id/analyses/cancel', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    const canceled = cancelAnalysis(id);
-    res.json({ message: canceled ? 'Analysis cancelling' : 'No active analysis' });
+    const result = cancelAnalysis(id);
+    if (result === 'protected') {
+      throw createAppError(
+        'Resume cannot be canceled safely after provider admission. Wait for it to finish or report blocked status.',
+        409,
+      );
+    }
+    res.json({ message: result === 'canceled' ? 'Analysis cancelling' : 'No active analysis' });
   } catch (error) {
     next(error);
   }
