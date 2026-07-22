@@ -8,6 +8,10 @@ import {
   resetAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import {
+  closeLogger,
+  setLogTransport,
+} from '../../packages/core/src/lib/logger.js';
+import {
   executeCertifiedViolationPhase,
   JournaledAnalyzeSessionLimitError,
 } from '../../packages/core/src/services/llm/certified-violation-phase.js';
@@ -20,7 +24,8 @@ import type { ServiceViolationContext } from '../../packages/core/src/services/l
 
 const repositories: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  await closeLogger();
   resetAnalyzeRunStorage();
   for (const repository of repositories.splice(0)) {
     fs.rmSync(repository, { recursive: true, force: true });
@@ -157,18 +162,54 @@ describe('certified violation phase', () => {
 
   it('marks the journal failed when certified provider execution fails', async () => {
     const repositoryKey = repository();
+    const sensitiveDiagnostic = '/Users/example/private-repo provider failed';
+    const failure = new Error(sensitiveDiagnostic);
     await expect(executeCertifiedViolationPhase({
       run: run(repositoryKey, 'failed-phase'),
       analysisTimestamp: '2026-07-19T00:00:02.000Z',
-      adapter: new Adapter(new Error('provider failed')),
+      adapter: new Adapter(failure),
       code: [],
       service: serviceContext(),
-    })).rejects.toThrow('provider failed');
+    })).rejects.toBe(failure);
 
     await expect(readAnalyzeRun(repositoryKey, { runId: 'failed-phase' }))
       .resolves.toMatchObject({
         state: 'failed',
-        failure: { code: 'ANALYZE_LLM_FAILED', message: 'provider failed' },
+        failure: {
+          code: 'ANALYZE_LLM_FAILED',
+          message: 'The LLM provider failed during analysis. Check local logs for details.',
+        },
+      });
+    expect(fs.readFileSync(path.join(
+      repositoryKey,
+      '.truecourse',
+      'analyses',
+      'runs',
+      'failed-phase.json',
+    ), 'utf8')).not.toContain(sensitiveDiagnostic);
+  });
+
+  it('journals and rethrows the provider failure when diagnostic logging throws', async () => {
+    const repositoryKey = repository();
+    const failure = new Error('original provider failure');
+    setLogTransport({
+      write() { throw new Error('diagnostic transport failed'); },
+    });
+
+    await expect(executeCertifiedViolationPhase({
+      run: run(repositoryKey, 'throwing-log-transport'),
+      analysisTimestamp: '2026-07-19T00:00:02.000Z',
+      adapter: new Adapter(failure),
+      code: [],
+      service: serviceContext(),
+    })).rejects.toBe(failure);
+    await expect(readAnalyzeRun(repositoryKey, { runId: 'throwing-log-transport' }))
+      .resolves.toMatchObject({
+        state: 'failed',
+        failure: {
+          code: 'ANALYZE_LLM_FAILED',
+          message: 'The LLM provider failed during analysis. Check local logs for details.',
+        },
       });
   });
 });
