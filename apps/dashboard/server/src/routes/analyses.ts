@@ -3,6 +3,7 @@
  *
  *   POST   /analyses          — start a run (body: `{mode, skipGit?}`)
  *   POST   /analyses/cancel   — abort the active run (either mode)
+ *   GET    /analyses/status   — latest attempt + active completed baseline
  *   GET    /analyses          — history list
  *   GET    /analyses/diff     — current diff.json contents
  *   GET    /analyses/:id/usage

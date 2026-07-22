@@ -114,12 +114,13 @@ finalization.
 It deliberately installs no graceful SIGINT cancellation handler: an abrupt
 interruption remains durably recoverable or execution-ambiguous instead of
 being mislabeled as a safe retryable failure. Dashboard Resume remains a later
-#791 dependency. The CLI will not silently replace incomplete paid work:
+#791 dependency. The local dashboard now exposes the latest attempted run and
+its durable progress separately from the active completed analysis, but keeps
+that view informational until dashboard Resume is added. The CLI will not silently replace incomplete paid work:
 resumable attempts direct the user toward recovery, execution-ambiguous
 attempts fail closed, and starting over requires exact acknowledgement with
-`--abandon-attempt <run-id>`. Dashboard enforcement follows with its status and
-action dependencies so existing dashboard users are not stranded without a
-recovery control. Starting over may repeat paid LLM calls; the active completed
+`--abandon-attempt <run-id>`. Dashboard enforcement and recovery actions follow
+the read-only status view in later dependencies. Starting over may repeat paid LLM calls; the active completed
 analysis remains canonical until the replacement succeeds. Once a replacement
 does succeed, the older attempt is ineligible for Resume against the newer
 completed baseline and no longer blocks later CLI analyses unless an admitted

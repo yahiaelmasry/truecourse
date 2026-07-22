@@ -7,6 +7,7 @@ import { errorHandler } from './middleware/error.js';
 import { projectResolver } from './middleware/project.js';
 import reposRouter from './routes/repos.js';
 import analysesRouter from './routes/analyses.js';
+import analysisStatusRouter from './routes/analysis-status.js';
 import graphRouter from './routes/graph.js';
 import filesRouter from './routes/files.js';
 import violationsRouter from './routes/violations.js';
@@ -69,6 +70,8 @@ export function createApp(opts: CreateAppOptions = {}): express.Express {
 
   // Home page / registry routes run without a project.
   app.use('/api/repos', reposRouter);
+  // Informational run status must not update the dashboard-recency registry.
+  app.use('/api/repos', analysisStatusRouter);
   // Project-scoped routes. Each router's patterns declare their own `:id`
   // (e.g. `/:id/violations`), so we mount at `/api/repos` — the router
   // matches the `:id` segment itself. The resolver validates the slug and
