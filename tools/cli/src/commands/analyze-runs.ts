@@ -7,12 +7,14 @@ import {
   type AnalyzeRunResumeUnavailableReason,
 } from '@truecourse/core/commands/analyze-run-status';
 import {
+  AnalysisRearmUnavailableError,
   AnalysisResumeUnavailableError,
   AnalysisSessionLimitError,
   AnalysisStartBlockedError,
   resolveAnalyzeStartExpectationFromStatus,
   type AnalyzeInProcessResult,
   type LatestAttemptExpectation,
+  type RearmAnalyzeInProcessOptions,
   type ResumeAnalyzeInProcessOptions,
 } from '@truecourse/core/commands/analyze-in-process';
 import { resolveRepoDir } from '@truecourse/core/config/paths';
@@ -46,6 +48,18 @@ export interface AnalyzeResumeOptions extends AnalyzeStatusOptions {
   ) => Promise<AnalyzeInProcessResult>;
 }
 
+export interface AnalyzeRearmOptions extends AnalyzeStatusOptions {
+  /** Exact maximum duplicate-call exposure the user acknowledged from status. */
+  acceptedMaxRepeatProviderCalls?: number;
+  readStatus?: typeof readAnalyzeRunStatus;
+  registerProject?: (repoPath: string) => Promise<RegistryEntry>;
+  configureDiagnostics?: typeof configureLogger;
+  rearm?: (
+    project: RegistryEntry,
+    options: RearmAnalyzeInProcessOptions,
+  ) => Promise<AnalyzeInProcessResult>;
+}
+
 export type AnalyzeResumeCliFailureReason =
   | AnalyzeRunResumeUnavailableReason
   | 'run-not-found'
@@ -61,6 +75,27 @@ export class AnalyzeResumeCliError extends Error {
   ) {
     super(resumeCliFailureMessage(reason), options);
     this.name = 'AnalyzeResumeCliError';
+  }
+}
+
+export type AnalyzeRearmCliFailureReason =
+  | AnalyzeRunResumeUnavailableReason
+  | 'run-not-found'
+  | 'not-latest-attempt'
+  | 'completed-analysis-not-active'
+  | 'rearm-unavailable'
+  | 'consent-required'
+  | 'risk-not-accepted'
+  | 'diagnostics-unavailable'
+  | 'execution-failed';
+
+export class AnalyzeRearmCliError extends Error {
+  constructor(
+    readonly reason: AnalyzeRearmCliFailureReason,
+    options?: ErrorOptions,
+  ) {
+    super(rearmCliFailureMessage(reason), options);
+    this.name = 'AnalyzeRearmCliError';
   }
 }
 
@@ -175,6 +210,100 @@ export async function runAnalyzeResume(
   }
 }
 
+/** Rearm one exact ambiguous run after the user accepts its exact duplicate-call bound. */
+export async function runAnalyzeRearm(
+  runId: string,
+  options: AnalyzeRearmOptions = {},
+): Promise<void> {
+  const cwd = options.cwd ?? process.cwd();
+  const repositoryKey = resolveRepoDir(cwd) ?? cwd;
+  let loggerConfigured = false;
+  try {
+    const status = await (options.readStatus ?? readAnalyzeRunStatus)(repositoryKey);
+    const run = selectAnalyzeRearmRun(status, runId);
+    const offer = run.rearm;
+    if (options.acceptedMaxRepeatProviderCalls === undefined) {
+      throw new AnalyzeRearmCliError('consent-required');
+    }
+    if (
+      !Number.isSafeInteger(options.acceptedMaxRepeatProviderCalls)
+      || options.acceptedMaxRepeatProviderCalls < 0
+      || options.acceptedMaxRepeatProviderCalls !== offer.maxRepeatProviderCalls
+    ) {
+      throw new AnalyzeRearmCliError('risk-not-accepted');
+    }
+
+    try {
+      (options.configureDiagnostics ?? configureLogger)({
+        filePath: path.join(repositoryKey, '.truecourse', 'logs', 'analyze.log'),
+      });
+      loggerConfigured = true;
+    } catch (error) {
+      throw new AnalyzeRearmCliError('diagnostics-unavailable', { cause: error });
+    }
+
+    const writeLine = options.writeLine ?? console.log;
+    const completed = run.counts.succeeded;
+    const pending = run.counts.pending;
+    const baseline = status.activeCompletedAnalysis?.analysisId ?? 'none';
+    writeLine(`Rearm requested for exact run ${runId}.`);
+    writeLine(
+      `An earlier provider call may have completed without a durable checkpoint. You accepted repeating up to ${offer.maxRepeatProviderCalls} provider ${plural(offer.maxRepeatProviderCalls, 'call')}.`,
+    );
+    writeLine(
+      `Saved run contains ${completed} durable successful LLM ${plural(completed, 'checkpoint')}; ${pending} pending ${plural(pending, 'check')} ${pending === 1 ? 'remains' : 'remain'}. Active completed analysis ${baseline} stays canonical until Analyze Rearm finishes.`,
+    );
+    writeLine(
+      'Revalidating repository, completed baseline, rules, configuration, prompts/schemas, provider, and model before any rearm work is admitted.',
+    );
+
+    const register = options.registerProject
+      ?? (await import('@truecourse/core/config/registry')).registerProject;
+    const rearm = options.rearm
+      ?? (await import('@truecourse/core/commands/analyze-in-process')).rearmAnalyzeInProcess;
+    const project = await register(repositoryKey);
+    const result = await rearm(project, {
+      runId,
+      consent: {
+        evidence: offer.evidence,
+        acceptedRisk: 'repeat-up-to-pending-provider-calls',
+        acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls,
+      },
+      onProgress: (progress) => {
+        if (progress.detail) writeLine(`Rearm: ${progress.detail}`);
+      },
+    });
+    if (completed > 0) {
+      writeLine(
+        `Revalidated and reused ${completed} successful LLM ${plural(completed, 'checkpoint')}.`,
+      );
+    }
+    writeLine(`Analyze Rearm complete: ${result.analysisId} is now the active completed analysis.`);
+  } catch (error) {
+    if (
+      error instanceof AnalyzeRearmCliError
+      || error instanceof AnalysisRearmUnavailableError
+      || error instanceof AnalysisSessionLimitError
+    ) {
+      throw error;
+    }
+    try {
+      log.error(`[CLI] Analyze Rearm failed: ${localFailureDiagnostic(error)}`, error);
+    } catch {
+      // Diagnostic failure must not expose or replace the original failure.
+    }
+    throw new AnalyzeRearmCliError('execution-failed', { cause: error });
+  } finally {
+    if (loggerConfigured) {
+      try {
+        await closeLogger();
+      } catch {
+        // Closing diagnostics must not replace the Rearm result or failure.
+      }
+    }
+  }
+}
+
 async function waitForResetBeforeResume(
   repositoryKey: string,
   runId: string,
@@ -261,6 +390,14 @@ export function formatAnalyzeRunStatus(status: AnalyzeRunStatus): string[] {
     } else {
       lines.push(`Resume: unavailable — ${resumeUnavailableMessage(run.resume.reason)}`);
     }
+    if (run.rearm) {
+      const calls = run.rearm.maxRepeatProviderCalls;
+      const checkpoints = run.rearm.checkpointedWorkCount;
+      const checkpointVerb = checkpoints === 1 ? 'is' : 'are';
+      lines.push(
+        `Rearm: truecourse analyze rearm ${run.runId} --accept-possible-duplicate-provider-charges ${calls} (may repeat up to ${calls} provider ${plural(calls, 'call')}; ${checkpoints} successful ${plural(checkpoints, 'checkpoint')} ${checkpointVerb} eligible for reuse if revalidation succeeds)`,
+      );
+    }
   }
 
   const completed = status.activeCompletedAnalysis;
@@ -323,6 +460,28 @@ function selectAnalyzeResumeRun(
   return run;
 }
 
+function selectAnalyzeRearmRun(
+  status: AnalyzeRunStatus,
+  runId: string,
+): NonNullable<AnalyzeRunStatus['latestAttempt']> & {
+  counts: NonNullable<NonNullable<AnalyzeRunStatus['latestAttempt']>['counts']>;
+  rearm: NonNullable<NonNullable<AnalyzeRunStatus['latestAttempt']>['rearm']>;
+} {
+  const run = status.latestAttempt;
+  if (run === null) throw new AnalyzeRearmCliError('run-not-found');
+  if (run.runId !== runId) throw new AnalyzeRearmCliError('not-latest-attempt');
+  if (run.completedBaselineId !== (status.activeCompletedAnalysis?.analysisId ?? null)) {
+    throw new AnalyzeRearmCliError('completed-analysis-not-active');
+  }
+  if (run.counts === null || run.rearm === null) {
+    throw new AnalyzeRearmCliError('rearm-unavailable');
+  }
+  return run as typeof run & {
+    counts: NonNullable<typeof run.counts>;
+    rearm: NonNullable<typeof run.rearm>;
+  };
+}
+
 function resumeCliFailureMessage(reason: AnalyzeResumeCliFailureReason): string {
   switch (reason) {
     case 'run-not-found':
@@ -337,6 +496,29 @@ function resumeCliFailureMessage(reason: AnalyzeResumeCliFailureReason): string 
       return 'Analysis Resume failed. Inspect truecourse analyze status; when local diagnostics were available, details were written to the local analyze log. The active completed analysis remains canonical unless status reports completion.';
     default:
       return `Analyze Resume is unavailable: ${resumeUnavailableMessage(reason)}`;
+  }
+}
+
+function rearmCliFailureMessage(reason: AnalyzeRearmCliFailureReason): string {
+  switch (reason) {
+    case 'run-not-found':
+      return 'Analyze Rearm requires an existing latest attempted run.';
+    case 'not-latest-attempt':
+      return 'Analyze Rearm requires the exact latest attempted run; inspect truecourse analyze status and try again.';
+    case 'completed-analysis-not-active':
+      return 'Analyze Rearm is unavailable because the completed-analysis baseline changed or disappeared.';
+    case 'rearm-unavailable':
+      return 'Analyze Rearm is unavailable because this attempt has no exact ambiguous-execution offer.';
+    case 'consent-required':
+      return 'Analyze Rearm requires --accept-possible-duplicate-provider-charges with the exact maximum shown by truecourse analyze status.';
+    case 'risk-not-accepted':
+      return 'Analyze Rearm requires the exact non-negative duplicate-provider-call maximum currently shown by truecourse analyze status.';
+    case 'diagnostics-unavailable':
+      return 'Analyze Rearm could not continue because local diagnostics could not be configured. No provider work was attempted.';
+    case 'execution-failed':
+      return 'Analyze Rearm failed. Inspect truecourse analyze status; when local diagnostics were available, details were written to the local analyze log. The active completed analysis remains canonical unless status reports completion.';
+    default:
+      return `Analyze Rearm is unavailable: ${resumeUnavailableMessage(reason)}`;
   }
 }
 

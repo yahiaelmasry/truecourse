@@ -7,10 +7,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AnalyzeRunStatus } from '../../packages/core/src/commands/analyze-run-status.js';
 import { AnalysisStartBlockedError } from '../../packages/core/src/commands/analyze-in-process.js';
 import {
+  AnalyzeRearmCliError,
   AnalyzeResumeCliError,
   formatAnalysisStartBlockedError,
   formatAnalyzeRunStatus,
   resolveAnalyzeStartExpectation,
+  runAnalyzeRearm,
   runAnalyzeResume,
   runAnalyzeStatus,
 } from '../../tools/cli/src/commands/analyze-runs.js';
@@ -23,6 +25,15 @@ describe('analyze run CLI status', () => {
       'Verified reset time: 2026-07-20T17:00:00.000Z',
       'Resume: truecourse analyze resume run-interrupted after the provider reset (repository, baseline, rules, configuration, prompts/schemas, provider, and model will be revalidated)',
       'Wait for reset: truecourse analyze resume run-interrupted --wait-for-reset (cancellable; Claude is not contacted before the certified reset time)',
+      'Active completed analysis: analysis-completed · 2026-07-19T09:00:00.000Z · main@abc1234',
+    ]);
+  });
+
+  it('shows the exact bounded ambiguous-rearm acknowledgement beside the safe baseline', () => {
+    expect(formatAnalyzeRunStatus(ambiguousStatus())).toEqual([
+      'Latest run: run-interrupted · running · 1/2 LLM checks complete · 1 pending',
+      'Resume: unavailable — a previously admitted provider call may still be incomplete',
+      'Rearm: truecourse analyze rearm run-interrupted --accept-possible-duplicate-provider-charges 1 (may repeat up to 1 provider call; 1 successful checkpoint is eligible for reuse if revalidation succeeds)',
       'Active completed analysis: analysis-completed · 2026-07-19T09:00:00.000Z · main@abc1234',
     ]);
   });
@@ -85,6 +96,25 @@ describe('analyze run CLI status', () => {
     expect(output).toContain('Usage: truecourse analyze resume [options] <run-id>');
     expect(output).toContain('Resume one exact latest attempted run');
     expect(output).toContain('--wait-for-reset');
+  });
+
+  it('registers `truecourse analyze rearm <run-id>` with an exact duplicate-charge acknowledgement', () => {
+    const output = execFileSync(
+      process.execPath,
+      [
+        '--import',
+        createRequire(import.meta.url).resolve('tsx'),
+        path.resolve('tools/cli/src/index.ts'),
+        'analyze',
+        'rearm',
+        '--help',
+      ],
+      { encoding: 'utf8', timeout: 30_000 },
+    );
+
+    expect(output).toContain('Usage: truecourse analyze rearm [options] <run-id>');
+    expect(output).toContain('Rearm one exact ambiguous attempted run');
+    expect(output).toContain('--accept-possible-duplicate-provider-charges <count>');
   });
 
   it('rejects every explicit parent full-analysis option for Resume', () => {
@@ -160,6 +190,99 @@ describe('analyze run CLI status', () => {
         'Resume complete: analysis-incomplete is now the active completed analysis.',
       );
       expect(lines).toContain('Revalidated and reused 1 successful LLM checkpoint.');
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('requires an exact bounded acknowledgement before registering or rearming', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-rearm-consent-'));
+    const rearm = vi.fn();
+    const registerProject = vi.fn();
+    const configureDiagnostics = vi.fn();
+    try {
+      await expect(runAnalyzeRearm('run-interrupted', {
+        cwd: repoPath,
+        readStatus: async () => ambiguousStatus(),
+        registerProject,
+        rearm,
+        configureDiagnostics,
+      })).rejects.toMatchObject({
+        name: 'AnalyzeRearmCliError',
+        reason: 'consent-required',
+      } satisfies Partial<AnalyzeRearmCliError>);
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(rearm).not.toHaveBeenCalled();
+      expect(configureDiagnostics).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a stale or broader duplicate-call acknowledgement before registering or rearming', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-rearm-bound-'));
+    const rearm = vi.fn();
+    const registerProject = vi.fn();
+    try {
+      await expect(runAnalyzeRearm('run-interrupted', {
+        cwd: repoPath,
+        acceptedMaxRepeatProviderCalls: 2,
+        readStatus: async () => ambiguousStatus(),
+        registerProject,
+        rearm,
+      })).rejects.toMatchObject({
+        name: 'AnalyzeRearmCliError',
+        reason: 'risk-not-accepted',
+      } satisfies Partial<AnalyzeRearmCliError>);
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(rearm).not.toHaveBeenCalled();
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('passes the exact status-bound consent to Core only after explaining duplicate exposure', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-rearm-'));
+    const lines: string[] = [];
+    const rearm = vi.fn(async () => ({
+      analysisId: 'analysis-incomplete',
+      filename: 'analysis-incomplete.json',
+      serviceCount: 1,
+      fileCount: 1,
+      architecture: 'monolith',
+      durationMs: 100,
+      violationsSummary: { total: 0, bySeverity: {} },
+    }));
+    try {
+      await runAnalyzeRearm('run-interrupted', {
+        cwd: repoPath,
+        acceptedMaxRepeatProviderCalls: 1,
+        writeLine: (line) => lines.push(line),
+        readStatus: async () => ambiguousStatus(),
+        registerProject: async () => ({ path: repoPath }) as never,
+        rearm,
+      });
+
+      expect(rearm).toHaveBeenCalledWith(
+        expect.objectContaining({ path: repoPath }),
+        expect.objectContaining({
+          runId: 'run-interrupted',
+          consent: {
+            acceptedRisk: 'repeat-up-to-pending-provider-calls',
+            acceptedMaxRepeatProviderCalls: 1,
+            evidence: ambiguousStatus().latestAttempt!.rearm!.evidence,
+          },
+        }),
+      );
+      expect(lines).toContain(
+        'An earlier provider call may have completed without a durable checkpoint. You accepted repeating up to 1 provider call.',
+      );
+      expect(lines).toContain(
+        'Revalidating repository, completed baseline, rules, configuration, prompts/schemas, provider, and model before any rearm work is admitted.',
+      );
+      expect(lines.at(-1)).toBe(
+        'Analyze Rearm complete: analysis-incomplete is now the active completed analysis.',
+      );
     } finally {
       fs.rmSync(repoPath, { recursive: true, force: true });
     }
@@ -970,4 +1093,38 @@ function blockedStatus(): AnalyzeRunStatus {
       commitHash: 'abc123456',
     },
   };
+}
+
+function ambiguousStatus(): AnalyzeRunStatus {
+  const status = blockedStatus();
+  const attempt = status.latestAttempt!;
+  attempt.state = 'running';
+  attempt.blocked = null;
+  attempt.lastProviderLimit = null;
+  attempt.resume = {
+    available: false,
+    scope: 'structural',
+    reason: 'resume-execution-ambiguous',
+  };
+  attempt.rearm = {
+    scope: 'structural',
+    mode: 'rearm-ambiguous-execution',
+    requiresLatestAttempt: true,
+    requiresRevalidation: true,
+    evidence: {
+      runId: attempt.runId,
+      runRevision: attempt.revision,
+      executionEpoch: {
+        kind: 'initial',
+        attemptNumber: 1,
+        activatedAt: attempt.executionAttempt.activatedAt,
+      },
+      admittedAt: attempt.executionAttempt.initialAdmission!.admittedAt,
+      pendingWorkCount: attempt.counts!.pending,
+    },
+    checkpointedWorkCount: attempt.counts!.succeeded,
+    maxRepeatProviderCalls: attempt.counts!.pending,
+    requiredAcknowledgement: 'possible-duplicate-provider-charges',
+  };
+  return status;
 }

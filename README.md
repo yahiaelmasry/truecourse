@@ -126,8 +126,12 @@ attempt. Fresh rearm requires the exact durable evidence and accepted maximum
 repeat-call count; already-activated or fully checkpointed response-loss
 recovery does not ask for consent again. An activated recovery executes only
 its pending work; a fully checkpointed recovery makes no provider call. CLI
-and dashboard adapters will expose that bounded consent in separate
-contributions.
+status now shows the exact bounded acknowledgement for eligible ambiguous
+attempts, and `truecourse analyze rearm <run-id>
+--accept-possible-duplicate-provider-charges <count>` requires that exact count
+before Core revalidates and admits any provider work. The active completed
+analysis remains canonical until the rearm finishes. Dashboard support remains
+a separate contribution.
 The read-only `truecourse analyze status` command shows the latest attempted run,
 durable progress, and advisory provider reset hint separately from the active
 completed analysis. A complete timezone-qualified Claude reset hint is also
@@ -269,6 +273,7 @@ truecourse analyze --no-stash         # Analyze working tree as-is, no stash
 truecourse analyze --diff             # New/resolved violations from your uncommitted changes
 truecourse analyze status             # Show latest attempted run + active completed analysis
 truecourse analyze resume <run-id>     # Revalidate and resume one exact saved attempt
+truecourse analyze rearm <run-id> --accept-possible-duplicate-provider-charges <count> # Rearm an exact ambiguous run after acknowledging the displayed repeat-call bound
 truecourse analyze --abandon-attempt <run-id> # Explicitly start over; paid calls may repeat
 truecourse list                       # Show violations from latest analysis
 truecourse list --all                 # Show all violations (no pagination)

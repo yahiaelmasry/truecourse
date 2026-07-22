@@ -4,8 +4,14 @@ import { Command } from "commander";
 import * as p from "@clack/prompts";
 import { runAdd } from "./commands/add.js";
 import { runAnalyze, runAnalyzeDiff } from "./commands/analyze.js";
-import { runAnalyzeResume, runAnalyzeStatus } from "./commands/analyze-runs.js";
 import {
+  AnalyzeRearmCliError,
+  runAnalyzeRearm,
+  runAnalyzeResume,
+  runAnalyzeStatus,
+} from "./commands/analyze-runs.js";
+import {
+  AnalysisRearmUnavailableError,
   AnalysisResumeUnavailableError,
   AnalysisSessionLimitError,
 } from "@truecourse/core/commands/analyze-in-process";
@@ -218,6 +224,52 @@ analyzeCmd
       } else if (error instanceof AnalysisResumeUnavailableError) {
         p.log.error(
           `${error.message}. No pending provider work was admitted after eligibility failed; inspect truecourse analyze status.`,
+        );
+      } else {
+        p.log.error(error instanceof Error ? error.message : String(error));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+analyzeCmd
+  .command("rearm <run-id>")
+  .description("Rearm one exact ambiguous attempted run")
+  .requiredOption(
+    "--accept-possible-duplicate-provider-charges <count>",
+    "Acknowledge the exact maximum provider calls that may repeat, as shown by analyze status",
+    (value) => Number(value),
+  )
+  .action(async (
+    runId: string,
+    options: { acceptPossibleDuplicateProviderCharges: number },
+    command: Command,
+  ) => {
+    const parentOptions = command.parent ? explicitAnalyzeOptions(command.parent) : [];
+    if (parentOptions.length > 0) {
+      p.log.error(
+        `Rearm cannot be combined with full-analysis options: ${parentOptions.join(", ")}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    p.intro("Rearming ambiguous analysis");
+    try {
+      await runAnalyzeRearm(runId, {
+        acceptedMaxRepeatProviderCalls: options.acceptPossibleDuplicateProviderCharges,
+      });
+      p.outro("Analyze Rearm complete");
+    } catch (error) {
+      if (error instanceof AnalysisSessionLimitError) {
+        p.log.error(
+          `${error.message} Analyze Rearm paused again. Inspect truecourse analyze status; the active completed analysis remains canonical.`,
+        );
+      } else if (
+        error instanceof AnalysisRearmUnavailableError
+        || error instanceof AnalyzeRearmCliError
+      ) {
+        p.log.error(
+          `${error.message}. No provider work was admitted after eligibility or acknowledgement failed; inspect truecourse analyze status.`,
         );
       } else {
         p.log.error(error instanceof Error ? error.message : String(error));
