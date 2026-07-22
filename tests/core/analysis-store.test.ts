@@ -29,10 +29,7 @@ import {
   writeLatest,
 } from '../../packages/core/src/lib/analysis-store';
 import {
-  acquireAnalyzeLock,
-  AnalyzeLockError,
   atomicWriteJson,
-  releaseAnalyzeLock,
 } from '../../packages/core/src/lib/atomic-write';
 import type {
   AnalysisSnapshot,
@@ -179,25 +176,6 @@ describe('atomicWriteJson', () => {
     atomicWriteJson(target, { v: 1 });
     atomicWriteJson(target, { v: 2 });
     expect(JSON.parse(fs.readFileSync(target, 'utf-8'))).toEqual({ v: 2 });
-  });
-});
-
-describe('analyze lock', () => {
-  it('acquires and releases cleanly', async () => {
-    await acquireAnalyzeLock(repoPath);
-    expect(fs.existsSync(path.join(repoPath, '.truecourse/.analyze.lock'))).toBe(true);
-    await releaseAnalyzeLock(repoPath);
-    expect(fs.existsSync(path.join(repoPath, '.truecourse/.analyze.lock'))).toBe(false);
-  });
-
-  it('rejects a second acquire while held (file lock fail-fasts)', async () => {
-    await acquireAnalyzeLock(repoPath);
-    await expect(acquireAnalyzeLock(repoPath)).rejects.toThrowError(AnalyzeLockError);
-    await releaseAnalyzeLock(repoPath);
-  });
-
-  it('release on a non-existent lock is a no-op', async () => {
-    await expect(releaseAnalyzeLock(repoPath)).resolves.toBeUndefined();
   });
 });
 

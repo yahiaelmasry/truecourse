@@ -29,7 +29,7 @@ pnpm test         # Run all tests (vitest)
 
 - **No workarounds.** Always find and fix the root cause. Do not use hacks, fallbacks, or temporary patches to bypass issues. If something isn't working, investigate why and fix it properly.
 - **Dev servers.** Do not start, stop, or restart dev servers. The user manages `pnpm dev` from their terminal. If a restart is needed (e.g. `.env` change), tell the user.
-- **Storage.** The store is file-based (no DB). Writes go through `packages/core/src/lib/analysis-store.ts` via `atomicWriteJson`. Reads are mtime-cached on `LATEST.json`. Concurrent analyses are prevented by `.analyze.lock` (O_EXCL).
+- **Storage.** The store is file-based (no DB). Writes go through `packages/core/src/lib/analysis-store.ts` via `atomicWriteJson`. Reads are mtime-cached on `LATEST.json`. Concurrent OSS analyses use a native kernel lock on the permanent, versioned `.analyze.lock` marker. Never delete, replace, or edit a valid native marker; ownership is released by closing its exact descriptor, not by unlinking the file.
 
 ## Conventions
 

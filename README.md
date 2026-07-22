@@ -72,6 +72,16 @@ The first `truecourse analyze` creates `.truecourse/` in your repo. Three files 
 
 Everything else (`analyses/`, `diff.json`, `history.json`, `ui-state.json`, `logs/`, `.analyze.lock`) is local-only and added to `.truecourse/.gitignore` automatically.
 
+`.analyze.lock` is a permanent, versioned marker used for a native kernel lock;
+analyze releases ownership by closing the exact open descriptor, including when
+the process crashes. Do not delete, replace, or edit a valid native marker. The
+community file lock is supported on common local filesystems on macOS 12+ (x64
+and arm64), Windows (x64 and arm64), and glibc-based Linux (x64 and arm64); musl
+Linux and network/distributed filesystems are not currently supported. If an
+older PID-and-timestamp marker or an incomplete/malformed marker is found,
+TrueCourse fails closed with recovery guidance instead of guessing that it is
+stale or migrating it automatically.
+
 Analyze attempts are tracked separately from the completed baseline under
 `.truecourse/analyses/runs/`. Each `<runId>.json` is an append-only-attempt
 journal entry, while `LATEST_ATTEMPT.json` points to the newest attempt. These

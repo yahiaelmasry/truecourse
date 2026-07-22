@@ -270,6 +270,7 @@
     "cross-spawn": "^7.0.6",
     "dagre": "^0.8.5",
     "dotenv": "^16.4.0",
+    "fs-native-extensions": "1.5.0",
     "js-yaml": "^4.1.0",
     "p-limit": "^7.3.0",
     "posthog-node": "^4.0.0",

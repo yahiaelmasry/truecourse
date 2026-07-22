@@ -19,14 +19,12 @@ export function atomicWriteJson(targetPath: string, data: unknown): void {
 
 // The analyze lock moved to `./analyze-lock.ts` (it became a pluggable seam so
 // the enterprise edition can use a Postgres advisory lock). Re-exported here for
-// back-compat with existing import sites.
+// Analyze-lock primitives retained here for existing import sites.
 export {
   AnalyzeLockError,
-  acquireAnalyzeLock,
-  releaseAnalyzeLock,
+  withAnalyzeLock,
   type AnalyzeLock,
   getAnalyzeLock,
   setAnalyzeLock,
   resetAnalyzeLock,
 } from './analyze-lock.js';
-

@@ -44,8 +44,13 @@ import {
   setLastAnalyzed,
   getProjectBySlug,
 } from '../../packages/core/src/config/registry';
+import {
+  getRegistryStore as getDashboardRegistryStore,
+  setRegistryStore as setDashboardRegistryStore,
+} from '@truecourse/core/config/registry';
 import { getRepoTruecourseDir } from '../../packages/core/src/config/paths';
 import { updateProjectConfig } from '../../packages/core/src/config/project-config';
+import { withAnalyzeLifecycleLock } from '../../packages/core/src/lib/analyze-lifecycle-lock';
 import type {
   AnalysisSnapshot,
   DiffSnapshot,
@@ -401,14 +406,57 @@ describe('dashboard routes (seeded store)', () => {
       await request(app).post('/api/repos').send({}).expect(400);
     });
 
-    it('DELETE /api/repos/:id 204 + removes .truecourse', async () => {
+    it('DELETE /api/repos/:id preserves the permanent lock marker and ignore bookkeeping', async () => {
       const tcDir = getRepoTruecourseDir(fixture.repoPath);
+      await withAnalyzeLifecycleLock(fixture.repoPath, async () => undefined);
+      const marker = path.join(tcDir, '.analyze.lock');
+      const markerBefore = fs.statSync(marker);
       expect(fs.existsSync(tcDir)).toBe(true);
 
       await request(app).delete(`/api/repos/${fixture.project.slug}`).expect(204);
 
       expect(await getProjectBySlug(fixture.project.slug)).toBeNull();
-      expect(fs.existsSync(tcDir)).toBe(false);
+      expect(fs.readdirSync(tcDir).sort()).toEqual(['.analyze.lock', '.gitignore']);
+      expect(fs.readFileSync(marker, 'utf8')).toBe('TRUECOURSE_ANALYZE_LOCK\nversion=1\n');
+      const markerAfter = fs.statSync(marker);
+      expect({ dev: markerAfter.dev, ino: markerAfter.ino }).toEqual({
+        dev: markerBefore.dev,
+        ino: markerBefore.ino,
+      });
+    });
+
+    it('DELETE /api/repos/:id cannot remove state through a held lifecycle lock', async () => {
+      const tcDir = getRepoTruecourseDir(fixture.repoPath);
+      await withAnalyzeLifecycleLock(fixture.repoPath, async () => {
+        const response = await request(app)
+          .delete(`/api/repos/${fixture.project.slug}`)
+          .expect(409);
+        expect(response.body.error).toMatch(/re-enter|already running/i);
+        expect(await getProjectBySlug(fixture.project.slug)).not.toBeNull();
+        expect(fs.existsSync(path.join(tcDir, 'LATEST.json'))).toBe(true);
+      });
+    });
+
+    it('DELETE /api/repos/:id preserves state when unregistering fails', async () => {
+      const tcDir = getRepoTruecourseDir(fixture.repoPath);
+      const registry = getDashboardRegistryStore();
+      const failingRegistry = new Proxy(registry, {
+        get(target, property, receiver) {
+          if (property === 'unregisterProject') {
+            return async () => { throw new Error('registry persistence failed'); };
+          }
+          const value = Reflect.get(target, property, receiver) as unknown;
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      setDashboardRegistryStore(failingRegistry);
+      try {
+        await request(app).delete(`/api/repos/${fixture.project.slug}`).expect(500);
+      } finally {
+        setDashboardRegistryStore(registry);
+      }
+      expect(await getProjectBySlug(fixture.project.slug)).not.toBeNull();
+      expect(fs.existsSync(path.join(tcDir, 'LATEST.json'))).toBe(true);
     });
 
     it('GET /api/repos/:id/config returns the project config', async () => {

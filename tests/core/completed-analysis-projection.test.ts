@@ -10,10 +10,7 @@ import {
   readHistory,
   writeDiff,
 } from '../../packages/core/src/lib/analysis-store';
-import {
-  acquireAnalyzeLock,
-  releaseAnalyzeLock,
-} from '../../packages/core/src/lib/analyze-lock';
+import { withAnalyzeLifecycleLock } from '../../packages/core/src/lib/analyze-lifecycle-lock';
 import {
   getProjectBySlug,
   registerProject,
@@ -149,12 +146,7 @@ function historyFor(value: AnalysisSnapshot): HistoryEntry {
 }
 
 async function underLifecycleLock<T>(operation: () => Promise<T>): Promise<T> {
-  await acquireAnalyzeLock(repoPath);
-  try {
-    return await operation();
-  } finally {
-    await releaseAnalyzeLock(repoPath);
-  }
+  return withAnalyzeLifecycleLock(repoPath, operation);
 }
 
 async function promote(value: AnalysisSnapshot, expectedBaseline: LatestSnapshot | null): Promise<void> {

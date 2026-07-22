@@ -6,9 +6,16 @@ import { CreateRepoSchema, BrowseDirQuerySchema } from '@truecourse/shared';
 import { getCapabilities } from '../ee-loader.js';
 import { createAppError } from '@truecourse/core/lib/errors';
 import { getGit } from '@truecourse/core/lib/git';
-import { getRepoTruecourseDir } from '@truecourse/core/config/paths';
+import {
+  ensureRepoTruecourseDir,
+  getRepoTruecourseDir,
+} from '@truecourse/core/config/paths';
 import { readProjectConfig, updateProjectConfig } from '@truecourse/core/config/project-config';
 import { readLatest } from '@truecourse/core/lib/analysis-store';
+import {
+  AnalyzeLockError,
+  withAnalyzeLock,
+} from '@truecourse/core/lib/analyze-lock';
 import { resolveLatestEvent } from '@truecourse/core/commands/repo-events';
 import { getRules } from '@truecourse/core/services/rules';
 import {
@@ -246,9 +253,9 @@ router.get('/:id/branches', async (req: Request, res: Response, next: NextFuncti
   }
 });
 
-// DELETE /api/repos/:id - Unregister the project, close its PGlite, and
-// remove `<repo>/.truecourse/` from disk. The repo source itself is never
-// touched.
+// DELETE /api/repos/:id - Unregister the project and remove its local
+// TrueCourse state. The permanent native-lock marker and its gitignore entry
+// remain in place so future analyzes always contend on the same inode.
 router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const slug = req.params.id as string;
@@ -257,14 +264,32 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
       throw createAppError('Project not found', 404);
     }
 
-    const tcDir = getRepoTruecourseDir(entry.path);
-    if (fs.existsSync(tcDir)) {
-      fs.rmSync(tcDir, { recursive: true, force: true });
-    }
-
-    await unregisterProject(slug);
+    await withAnalyzeLock(entry.path, async () => {
+      // Make the registry authoritative first. If unregistering fails, no
+      // project state has been removed. If later cleanup fails, the project is
+      // already absent rather than becoming a live-looking ghost entry.
+      await unregisterProject(slug);
+      const tcDir = getRepoTruecourseDir(entry.path);
+      if (fs.existsSync(tcDir)) {
+        // File-backed OSS locking has created the directory and marker before
+        // this callback. Recreate only missing ignore bookkeeping here; hosted
+        // opaque repository identities must not create relative directories.
+        ensureRepoTruecourseDir(entry.path);
+        for (const child of fs.readdirSync(tcDir)) {
+          if (child === '.analyze.lock' || child === '.gitignore') continue;
+          fs.rmSync(path.join(tcDir, child), { recursive: true, force: true });
+        }
+      }
+    });
     res.status(204).send();
   } catch (error) {
+    if (
+      error instanceof AnalyzeLockError
+      && (error.reason === 'contended' || error.reason === 'reentrant')
+    ) {
+      next(createAppError(error.message, 409));
+      return;
+    }
     next(error);
   }
 });

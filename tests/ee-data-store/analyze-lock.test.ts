@@ -16,7 +16,7 @@ interface QueryCall {
   params: unknown[];
 }
 
-function fakePool(opts: { failOn?: 'lock' | 'unlock' } = {}) {
+function fakePool(opts: { failOn?: 'lock' | 'unlock'; releaseThrows?: boolean } = {}) {
   const queries: QueryCall[] = [];
   const released: number[] = [];
   const releaseArgs: unknown[] = []; // what was passed to client.release()
@@ -38,6 +38,7 @@ function fakePool(opts: { failOn?: 'lock' | 'unlock' } = {}) {
         release: (arg?: unknown) => {
           released.push(id);
           releaseArgs.push(arg);
+          if (opts.releaseThrows) throw new Error('release failed');
         },
       };
     },
@@ -50,13 +51,13 @@ describe('PgAnalyzeLock', () => {
     const { pool, queries, released } = fakePool();
     const lock = new PgAnalyzeLock(pool);
 
-    await lock.acquire('acme/api');
-    expect(queries).toEqual([
-      { client: 0, sql: expect.stringContaining('pg_advisory_lock(hashtext($1))'), params: ['acme/api'] },
-    ]);
-    expect(released).toEqual([]); // still held — connection NOT returned
-
-    await lock.release('acme/api');
+    await expect(lock.withLock('acme/api', async () => {
+      expect(queries).toEqual([
+        { client: 0, sql: expect.stringContaining('pg_advisory_lock(hashtext($1))'), params: ['acme/api'] },
+      ]);
+      expect(released).toEqual([]); // still held — connection NOT returned
+      return 'done';
+    })).resolves.toBe('done');
     expect(queries[1]).toEqual({
       client: 0, // same connection that took the lock
       sql: expect.stringContaining('pg_advisory_unlock(hashtext($1))'),
@@ -65,56 +66,61 @@ describe('PgAnalyzeLock', () => {
     expect(released).toEqual([0]); // connection returned exactly once
   });
 
-  it('keeps a separate connection per key', async () => {
-    const { pool, released } = fakePool();
+  it('destroys the suspect connection if the lock query itself fails', async () => {
+    const { pool, released, releaseArgs } = fakePool({ failOn: 'lock' });
     const lock = new PgAnalyzeLock(pool);
-
-    await lock.acquire('a');
-    await lock.acquire('b');
-    await lock.release('a');
-    expect(released).toEqual([0]); // only a's connection freed; b still held
-    await lock.release('b');
-    expect(released).toEqual([0, 1]);
-  });
-
-  it('release without a held lock is a no-op (does not touch the pool)', async () => {
-    const { pool, queries, released } = fakePool();
-    const lock = new PgAnalyzeLock(pool);
-    await lock.release('never-acquired');
-    expect(queries).toEqual([]);
-    expect(released).toEqual([]);
-  });
-
-  it('returns the connection if the lock query itself fails', async () => {
-    const { pool, released } = fakePool({ failOn: 'lock' });
-    const lock = new PgAnalyzeLock(pool);
-    await expect(lock.acquire('acme/api')).rejects.toThrow('boom');
+    await expect(lock.withLock('acme/api', async () => 'unreachable')).rejects.toThrow('boom');
     expect(released).toEqual([0]); // no leaked connection on failure
-    // And a subsequent release is a no-op (it was never recorded as held).
-    await lock.release('acme/api');
-    expect(released).toEqual([0]);
+    expect(releaseArgs[0]).toBeInstanceOf(Error);
   });
 
   it('refuses a re-entrant acquire of the same key (self-deadlock guard)', async () => {
     const { pool, released } = fakePool();
     const lock = new PgAnalyzeLock(pool);
-    await lock.acquire('acme/api');
-    // A second acquire on a different pooled connection would block forever on
-    // the lock this process already holds — fail fast instead.
-    await expect(lock.acquire('acme/api')).rejects.toThrow(/already held/);
-    expect(released).toEqual([]); // the held connection is untouched
-    await lock.release('acme/api');
-    expect(released).toEqual([0]); // still releasable exactly once
+    await lock.withLock('acme/api', async () => {
+      await expect(lock.withLock('acme/api', async () => 'nested')).rejects.toMatchObject({
+        reason: 'reentrant',
+      });
+      expect(released).toEqual([]); // the held connection is untouched
+    });
+    expect(released).toEqual([0]);
   });
 
   it('destroys the connection (passes the error to release) when unlock fails', async () => {
-    const { pool, released, releaseArgs } = fakePool({ failOn: 'unlock' });
+    const { pool, released, releaseArgs } = fakePool({
+      failOn: 'unlock',
+      releaseThrows: true,
+    });
     const lock = new PgAnalyzeLock(pool);
-    await lock.acquire('acme/api');
-    // release must not throw even though the unlock query does.
-    await expect(lock.release('acme/api')).resolves.toBeUndefined();
+    // Cleanup must not replace a successful operation result when unlock fails.
+    await expect(lock.withLock('acme/api', async () => 'complete')).resolves.toBe('complete');
     expect(released).toEqual([0]);
     // A suspect connection is destroyed, not returned clean: release got an Error.
     expect(releaseArgs[0]).toBeInstanceOf(Error);
+  });
+
+  it('returns the exact client and preserves the callback error', async () => {
+    const { pool, released } = fakePool();
+    const lock = new PgAnalyzeLock(pool);
+    await expect(lock.withLock('acme/api', async () => {
+      throw new Error('operation failed');
+    })).rejects.toThrow('operation failed');
+    expect(released).toEqual([0]);
+  });
+
+  it('preserves a callback that throws undefined while still releasing the client', async () => {
+    const { pool, released } = fakePool();
+    const lock = new PgAnalyzeLock(pool);
+    let rejected = false;
+    try {
+      await lock.withLock('acme/api', async () => {
+        throw undefined;
+      });
+    } catch (error) {
+      rejected = true;
+      expect(error).toBeUndefined();
+    }
+    expect(rejected).toBe(true);
+    expect(released).toEqual([0]);
   });
 });

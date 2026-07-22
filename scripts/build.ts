@@ -10,8 +10,9 @@
  * 5. Generate publishable package.json + install production deps
  */
 
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -109,6 +110,7 @@ run(
     '--external:web-tree-sitter',
     '--external:pyright',
     '--external:typescript',
+    '--external:fs-native-extensions',
     // Keep the commercial enterprise plugin OUT of the community
     // artifact. The server reaches it only via a guarded dynamic
     // import, which resolves to nothing here → runs as community.
@@ -138,6 +140,7 @@ run(
     '--external:web-tree-sitter',
     '--external:pyright',
     '--external:typescript',
+    '--external:fs-native-extensions',
     // Community artifact excludes the commercial enterprise plugin.
     '--external:@truecourse/ee-server',
     versionDefine,
@@ -236,6 +239,7 @@ const publishPkg = {
     '@clack/prompts': cliPkg.dependencies['@clack/prompts'],
     'typescript': analyzerPkg.dependencies['typescript'],
     'web-tree-sitter': analyzerPkg.dependencies['web-tree-sitter'],
+    'fs-native-extensions': corePkg.dependencies['fs-native-extensions'],
   },
   optionalDependencies: {
     'node-windows': '^1.0.0-beta.8',
@@ -259,6 +263,64 @@ fs.writeFileSync(
 // 10. Install production dependencies
 console.log('\n=== Installing dependencies ===');
 run('npm install --omit=dev --legacy-peer-deps', DIST);
+
+// Exercise the installed publish artifact through its real CLI entry. This is
+// deliberately after the clean production install: it proves the externalized
+// native addon is present, loadable, and able to acquire/release the bundled
+// core lifecycle lock instead of accidentally resolving a workspace package.
+console.log('\n=== Smoke testing distributed analyze lock ===');
+const distRequire = createRequire(path.join(DIST, 'package.json'));
+const distributedNativePath = fs.realpathSync(distRequire.resolve('fs-native-extensions'));
+const distributedNodeModules = `${fs.realpathSync(path.join(DIST, 'node_modules'))}${path.sep}`;
+if (!distributedNativePath.startsWith(distributedNodeModules)) {
+  throw new Error(
+    `distributed native analyze lock resolved outside dist/node_modules: ${distributedNativePath}`,
+  );
+}
+for (const bundle of ['cli.mjs', 'server.mjs']) {
+  if (!fs.readFileSync(path.join(DIST, bundle), 'utf8').includes('fs-native-extensions')) {
+    throw new Error(`${bundle} does not retain the external native analyze-lock load`);
+  }
+}
+const lockSmokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-dist-lock-'));
+const lockSmokeHome = path.join(lockSmokeRoot, 'home');
+const lockSmokeRepo = path.join(lockSmokeRoot, 'repo');
+try {
+  fs.mkdirSync(lockSmokeRepo, { recursive: true });
+  fs.writeFileSync(path.join(lockSmokeRepo, 'package.json'), '{"type":"module"}\n');
+  fs.writeFileSync(path.join(lockSmokeRepo, 'index.ts'), 'export const ready = true;\n');
+  execSync('git init -q -b main', { cwd: lockSmokeRepo, stdio: 'ignore' });
+  execSync('git add -A', { cwd: lockSmokeRepo, stdio: 'ignore' });
+  execSync(
+    'git -c user.name=TrueCourse -c user.email=smoke@truecourse.dev -c commit.gpgsign=false commit -q -m init',
+    { cwd: lockSmokeRepo, stdio: 'ignore' },
+  );
+  execFileSync(process.execPath, [
+    path.join(DIST, 'cli.mjs'),
+    'analyze',
+    '--no-llm',
+    '--no-stash',
+    '--no-skills',
+  ], {
+    cwd: lockSmokeRepo,
+    env: {
+      ...process.env,
+      CI: 'true',
+      HOME: lockSmokeHome,
+      USERPROFILE: lockSmokeHome,
+      TRUECOURSE_HOME: lockSmokeHome,
+      TRUECOURSE_TELEMETRY: '0',
+    },
+    stdio: 'inherit',
+  });
+  const marker = path.join(lockSmokeRepo, '.truecourse', '.analyze.lock');
+  if (fs.readFileSync(marker, 'utf8') !== 'TRUECOURSE_ANALYZE_LOCK\nversion=1\n') {
+    throw new Error('distributed analyze-lock smoke produced an invalid marker');
+  }
+  console.log('  distributed CLI loaded, acquired, and released the native analyze lock');
+} finally {
+  fs.rmSync(lockSmokeRoot, { recursive: true, force: true });
+}
 
 console.log('\n=== Build complete ===');
 console.log(`Output: ${DIST}`);

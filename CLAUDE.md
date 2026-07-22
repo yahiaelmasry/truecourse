@@ -38,7 +38,7 @@ Per-repo layout under `<repo>/.truecourse/`:
 - `config.json` — per-repo settings (committable)
 - `ui-state.json` — graph positions + collapse state (gitignored)
 - `logs/` — per-repo analyze logs (gitignored)
-- `.analyze.lock` — transient, held for the duration of an analyze (gitignored)
+- `.analyze.lock` — permanent, versioned native-lock marker (gitignored); the kernel lock is held only for the analyze lifecycle. Never delete, replace, or edit a valid native marker.
 - `specs/` — the spec-consolidation store for `truecourse spec scan`:
   - `specs/corpus.json` — **committable** (LATEST.json convention). The curated doc corpus produced by the corpus-path scan (`curate()`): kept docs + their area tags, docs grouped by area, within-area overlap flags, auto-detected doc→doc relations, and the relevance-dropped docs (`skippedDocs`: path + reason) so the dashboard can surface "not included" docs for force-include. Expensive to regenerate (LLM tagging) and not purely deterministic, so teammates inherit it from git.
   - `specs/decisions.json` — **committable**, user-authored. Curated resolutions: doc→doc `relations[]` (replace/precedence/keep-both), `manualAreas[]` (area-tag overrides), `manualIncludes[]` (relevance force-includes), `manualExcludes[]` (force-excludes — drop an otherwise-kept doc), and `conflictResolutions[]` (section-scoped conflict verdicts — pick-a-side / dismissal keyed by dispute identity; the losing side's disputed claim is suppressed at guard generate).
@@ -73,7 +73,7 @@ The pre-flight LLM estimate (spec scan and guard generate) is **token + ceiling-
 
 - **No workarounds.** Always find and fix the root cause. Do not use hacks, fallbacks, or temporary patches to bypass issues. If something isn't working, investigate why and fix it properly.
 - **Dev servers.** Do not start, stop, or restart dev servers. The user manages `pnpm dev` from their terminal. If a restart is needed (e.g. `.env` change), tell the user.
-- **Storage.** The store is file-based. Writes go through `packages/core/src/lib/analysis-store.ts` via `atomicWriteJson` (write-to-tmp + rename for atomicity). Reads are mtime-cached on `LATEST.json`. Concurrent analyses are prevented by `.analyze.lock` (O_EXCL).
+- **Storage.** The store is file-based. Writes go through `packages/core/src/lib/analysis-store.ts` via `atomicWriteJson` (write-to-tmp + rename for atomicity). Reads are mtime-cached on `LATEST.json`. Concurrent OSS analyses use a native kernel lock on the permanent `.analyze.lock` marker. Never delete, replace, or edit a valid native marker; closing the exact descriptor releases ownership after normal exit or a crash.
 - **No Claude Code session details in commits/PRs/issues.** Never put a `Claude-Session:` trailer or any `https://claude.ai/code/session…` URL into a commit message, PR body, or issue body — strip them before committing or opening the PR/issue. Default commit/PR formatting is otherwise fine.
 
 ## Releasing

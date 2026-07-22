@@ -7,6 +7,30 @@ on:
     branches: [main]
 
 jobs:
+  analyze-lock-platforms:
+    name: Analyze lock (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test native analyze lock
+        run: pnpm exec vitest run tests/core/analyze-lifecycle-lock.test.ts
+
   test:
     runs-on: ubuntu-latest
     steps:

@@ -29,7 +29,7 @@ vi.mock('../../apps/dashboard/server/src/socket/handlers', async (importOriginal
 import { analyzeInProcess } from '../../packages/core/src/commands/analyze-in-process';
 import { analyzeCoreAndFinalize } from '../../packages/core/src/commands/analyze-core';
 import { readLatest, clearLatestCache } from '../../packages/core/src/lib/analysis-store';
-import { acquireAnalyzeLock, releaseAnalyzeLock } from '../../packages/core/src/lib/atomic-write';
+import { withAnalyzeLifecycleLock } from '../../packages/core/src/lib/analyze-lifecycle-lock';
 import {
   registerProject,
   resetRegistryStore,
@@ -133,10 +133,9 @@ describe('analyzeInProcess with codeDir — code ≠ storage key (the EE flow)',
     );
 
     await finalizerEntered;
-    await expect(acquireAnalyzeLock(keyDir)).rejects.toThrow(/already running/i);
+    await expect(withAnalyzeLifecycleLock(keyDir, async () => 'nested')).rejects.toThrow(/already running|re-enter/i);
     allowFinalizer();
     await expect(lifecycle).resolves.toEqual(expect.any(String));
-    await expect(acquireAnalyzeLock(keyDir)).resolves.toBeUndefined();
-    await releaseAnalyzeLock(keyDir);
+    await expect(withAnalyzeLifecycleLock(keyDir, async () => 'available')).resolves.toBe('available');
   }, 30_000);
 });
