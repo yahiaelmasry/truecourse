@@ -122,10 +122,21 @@ describe('PgRegistryStore (pglite)', () => {
     expect(e.slug).toBe('my-service');
   });
 
-  it('touchProject + setLastAnalyzed update timestamps; unregister returns found/not-found', async () => {
+  it('touchProject + lastAnalyzed projection update timestamps; unregister returns found/not-found', async () => {
     await store.registerProject('/a/myrepo');
-    await store.setLastAnalyzed('myrepo', '2026-05-01T00:00:00.000Z');
-    expect((await store.getProjectBySlug('myrepo'))?.lastAnalyzed).toBe('2026-05-01T00:00:00.000Z');
+    const newer = '2026-05-02T00:00:00.000Z';
+    await expect(store.ensureLastAnalyzed('myrepo', newer)).resolves.toBe('updated');
+    await expect(store.ensureLastAnalyzed('myrepo', newer)).resolves.toBe('present');
+    await expect(store.ensureLastAnalyzed('myrepo', '2026-05-01T00:00:00.000Z'))
+      .resolves.toBe('superseded');
+    expect((await store.getProjectBySlug('myrepo'))?.lastAnalyzed).toBe(newer);
+    await expect(store.ensureLastAnalyzed('ghost', newer)).rejects.toThrow(
+      'Cannot project lastAnalyzed for an untracked project',
+    );
+    await expect(store.setLastAnalyzed('ghost', newer)).resolves.toBeUndefined();
+    await expect(store.ensureLastAnalyzed('myrepo', 'not-a-timestamp')).rejects.toThrow(
+      'lastAnalyzed must be a canonical ISO timestamp',
+    );
 
     await store.touchProject('myrepo'); // no throw; updates lastOpened
     await store.touchProject('ghost'); // no-op for unknown slug
@@ -133,5 +144,29 @@ describe('PgRegistryStore (pglite)', () => {
     expect(await store.unregisterProject('ghost')).toBe(false);
     expect(await store.unregisterProject('myrepo')).toBe(true);
     expect(await store.readRegistry()).toEqual([]);
+  });
+
+  it('rejects a malformed stored lastAnalyzed value without replacing it', async () => {
+    await store.registerProject('/a/myrepo');
+    await client.exec("UPDATE registry SET last_analyzed = 'malformed' WHERE slug = 'myrepo'");
+
+    await expect(store.ensureLastAnalyzed(
+      'myrepo',
+      '2026-05-01T00:00:00.000Z',
+    )).rejects.toThrow('Stored lastAnalyzed must be a canonical ISO timestamp');
+    expect((await store.getProjectBySlug('myrepo'))?.lastAnalyzed).toBe('malformed');
+  });
+
+  it('keeps the newest lastAnalyzed value under competing projections', async () => {
+    await store.registerProject('/a/myrepo');
+    const newer = '2026-05-02T00:00:00.000Z';
+    const older = '2026-05-01T00:00:00.000Z';
+
+    await Promise.all([
+      store.ensureLastAnalyzed('myrepo', newer),
+      store.ensureLastAnalyzed('myrepo', older),
+    ]);
+
+    expect((await store.getProjectBySlug('myrepo'))?.lastAnalyzed).toBe(newer);
   });
 });

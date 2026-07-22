@@ -2,9 +2,19 @@
  * TypeScript shapes for the file-based analysis store.
  *
  *   analyses/<iso>_<short-uuid>.json  → AnalysisSnapshot  (per-analysis file)
+ *   analyses/.promotions/<filename>   → local prepared-promotion marker (schema v1)
  *   LATEST.json                        → LatestSnapshot    (materialized current state)
  *   history.json                       → History           (summaries for cross-analysis queries)
  *   diff.json                          → DiffSnapshot      (active diff against LATEST)
+ *   analyses/runs/<runId>.json         → attempted-run journal (local, versioned separately)
+ *   analyses/runs/LATEST_ATTEMPT.json  → pointer to the newest attempted run (local)
+ *
+ * Attempted-run journals are intentionally outside the completed snapshot
+ * shapes below. Their schema and storage contract live in
+ * `lib/analyze-run-journal.ts`; incomplete findings never become LATEST truth.
+ * Prepared-promotion markers are owned by `lib/analysis-store.ts`. They bind
+ * the exact expected baseline and candidate while `LATEST.json` remains the
+ * completed-baseline commit point; they are removed after promotion recovery.
  *
  * UUIDs are strings, timestamps are ISO-8601 strings.
  */

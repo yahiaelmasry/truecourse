@@ -222,7 +222,7 @@ export function computeViolationLifecycle(
   const resolvedRefs: ResolvedViolationRef[] = [];
 
   // If a new violation has the same title as a previous one, treat the
-  // previous as replaced (drop it from the carried-forward set).
+  // previous as replaced and record its exact ID as resolved in the delta.
   const newTitles = new Set(newViolations.map((v) => v.title.toLowerCase().trim()));
 
   // Carry forward or resolve previous violations
@@ -246,7 +246,10 @@ export function computeViolationLifecycle(
           : null,
     };
 
-    if (resolvedSet.has(prev.id)) {
+    if (
+      resolvedSet.has(prev.id)
+      || newTitles.has(prev.title.toLowerCase().trim())
+    ) {
       resolved.push({
         id: randomUUID(),
         type: prev.type,
@@ -278,7 +281,7 @@ export function computeViolationLifecycle(
         createdAt: now,
       });
       resolvedRefs.push({ id: prev.id, resolvedAt: now });
-    } else if (!newTitles.has(prev.title.toLowerCase().trim())) {
+    } else {
       unchanged.push({
         id: randomUUID(),
         type: prev.type,

@@ -7,40 +7,81 @@ import pLimit, { type LimitFunction } from 'p-limit';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { registerChildProcess, unregisterChildProcess } from '../analysis-registry.js';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { ZodType } from 'zod';
 import type { Violation } from '@truecourse/shared';
 import {
   isLlmSessionLimitError,
   parseLlmSessionLimitError,
+  resolveEnvelopeModel,
   type LlmSessionLimitError,
   type LlmTransport,
 } from '@truecourse/shared/llm';
 import { config } from '../../config/index.js';
 import {
   getPrompt,
-  buildServiceTemplateVars,
-  buildDatabaseTemplateVars,
-  buildModuleTemplateVars,
-  buildCodeTemplateVars,
   buildFlowTemplateVars,
-  resolveId,
-  resolveIds,
   type FlowEnrichmentContext,
   type PromptIdMap,
 } from './prompts.js';
 import {
-  ServiceViolationOutputSchema,
-  DatabaseLifecycleViolationOutputSchema,
-  DatabaseViolationOutputSchema,
-  ModuleViolationOutputSchema,
-  DiffViolationOutputSchema,
-  LifecycleServiceOutputSchema,
-  CodeViolationOutputSchema,
-  CodeViolationLifecycleOutputSchema,
   FlowEnrichmentOutputSchema,
 } from './schemas.js';
+import {
+  type CodeViolationLifecycleOutput,
+  type CodeViolationOutput,
+  type PreparedCodeOwnership,
+} from './prepared-code-violation-request.js';
+import type {
+  PreparedLifecycleServiceViolationRequest,
+  PreparedNormalServiceViolationRequest,
+  ServiceLifecycleViolationOutput,
+  ServiceViolationOutput,
+} from './prepared-service-violation-request.js';
+import type {
+  DatabaseLifecycleViolationOutput,
+  DatabaseViolationOutput,
+  PreparedLifecycleDatabaseViolationRequest,
+  PreparedNormalDatabaseViolationRequest,
+} from './prepared-database-violation-request.js';
+import type {
+  ModuleLifecycleViolationOutput,
+  ModuleViolationOutput,
+  PreparedLifecycleModuleViolationRequest,
+  PreparedNormalModuleViolationRequest,
+} from './prepared-module-violation-request.js';
+import {
+  serializePreparedRequestSchema,
+  type PreparedLlmRequest,
+} from './prepared-request.js';
+import {
+  planCodeViolationWork,
+  type PlannedCodeViolationWork,
+} from './code-work-planner.js';
+import {
+  planDatabaseViolationWork,
+  type PlannedDatabaseViolationWork,
+} from './database-work-planner.js';
+import {
+  planServiceViolationWork,
+  type PlannedServiceViolationWork,
+} from './service-work-planner.js';
+import {
+  planModuleViolationWork,
+  type PlannedModuleViolationWork,
+} from './module-work-planner.js';
 import type { UsageData } from '../usage.service.js';
+import type { AnalyzeLlmExecutionUsage } from './analyze-llm-execution-evidence.js';
+import type {
+  AnalyzeLlmExecutionAdapter,
+  AnalyzeLlmExecutionOptions,
+  AnalyzeLlmExecutionOutcome,
+  CertifiedAnalyzeLlmWork,
+} from './certified-analyze-llm-run.js';
+import {
+  materializePlannedViolationPayload,
+  type MaterializedPlannedViolationResult,
+  type PlannedViolationResultRequest,
+} from './planned-violation-result.js';
 import type {
   LLMProvider,
   UsageRecord,
@@ -70,10 +111,20 @@ import type {
 
 interface SpawnOptions {
   timeoutMs?: number;
+  /** Replace the configured model flag for this one certified resume call. */
+  modelOverride?: string;
   /** Extra CLI args appended after base args */
   extraArgs?: string[];
   /** Fires once the concurrency limiter grants a slot, before spawnCLI runs. */
   onStart?: () => void;
+  /** Exact provider-independent request metadata, when the request was prepared up front. */
+  stage?: string;
+  system?: string;
+  responseFormat?: 'json' | 'text';
+  /** Stable semantic identity of the planned work unit. */
+  id?: string;
+  workId?: string;
+  inputFingerprint?: string;
 }
 
 interface CLIUsage {
@@ -83,15 +134,27 @@ interface CLIUsage {
   cacheWriteTokens: number;
   totalTokens: number;
   costUsd?: string;
+  resolvedModel: string | null;
 }
 
+interface PlannedExecutionSuccess {
+  attemptId: string;
+  completedAt: string;
+  usage: AnalyzeLlmExecutionUsage | null;
+}
+
+type PlannedExecutionOptions = AnalyzeLlmExecutionOptions & {
+  onSuccess?: (evidence: PlannedExecutionSuccess) => void;
+  resumeModelPin?: string;
+};
+
 function certifyCodeResultOwnership(
-  context: CodeViolationContext,
+  ownership: PreparedCodeOwnership,
   violations: CodeViolationRaw[],
 ): void {
-  const allowedRules = new Set(context.llmRules.map((rule) => rule.key));
-  const allowedSources = new Map<string, CodeViolationContext['sourceScopes'][number]['ranges']>();
-  for (const scope of context.sourceScopes) {
+  const allowedRules = new Set(ownership.ruleKeys);
+  const allowedSources = new Map<string, PreparedCodeOwnership['sourceScopes'][number]['ranges'][number][]>();
+  for (const scope of ownership.sourceScopes) {
     const ranges = allowedSources.get(scope.path) ?? [];
     ranges.push(...scope.ranges);
     allowedSources.set(scope.path, ranges);
@@ -113,7 +176,7 @@ function certifyCodeResultOwnership(
     }
 
     const rangeIsOwned = violation.lineEnd >= violation.lineStart && ranges.some((range) =>
-      context.tier === 'metadata'
+      ownership.tier === 'metadata'
         ? violation.lineStart === range.lineStart && violation.lineEnd === range.lineEnd
         : violation.lineStart >= range.lineStart && violation.lineEnd <= range.lineEnd,
     );
@@ -132,17 +195,17 @@ function certifyCodeResultOwnership(
 }
 
 function certifyNoPriorCodeCollision(
-  context: CodeViolationContext,
+  ownership: PreparedCodeOwnership,
   newViolations: CodeViolationRaw[],
 ): void {
-  const priorKeys = new Set((context.existingViolations ?? []).map((violation) =>
-    context.tier === 'metadata'
+  const priorKeys = new Set(ownership.priorFindings.map((violation) =>
+    ownership.tier === 'metadata'
       ? `${violation.ruleKey}\0${violation.filePath}\0${violation.title}`
       : `${violation.ruleKey}\0${violation.filePath}\0${violation.lineStart}\0${violation.lineEnd}\0${violation.title}`,
   ));
 
   for (const violation of newViolations) {
-    const key = context.tier === 'metadata'
+    const key = ownership.tier === 'metadata'
       ? `${violation.ruleKey}\0${violation.filePath}\0${violation.title}`
       : `${violation.ruleKey}\0${violation.filePath}\0${violation.lineStart}\0${violation.lineEnd}\0${violation.title}`;
     if (priorKeys.has(key)) {
@@ -173,7 +236,35 @@ function certifyCodeLifecyclePartition(
   }
 }
 
-export abstract class BaseCLIProvider implements LLMProvider {
+type PlannedResultRequestFor<
+  TFamily extends CertifiedAnalyzeLlmWork['family'],
+  TMode extends CertifiedAnalyzeLlmWork['mode'],
+> = Extract<PlannedViolationResultRequest, { family: TFamily; mode: TMode }>;
+type MaterializedResultFor<
+  TFamily extends CertifiedAnalyzeLlmWork['family'],
+  TMode extends CertifiedAnalyzeLlmWork['mode'],
+> = Extract<MaterializedPlannedViolationResult, { family: TFamily; mode: TMode }>['result'];
+
+function materializeProviderResult(input: PlannedResultRequestFor<'code', 'normal'>, result: unknown): MaterializedResultFor<'code', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'code', 'lifecycle'>, result: unknown): MaterializedResultFor<'code', 'lifecycle'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'database', 'normal'>, result: unknown): MaterializedResultFor<'database', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'database', 'lifecycle'>, result: unknown): MaterializedResultFor<'database', 'lifecycle'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'service', 'normal'>, result: unknown): MaterializedResultFor<'service', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'service', 'lifecycle'>, result: unknown): MaterializedResultFor<'service', 'lifecycle'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'module', 'normal'>, result: unknown): MaterializedResultFor<'module', 'normal'>;
+function materializeProviderResult(input: PlannedResultRequestFor<'module', 'lifecycle'>, result: unknown): MaterializedResultFor<'module', 'lifecycle'>;
+function materializeProviderResult(
+  input: PlannedViolationResultRequest,
+  result: unknown,
+): MaterializedPlannedViolationResult['result'] {
+  return materializePlannedViolationPayload({ ...input, result }, {
+    createId: randomUUID,
+    createdAt: () => new Date().toISOString(),
+  });
+}
+
+export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutionAdapter {
+  abstract get providerId(): string;
   abstract get binaryName(): string;
   abstract get baseArgs(): string[];
   abstract get modelFlag(): string[];
@@ -227,10 +318,73 @@ export abstract class BaseCLIProvider implements LLMProvider {
     return records;
   }
 
-  private collectUsage(callType: string, cliUsage: CLIUsage | undefined, durationMs: number): void {
-    if (!cliUsage) return;
-    this._usageRecords.push({
-      provider: 'claude-code',
+  get execution(): AnalyzeLlmExecutionAdapter['execution'] {
+    return Object.freeze({
+      provider: this.transport ? 'transport:unverified' : this.providerId,
+      requestedModel: this.modelFlag[1] ?? null,
+    });
+  }
+
+  async execute(
+    work: CertifiedAnalyzeLlmWork,
+    options?: AnalyzeLlmExecutionOptions,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
+    return this.executeCertifiedWork(work, options);
+  }
+
+  protected executeWithPinnedResumeModel(
+    work: CertifiedAnalyzeLlmWork,
+    resolvedModel: string,
+    options?: AnalyzeLlmExecutionOptions,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
+    return this.executeCertifiedWork(work, options, resolvedModel);
+  }
+
+  private async executeCertifiedWork(
+    work: CertifiedAnalyzeLlmWork,
+    options?: AnalyzeLlmExecutionOptions,
+    resumeModelPin?: string,
+  ): Promise<AnalyzeLlmExecutionOutcome> {
+    let result: unknown;
+    let evidence: PlannedExecutionSuccess | undefined;
+    const plannedOptions: PlannedExecutionOptions = {
+      ...options,
+      resumeModelPin,
+      onSuccess: (value) => { evidence = value; },
+    };
+    switch (work.family) {
+      case 'code':
+        result = await this.executePlannedCodeViolationWork(work.planned, plannedOptions);
+        break;
+      case 'database':
+        result = await this.executePlannedDatabaseViolationWork(work.planned, plannedOptions);
+        break;
+      case 'service':
+        result = await this.executePlannedServiceViolationWork(work.planned, plannedOptions);
+        break;
+      case 'module':
+        result = await this.executePlannedModuleViolationWork(work.planned, plannedOptions);
+        break;
+    }
+    if (!evidence) throw new Error(`Analyze work ${work.workId} returned without attempt evidence`);
+    return {
+      family: work.family,
+      domain: work.domain,
+      mode: work.mode,
+      workId: work.workId,
+      inputFingerprint: work.inputFingerprint,
+      resultContractId: work.planned.request.resultContractId,
+      result,
+      attemptId: evidence.attemptId,
+      completedAt: evidence.completedAt,
+      usage: evidence.usage,
+    };
+  }
+
+  private collectUsage(callType: string, cliUsage: CLIUsage | undefined, durationMs: number): UsageData | null {
+    if (!cliUsage) return null;
+    const usage = {
+      provider: this.providerId,
       callType,
       inputTokens: cliUsage.inputTokens,
       outputTokens: cliUsage.outputTokens,
@@ -239,7 +393,9 @@ export abstract class BaseCLIProvider implements LLMProvider {
       totalTokens: cliUsage.totalTokens,
       costUsd: cliUsage.costUsd,
       durationMs,
-    });
+    };
+    this._usageRecords.push(usage);
+    return usage;
   }
 
   constructor(transport?: LlmTransport) {
@@ -274,11 +430,25 @@ export abstract class BaseCLIProvider implements LLMProvider {
 
   /** Convert a Zod schema to JSON Schema string for --json-schema flag. */
   protected toJsonSchema(schema: ZodType): string {
-    const jsonSchema = zodToJsonSchema(schema, { target: 'openApi3' });
-    return JSON.stringify(jsonSchema);
+    return serializePreparedRequestSchema(schema);
   }
 
   /** Spawn CLI subprocess, pipe prompt via stdin, collect stdout. */
+  protected buildCLIArgs(
+    jsonSchemaStr: string,
+    opts?: Pick<SpawnOptions, 'modelOverride' | 'extraArgs'>,
+  ): string[] {
+    const modelArgs = opts?.modelOverride
+      ? ['--model', opts.modelOverride]
+      : this.modelFlag;
+    return [
+      ...this.baseArgs,
+      ...modelArgs,
+      '--json-schema', jsonSchemaStr,
+      ...(opts?.extraArgs ?? []),
+    ];
+  }
+
   protected spawnCLI(prompt: string, jsonSchemaStr: string, opts?: SpawnOptions & { label?: string }): Promise<string> {
     // Check if already aborted before spawning
     if (this._abortSignal?.aborted) {
@@ -294,22 +464,20 @@ export abstract class BaseCLIProvider implements LLMProvider {
     // it exactly as it does for the CLI's `result` field.
     if (this.transport) {
       return this.transport({
-        stage: `analyze.${label}`,
+        id: opts?.id,
+        workId: opts?.workId,
+        inputFingerprint: opts?.inputFingerprint,
+        stage: opts?.stage ?? `analyze.${label}`,
         user: prompt,
-        system: '',
+        system: opts?.system ?? '',
         schema: jsonSchemaStr,
-        responseFormat: 'json',
-        model: this.modelFlag[1],
+        responseFormat: opts?.responseFormat ?? 'json',
+        model: opts?.modelOverride ?? this.modelFlag[1],
         timeoutMs: timeout,
       }).then((text) => JSON.stringify({ result: text }));
     }
 
-    const args = [
-      ...this.baseArgs,
-      ...this.modelFlag,
-      '--json-schema', jsonSchemaStr,
-      ...(opts?.extraArgs ?? []),
-    ];
+    const args = this.buildCLIArgs(jsonSchemaStr, opts);
 
     return new Promise((resolve, reject) => {
       // cross-spawn handles Windows `.cmd`/`.ps1` shim resolution without
@@ -413,6 +581,7 @@ export abstract class BaseCLIProvider implements LLMProvider {
       cacheWriteTokens: cacheWrite,
       totalTokens: input + output,
       costUsd: costRaw != null ? String(costRaw) : undefined,
+      resolvedModel: resolveEnvelopeModel(this.execution.requestedModel, parsed),
     };
   }
 
@@ -421,6 +590,13 @@ export abstract class BaseCLIProvider implements LLMProvider {
    * The response is a JSON envelope with structured_output containing validated data.
    */
   protected parseAndValidate<T>(raw: string, schema: ZodType<T>): { data: T; usage?: CLIUsage } {
+    return this.parseAndValidatePrepared(raw, (value) => schema.parse(value));
+  }
+
+  private parseAndValidatePrepared<T>(
+    raw: string,
+    parse: (value: unknown) => T,
+  ): { data: T; usage?: CLIUsage } {
     const parsed = JSON.parse(raw.trim());
     const usage = this.extractCLIUsage(parsed);
 
@@ -431,13 +607,13 @@ export abstract class BaseCLIProvider implements LLMProvider {
     }
 
     if (parsed.structured_output) {
-      return { data: schema.parse(parsed.structured_output), usage };
+      return { data: parse(parsed.structured_output), usage };
     }
 
     // Fallback: try parsing the result field as JSON
     if (parsed.result) {
       const data = typeof parsed.result === 'string' ? JSON.parse(parsed.result) : parsed.result;
-      return { data: schema.parse(data), usage };
+      return { data: parse(data), usage };
     }
 
     throw new Error(`[CLI] No structured_output in response (subtype: ${parsed.subtype})`);
@@ -447,6 +623,23 @@ export abstract class BaseCLIProvider implements LLMProvider {
   protected async spawnAndParse<T>(
     prompt: string,
     schema: ZodType<T>,
+    opts?: SpawnOptions & { label?: string },
+  ): Promise<{ data: T; usage?: CLIUsage }> {
+    return this.spawnPreparedAndParse({
+      stage: `analyze.${opts?.label ?? 'call'}`,
+      system: '',
+      prompt,
+      schemaJson: this.toJsonSchema(schema),
+      responseFormat: 'json',
+      parse: (value) => schema.parse(value),
+    }, opts);
+  }
+
+  private async spawnPreparedAndParse<T>(
+    request: Pick<
+      PreparedLlmRequest<T>,
+      'stage' | 'system' | 'prompt' | 'schemaJson' | 'responseFormat' | 'parse'
+    >,
     opts?: SpawnOptions & { label?: string },
   ): Promise<{ data: T; usage?: CLIUsage }> {
     // Cap concurrent CLI spawns across all callers on this provider.
@@ -459,15 +652,20 @@ export abstract class BaseCLIProvider implements LLMProvider {
       if (this._sessionLimitError) throw this._sessionLimitError;
       opts?.onStart?.();
 
-      const jsonSchemaStr = this.toJsonSchema(schema);
+      const jsonSchemaStr = request.schemaJson;
       const label = opts?.label ?? 'call';
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
         try {
-          const raw = await this.spawnCLI(prompt, jsonSchemaStr, opts);
-          this.dumpDebug(label, prompt, raw, jsonSchemaStr);
-          return this.parseAndValidate(raw, schema);
+          const raw = await this.spawnCLI(request.prompt, jsonSchemaStr, {
+            ...opts,
+            stage: request.stage,
+            system: request.system,
+            responseFormat: request.responseFormat,
+          });
+          this.dumpDebug(label, request.prompt, raw, jsonSchemaStr);
+          return this.parseAndValidatePrepared(raw, request.parse);
         } catch (err) {
           lastError = err as Error;
           if (this._abortSignal?.aborted) throw lastError; // don't retry on cancel
@@ -506,152 +704,309 @@ export abstract class BaseCLIProvider implements LLMProvider {
   // LLMProvider implementation
   // ---------------------------------------------------------------------------
 
+  private async executePreparedViolationWork<T>(options: {
+    callType: string;
+    attemptIdPrefix: string;
+    workId: string;
+    inputFingerprint: string;
+    request: Pick<
+      PreparedLlmRequest<T>,
+      'stage' | 'system' | 'prompt' | 'schemaJson' | 'responseFormat' | 'parse'
+    > & { readonly label: string; readonly timeoutMs: number };
+    extraArgs: string[];
+    startMessage: string;
+    accept?: (result: T) => void;
+    doneMessage: (result: T, durationMs: number) => string;
+    onStart?: () => void;
+    onSuccess?: (evidence: PlannedExecutionSuccess) => void;
+    resumeModelPin?: string;
+  }): Promise<T> {
+    log.info(options.startMessage);
+    const t0 = Date.now();
+    const attemptId = `${options.attemptIdPrefix}:${randomUUID()}`;
+    const { data, usage: cliUsage } = await this.spawnPreparedAndParse(options.request, {
+      id: attemptId,
+      workId: options.workId,
+      inputFingerprint: options.inputFingerprint,
+      extraArgs: options.extraArgs,
+      modelOverride: options.resumeModelPin,
+      label: options.request.label,
+      timeoutMs: options.request.timeoutMs,
+      onStart: options.onStart,
+    });
+    if (options.resumeModelPin && cliUsage?.resolvedModel !== options.resumeModelPin) {
+      throw new Error(
+        `Certified resume expected resolved model "${options.resumeModelPin}" but provider reported "${cliUsage?.resolvedModel ?? 'unknown'}"`,
+      );
+    }
+    options.accept?.(data);
+    const dur = Date.now() - t0;
+    log.info(options.doneMessage(data, dur));
+    const usage = this.collectUsage(options.callType, cliUsage, dur);
+    options.onSuccess?.({
+      attemptId,
+      completedAt: new Date(t0 + dur).toISOString(),
+      usage: usage === null ? null : {
+        ...usage,
+        requestedModel: this.execution.requestedModel,
+        resolvedModel: cliUsage?.resolvedModel ?? null,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+        costUsd: usage.costUsd ?? null,
+      },
+    });
+    return data;
+  }
+
+  /** Execute one already-planned service request without rebuilding its source context. */
+  protected executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork<PreparedNormalServiceViolationRequest>,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ServiceViolationOutput>;
+  protected executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork<PreparedLifecycleServiceViolationRequest>,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ServiceLifecycleViolationOutput>;
+  protected executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ServiceViolationOutput | ServiceLifecycleViolationOutput>;
+  protected async executePlannedServiceViolationWork(
+    planned: PlannedServiceViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ServiceViolationOutput | ServiceLifecycleViolationOutput> {
+    const request = planned.request;
+
+    if (request.resultContractId === 'analyze.service-lifecycle@1') {
+      return this.executePreparedViolationWork({
+        callType: 'service',
+        attemptIdPrefix: 'llm.service.attempt',
+        workId: planned.workId,
+        inputFingerprint: planned.inputFingerprint,
+        request,
+        extraArgs: ['--tools', ''],
+        startMessage: '[CLI] Lifecycle service call starting...',
+        doneMessage: (result, dur) =>
+          `[CLI] Lifecycle service call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
+        onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
+      });
+    }
+    return this.executePreparedViolationWork({
+      callType: 'service',
+      attemptIdPrefix: 'llm.service.attempt',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      request,
+      extraArgs: ['--tools', ''],
+      startMessage: '[CLI] Service violations call starting...',
+      doneMessage: (result, dur) =>
+        `[CLI] Service violations call done in ${dur}ms — ${result.violations.length} violations`,
+      onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
+    });
+  }
+
+  /** Execute one already-planned database request without rebuilding its source context. */
+  protected executePlannedDatabaseViolationWork(
+    planned: PlannedDatabaseViolationWork<PreparedNormalDatabaseViolationRequest>,
+    opts?: PlannedExecutionOptions,
+  ): Promise<DatabaseViolationOutput>;
+  protected executePlannedDatabaseViolationWork(
+    planned: PlannedDatabaseViolationWork<PreparedLifecycleDatabaseViolationRequest>,
+    opts?: PlannedExecutionOptions,
+  ): Promise<DatabaseLifecycleViolationOutput>;
+  protected executePlannedDatabaseViolationWork(
+    planned: PlannedDatabaseViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<DatabaseViolationOutput | DatabaseLifecycleViolationOutput>;
+  protected async executePlannedDatabaseViolationWork(
+    planned: PlannedDatabaseViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<DatabaseViolationOutput | DatabaseLifecycleViolationOutput> {
+    const request = planned.request;
+    if (request.resultContractId === 'analyze.database-lifecycle@1') {
+      return this.executePreparedViolationWork({
+        callType: 'database',
+        attemptIdPrefix: 'llm.database.attempt',
+        workId: planned.workId,
+        inputFingerprint: planned.inputFingerprint,
+        request,
+        extraArgs: ['--tools', ''],
+        startMessage: '[CLI] Lifecycle database call starting...',
+        doneMessage: (result, dur) =>
+          `[CLI] Lifecycle database call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
+        onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
+      });
+    }
+    return this.executePreparedViolationWork({
+      callType: 'database',
+      attemptIdPrefix: 'llm.database.attempt',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      request,
+      extraArgs: ['--tools', ''],
+      startMessage: '[CLI] Database violations call starting...',
+      doneMessage: (result, dur) =>
+        `[CLI] Database violations call done in ${dur}ms — ${result.violations.length} violations`,
+      onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
+    });
+  }
+
+  /** Execute one already-planned module request without rebuilding its source context. */
+  protected executePlannedModuleViolationWork(
+    planned: PlannedModuleViolationWork<PreparedNormalModuleViolationRequest>,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ModuleViolationOutput>;
+  protected executePlannedModuleViolationWork(
+    planned: PlannedModuleViolationWork<PreparedLifecycleModuleViolationRequest>,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ModuleLifecycleViolationOutput>;
+  protected executePlannedModuleViolationWork(
+    planned: PlannedModuleViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ModuleViolationOutput | ModuleLifecycleViolationOutput>;
+  protected async executePlannedModuleViolationWork(
+    planned: PlannedModuleViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<ModuleViolationOutput | ModuleLifecycleViolationOutput> {
+    const request = planned.request;
+    if (request.resultContractId === 'analyze.module-lifecycle@1') {
+      return this.executePreparedViolationWork({
+        callType: 'module',
+        attemptIdPrefix: 'llm.module.attempt',
+        workId: planned.workId,
+        inputFingerprint: planned.inputFingerprint,
+        request,
+        extraArgs: ['--tools', ''],
+        startMessage: '[CLI] Lifecycle module call starting...',
+        doneMessage: (result, dur) =>
+          `[CLI] Lifecycle module call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
+        onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
+      });
+    }
+    return this.executePreparedViolationWork({
+      callType: 'module',
+      attemptIdPrefix: 'llm.module.attempt',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      request,
+      extraArgs: ['--tools', ''],
+      startMessage: `[CLI] Module violations call starting (${request.ownership.moduleNames.length} modules)...`,
+      doneMessage: (result, dur) =>
+        `[CLI] Module violations call done in ${dur}ms — ${result.violations.length} violations`,
+      onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
+    });
+  }
+
+  /** Execute and certify one already-planned code request without rebuilding its source context. */
+  protected async executePlannedCodeViolationWork(
+    planned: PlannedCodeViolationWork,
+    opts?: PlannedExecutionOptions,
+  ): Promise<CodeViolationOutput | CodeViolationLifecycleOutput> {
+    const request = planned.request;
+    const codeExtraArgs = request.toolPolicy === 'read'
+      ? ['--allowedTools', 'Read']
+      : ['--tools', ''];
+    if (request.resultContractId === 'analyze.code-lifecycle@1') {
+      const idMap = new Map(request.bindings.map(({ promptId, runtimeId }) => [promptId, runtimeId]));
+      return this.executePreparedViolationWork({
+        callType: 'code',
+        attemptIdPrefix: 'llm.code.attempt',
+        workId: planned.workId,
+        inputFingerprint: planned.inputFingerprint,
+        request,
+        extraArgs: codeExtraArgs,
+        startMessage: `[CLI] Code violations call starting (${request.ownership.fileCount} files, lifecycle)...`,
+        accept: (result) => {
+          certifyCodeResultOwnership(request.ownership, result.newViolations);
+          certifyCodeLifecyclePartition(
+            result.resolvedViolationIds,
+            result.unchangedViolationIds,
+            idMap,
+          );
+          certifyNoPriorCodeCollision(request.ownership, result.newViolations);
+        },
+        doneMessage: (result, dur) =>
+          `[CLI] Code violations call done in ${dur}ms — new: ${result.newViolations.length}, resolved: ${result.resolvedViolationIds.length}, unchanged: ${result.unchangedViolationIds.length}`,
+        onStart: opts?.onStart,
+        onSuccess: opts?.onSuccess,
+        resumeModelPin: opts?.resumeModelPin,
+      });
+    }
+    return this.executePreparedViolationWork({
+      callType: 'code',
+      attemptIdPrefix: 'llm.code.attempt',
+      workId: planned.workId,
+      inputFingerprint: planned.inputFingerprint,
+      request,
+      extraArgs: codeExtraArgs,
+      startMessage: `[CLI] Code violations call starting (${request.ownership.fileCount} files, first-run)...`,
+      accept: (result) => certifyCodeResultOwnership(request.ownership, result.violations),
+      doneMessage: (result, dur) =>
+        `[CLI] Code violations call done in ${dur}ms — ${result.violations.length} violations`,
+      onStart: opts?.onStart,
+      onSuccess: opts?.onSuccess,
+      resumeModelPin: opts?.resumeModelPin,
+    });
+  }
+
   async generateServiceViolations(
     context: ServiceViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ServiceViolationsResult> {
-    const { vars, idMap } = buildServiceTemplateVars(context);
-    const prompt = getPrompt('violations-service', vars);
-
-    log.info('[CLI] Service violations call starting...');
-    const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, ServiceViolationOutputSchema, {
-      extraArgs: ['--tools', ''], label: 'service', onStart: opts?.onStart,
-    });
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Service violations call done in ${dur}ms — ${object.violations.length} violations`);
-    this.collectUsage('service', cliUsage, dur);
-
-    return {
-      violations: object.violations.map((v) => ({
-        id: randomUUID(),
-        type: v.type,
-        category: 'rule' as const,
-        title: v.title,
-        content: v.content,
-        severity: v.severity,
-        targetServiceId: resolveId(v.targetServiceId, idMap) ?? undefined,
-        fixPrompt: v.fixPrompt ?? undefined,
-        ruleKey: v.ruleKey ?? undefined,
-        createdAt: new Date().toISOString(),
-      })),
-      serviceDescriptions: object.serviceDescriptions.map((d) => ({
-        id: resolveId(d.id, idMap) || d.id,
-        description: d.description,
-      })),
-    };
+    const planned = planServiceViolationWork(context, 'normal', this.execution);
+    const object = await this.executePlannedServiceViolationWork(planned, opts);
+    return materializeProviderResult(
+      { family: 'service', mode: 'normal', planned },
+      object,
+    );
   }
 
   async generateDatabaseViolations(
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsResult> {
-    const { vars, idMap } = buildDatabaseTemplateVars(context);
-    const prompt = getPrompt('violations-database', vars);
-
-    log.info('[CLI] Database violations call starting...');
-    const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, DatabaseViolationOutputSchema, {
-      extraArgs: ['--tools', ''], label: 'database', onStart: opts?.onStart,
-    });
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Database violations call done in ${dur}ms — ${object.violations.length} violations`);
-    this.collectUsage('database', cliUsage, dur);
-
-    return {
-      violations: object.violations.map((v) => ({
-        id: randomUUID(),
-        type: v.type,
-        category: 'rule' as const,
-        title: v.title,
-        content: v.content,
-        severity: v.severity,
-        targetDatabaseId: resolveId(v.targetDatabaseId, idMap) ?? undefined,
-        targetTable: v.targetTable ?? undefined,
-        fixPrompt: v.fixPrompt ?? undefined,
-        ruleKey: v.ruleKey ?? undefined,
-        createdAt: new Date().toISOString(),
-      })),
-    };
+    const planned = planDatabaseViolationWork(context, 'normal', this.execution);
+    const object = await this.executePlannedDatabaseViolationWork(planned, opts);
+    return materializeProviderResult(
+      { family: 'database', mode: 'normal', planned },
+      object,
+    );
   }
 
   async generateDatabaseViolationsWithLifecycle(
     context: DatabaseViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<DatabaseViolationsLifecycleResult> {
-    const { vars, idMap } = buildDatabaseTemplateVars(context);
-    const prompt = getPrompt('violations-database-lifecycle', vars);
-
-    log.info('[CLI] Lifecycle database call starting...');
-    const t0 = Date.now();
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(
-      prompt,
-      DatabaseLifecycleViolationOutputSchema,
-      {
-        extraArgs: ['--tools', ''],
-        label: 'database-lifecycle',
-        onStart: opts?.onStart,
-      },
+    const planned = planDatabaseViolationWork(context, 'lifecycle', this.execution);
+    const object = await this.executePlannedDatabaseViolationWork(planned, opts);
+    return materializeProviderResult(
+      { family: 'database', mode: 'lifecycle', planned },
+      object,
     );
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Lifecycle database call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
-    this.collectUsage('database', cliUsage, dur);
-
-    return {
-      resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
-      unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
-      newViolations: object.newViolations.map((violation) => ({
-        ...violation,
-        targetDatabaseId: violation.targetDatabaseId?.startsWith('db-')
-          ? idMap.get(violation.targetDatabaseId) ?? null
-          : null,
-      })),
-    };
   }
 
   async generateModuleViolations(
     context: ModuleViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<ModuleViolationsResult> {
-    const { vars, idMap } = buildModuleTemplateVars(context);
-    const prompt = getPrompt('violations-module', vars);
-
-    const moduleIdToServiceId = new Map(
-      context.modules.filter((m) => m.serviceId).map((m) => [m.id, m.serviceId!]),
+    const planned = planModuleViolationWork(context, 'normal', this.execution);
+    const object = await this.executePlannedModuleViolationWork(planned, opts);
+    return materializeProviderResult(
+      { family: 'module', mode: 'normal', planned },
+      object,
     );
-
-    log.info(`[CLI] Module violations call starting (${context.modules.length} modules)...`);
-    const t0 = Date.now();
-    // Module context is a connected graph — use a longer timeout instead of batching
-    // to avoid losing cross-module dependency edges
-    const moduleTimeoutMs = 300_000; // 5 minutes
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, ModuleViolationOutputSchema, {
-      extraArgs: ['--tools', ''], label: 'module', timeoutMs: moduleTimeoutMs, onStart: opts?.onStart,
-    });
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Module violations call done in ${dur}ms — ${object.violations.length} violations`);
-    this.collectUsage('module', cliUsage, dur);
-
-    return {
-      violations: object.violations.map((v) => {
-        const targetModuleId = resolveId(v.targetModuleId, idMap) ?? undefined;
-        const targetServiceId = targetModuleId ? moduleIdToServiceId.get(targetModuleId) : undefined;
-        return {
-          id: randomUUID(),
-          type: v.type,
-          category: 'rule' as const,
-          title: v.title,
-          content: v.content,
-          severity: v.severity,
-          targetServiceId,
-          targetModuleId,
-          targetMethodId: resolveId(v.targetMethodId, idMap) ?? undefined,
-          fixPrompt: v.fixPrompt ?? undefined,
-          ruleKey: v.ruleKey ?? undefined,
-          createdAt: new Date().toISOString(),
-        };
-      }),
-    };
   }
 
   async generateAllViolations(contexts: AllViolationsInput): Promise<AllViolationsResult> {
@@ -719,25 +1074,20 @@ export abstract class BaseCLIProvider implements LLMProvider {
     let serviceDescriptions: ServiceDescription[] = [];
 
     const promises: [string, Promise<unknown>][] = [];
-    const idMaps: Record<string, PromptIdMap> = {};
 
     // Service call
     if (contexts.service) {
       const ctx = contexts.service;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
         promises.push(['service', (async () => {
-          const { vars, idMap } = buildServiceTemplateVars(ctx);
-          idMaps.service = idMap;
-          const prompt = getPrompt('violations-service-lifecycle', vars);
-          log.info('[CLI] Lifecycle service call starting...');
-          const t0 = Date.now();
-          const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, LifecycleServiceOutputSchema, {
-            extraArgs: ['--tools', ''], label: 'service-lifecycle', onStart: () => onCallStart?.('service'),
+          const planned = planServiceViolationWork(ctx, 'lifecycle', this.execution);
+          const object = await this.executePlannedServiceViolationWork(planned, {
+            onStart: () => onCallStart?.('service'),
           });
-          const dur = Date.now() - t0;
-          log.info(`[CLI] Lifecycle service call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
-          this.collectUsage('service', cliUsage, dur);
-          return object;
+          return materializeProviderResult(
+            { family: 'service', mode: 'lifecycle', planned },
+            object,
+          );
         })()]);
       } else {
         promises.push(['service-normal', this.generateServiceViolations(ctx, {
@@ -764,36 +1114,15 @@ export abstract class BaseCLIProvider implements LLMProvider {
     if (contexts.module) {
       const ctx = contexts.module;
       if (ctx.existingViolations && ctx.existingViolations.length > 0) {
-        const modIdToSvcId = new Map(
-          ctx.modules.filter((m) => m.serviceId).map((m) => [m.id, m.serviceId!]),
-        );
         promises.push(['module', (async () => {
-          const { vars, idMap } = buildModuleTemplateVars(ctx);
-          idMaps.module = idMap;
-          const prompt = getPrompt('violations-module-lifecycle', vars);
-          log.info('[CLI] Lifecycle module call starting...');
-          const t0 = Date.now();
-          const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, DiffViolationOutputSchema, {
-            extraArgs: ['--tools', ''], label: 'module-lifecycle', onStart: () => onCallStart?.('module'),
+          const planned = planModuleViolationWork(ctx, 'lifecycle', this.execution);
+          const object = await this.executePlannedModuleViolationWork(planned, {
+            onStart: () => onCallStart?.('module'),
           });
-          const dur = Date.now() - t0;
-          log.info(`[CLI] Lifecycle module call done in ${dur}ms — resolved: ${object.resolvedViolationIds.length}, new: ${object.newViolations.length}`);
-          this.collectUsage('module', cliUsage, dur);
-          return {
-            resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
-            unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
-            newViolations: object.newViolations.map((i) => {
-              const realModuleId = resolveId(i.targetModuleId, idMap);
-              return {
-                ...i,
-                targetServiceId: (realModuleId ? modIdToSvcId.get(realModuleId) : null) ?? null,
-                targetModuleId: realModuleId ?? null,
-                targetMethodId: resolveId(i.targetMethodId, idMap) ?? null,
-                targetModuleName: i.targetModuleName ?? null,
-                targetMethodName: i.targetMethodName ?? null,
-              };
-            }),
-          };
+          return materializeProviderResult(
+            { family: 'module', mode: 'lifecycle', planned },
+            object,
+          );
         })()]);
       } else {
         promises.push(['module-normal', this.generateModuleViolations(ctx, {
@@ -834,23 +1163,11 @@ export abstract class BaseCLIProvider implements LLMProvider {
       }
 
       if (key === 'service') {
-        const idMap = idMaps.service;
         const result = outcome.value as { resolvedViolationIds: string[]; unchangedViolationIds: string[]; newViolations: DiffViolationItem[]; serviceDescriptions: ServiceDescription[] };
-        allResolved.push(...resolveIds(result.resolvedViolationIds, idMap));
-        allUnchanged.push(...resolveIds(result.unchangedViolationIds, idMap));
-        allNew.push(...result.newViolations.map((v) => ({
-          ...v,
-          targetServiceId: resolveId(v.targetServiceId, idMap) ?? null,
-          targetModuleId: v.targetModuleId ?? null,
-          targetMethodId: v.targetMethodId ?? null,
-          targetServiceName: v.targetServiceName ?? null,
-          targetModuleName: v.targetModuleName ?? null,
-          targetMethodName: v.targetMethodName ?? null,
-        })));
-        serviceDescriptions = result.serviceDescriptions.map((d) => ({
-          id: resolveId(d.id, idMap) || d.id,
-          description: d.description,
-        }));
+        allResolved.push(...result.resolvedViolationIds);
+        allUnchanged.push(...result.unchangedViolationIds);
+        allNew.push(...result.newViolations);
+        serviceDescriptions = result.serviceDescriptions;
       } else if (key === 'service-normal') {
         const result = outcome.value as ServiceViolationsResult;
         serviceDescriptions = result.serviceDescriptions;
@@ -919,82 +1236,25 @@ export abstract class BaseCLIProvider implements LLMProvider {
     context: CodeViolationContext,
     opts?: { onStart?: () => void },
   ): Promise<CodeViolationsResult> {
-    const hasExisting = context.existingViolations && context.existingViolations.length > 0;
-    let promptName: Parameters<typeof getPrompt>[0];
-    if (context.tier === 'metadata') {
-      promptName = hasExisting ? 'violations-code-metadata-lifecycle' : 'violations-code-metadata';
-    } else if (context.tier === 'targeted') {
-      promptName = hasExisting ? 'violations-code-targeted-lifecycle' : 'violations-code-targeted';
-    } else {
-      promptName = hasExisting ? 'violations-code-lifecycle' : 'violations-code';
-    }
-
-    // Only use file-path mode (Read tool) when files have real paths, not pre-built content
-    // from the context router (which uses synthetic path 'context' for metadata/targeted tiers)
-    const hasRealPaths = context.files.length > 0 && context.files.every((f) => f.path !== 'context');
-    const { vars, idMap } = buildCodeTemplateVars(context, { useFilePaths: hasRealPaths });
-    const prompt = getPrompt(promptName, vars);
-
-    log.info(`[CLI] Code violations call starting (${context.files.length} files, ${hasExisting ? 'lifecycle' : 'first-run'})...`);
-    const t0 = Date.now();
-
-    // Only give Read tool access when files have real paths to read
-    const codeExtraArgs = hasRealPaths ? ['--allowedTools', 'Read'] : ['--tools', ''];
-    const codeTimeoutMs = 300_000; // 5 minutes — code review uses Read tool, takes many turns
-
-    if (hasExisting) {
-      const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, CodeViolationLifecycleOutputSchema, {
-        extraArgs: codeExtraArgs, label: 'code-lifecycle', timeoutMs: codeTimeoutMs, onStart: opts?.onStart,
-      });
-      certifyCodeResultOwnership(context, object.newViolations);
-      certifyCodeLifecyclePartition(
-        object.resolvedViolationIds,
-        object.unchangedViolationIds,
-        idMap,
-      );
-      certifyNoPriorCodeCollision(context, object.newViolations);
-      const dur = Date.now() - t0;
-      log.info(`[CLI] Code violations call done in ${dur}ms — new: ${object.newViolations.length}, resolved: ${object.resolvedViolationIds.length}, unchanged: ${object.unchangedViolationIds.length}`);
-      this.collectUsage('code', cliUsage, dur);
-
-      return {
-        violations: object.newViolations.map((v) => ({
-          ruleKey: v.ruleKey,
-          filePath: v.filePath,
-          lineStart: v.lineStart,
-          lineEnd: v.lineEnd,
-          severity: v.severity,
-          title: v.title,
-          content: v.content,
-          fixPrompt: v.fixPrompt ?? null,
-          sourceTier: context.tier ?? 'full-file',
-        })),
-        resolvedViolationIds: resolveIds(object.resolvedViolationIds, idMap),
-        unchangedViolationIds: resolveIds(object.unchangedViolationIds, idMap),
-      };
-    }
-
-    const { data: object, usage: cliUsage } = await this.spawnAndParse(prompt, CodeViolationOutputSchema, {
-      extraArgs: codeExtraArgs, label: 'code', timeoutMs: codeTimeoutMs, onStart: opts?.onStart,
+    const planned = planCodeViolationWork(context, {
+      ...this.execution,
+      // An injected transport does not currently expose its served provider.
+      // Keep that uncertainty explicit so future reuse fails closed until an
+      // execution receipt can prove the provider/model that answered.
+      repositoryRoot: this._repoPath,
     });
-    certifyCodeResultOwnership(context, object.violations);
-    const dur = Date.now() - t0;
-    log.info(`[CLI] Code violations call done in ${dur}ms — ${object.violations.length} violations`);
-    this.collectUsage('code', cliUsage, dur);
-
-    return {
-      violations: object.violations.map((v) => ({
-        ruleKey: v.ruleKey,
-        filePath: v.filePath,
-        lineStart: v.lineStart,
-        lineEnd: v.lineEnd,
-        severity: v.severity,
-        title: v.title,
-        content: v.content,
-        fixPrompt: v.fixPrompt ?? null,
-        sourceTier: context.tier ?? 'full-file',
-      })),
-    };
+    const object = await this.executePlannedCodeViolationWork(planned, opts);
+    const request = planned.request;
+    if (request.resultContractId === 'analyze.code-lifecycle@1') {
+      return materializeProviderResult(
+        { family: 'code', mode: 'lifecycle', planned: { ...planned, request } },
+        object,
+      );
+    }
+    return materializeProviderResult(
+      { family: 'code', mode: 'normal', planned: { ...planned, request } },
+      object,
+    );
   }
 
   async generateAllCodeViolations(batches: CodeViolationContext[]): Promise<CodeViolationsResult> {
@@ -1072,6 +1332,10 @@ export class ClaudeCodeProvider extends BaseCLIProvider {
     this.selectedModel = selectedModel;
   }
 
+  get providerId(): string {
+    return 'claude-code';
+  }
+
   get binaryName(): string {
     return config.claudeCodeBinary ?? 'claude';
   }
@@ -1090,5 +1354,35 @@ export class ClaudeCodeProvider extends BaseCLIProvider {
     // CLAUDE_CODE_MODEL background default.
     const model = this.selectedModel || config.claudeCodeModel;
     return model ? ['--model', model] : [];
+  }
+
+  /**
+   * Create a resume-adapter-scoped executor that can prove and enforce the exact concrete
+   * Claude model recorded by a blocked run. The original requested alias stays
+   * in `execution`, so the certified work identity remains unchanged.
+   */
+  createPinnedResumeAdapter(resolvedModel: string): AnalyzeLlmExecutionAdapter {
+    if (this.transport || this.providerId !== 'claude-code') {
+      throw new Error('Resume model pinning is available only for direct Claude Code execution');
+    }
+    if (resolvedModel.length === 0) {
+      throw new Error('Resume model pin must be non-empty');
+    }
+    if (resolvedModel.trim() !== resolvedModel) {
+      throw new Error('Resume model pin must not contain surrounding whitespace');
+    }
+
+    const execution = this.execution;
+    const resumeExecution = Object.freeze({
+      ...execution,
+      modelSelection: 'pinned' as const,
+      resolvedModel,
+    });
+    return Object.freeze({
+      execution,
+      resumeExecution,
+      execute: (work: CertifiedAnalyzeLlmWork, options?: AnalyzeLlmExecutionOptions) =>
+        this.executeWithPinnedResumeModel(work, resolvedModel, options),
+    });
   }
 }

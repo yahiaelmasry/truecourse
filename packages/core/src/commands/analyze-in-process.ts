@@ -10,8 +10,20 @@ import type { RegistryEntry } from '../config/registry.js';
 import type { LLMProvider } from '../services/llm/provider.js';
 import type { LlmTransport } from '@truecourse/shared/llm';
 import type { StepTracker } from '../progress.js';
-import { analyzeCore, type LlmEstimate } from './analyze-core.js';
-import { persistFullAnalysis, type PersistFullResult } from './analyze-persist.js';
+import { analyzeCoreAndFinalize, type AnalyzeCoreResult, type LlmEstimate } from './analyze-core.js';
+import {
+  buildFullAnalysisFinalizationPlan,
+  persistFullAnalysis,
+  type PersistFullResult,
+} from './analyze-persist.js';
+import {
+  beginFinalizeAnalyzeRun,
+  dispatchAnalyzeRun,
+  prepareAnalyzeRunFinalization,
+  readAnalyzeRun,
+} from '../lib/analyze-run-journal.js';
+import { finalizePreparedAnalyzeRun } from '../lib/analyze-run-finalization.js';
+import { JournaledAnalyzeSessionLimitError } from '../services/llm/certified-violation-phase.js';
 import { config } from '../config/index.js';
 import { log } from '../lib/logger.js';
 import {
@@ -73,7 +85,9 @@ export class AnalysisSessionLimitError extends LlmSessionLimitError {
   constructor(error: LlmSessionLimitError) {
     super(error.resetHint);
     this.name = 'AnalysisSessionLimitError';
-    this.message = `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
+    this.message = error instanceof JournaledAnalyzeSessionLimitError
+      ? `${this.message} The interrupted run and any successful LLM results were checkpointed as the latest attempted run, but LATEST.json was not updated and the previous completed analysis remains unchanged. Resume and checkpoint reuse are not enabled yet, so starting a new run may repeat those calls.`
+      : `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
   }
 }
 
@@ -87,14 +101,70 @@ export async function analyzeInProcess(
       options.selectedModel || config.claudeCodeModel || 'default (chosen by Claude Code)'
     }, maxConcurrency: ${config.claudeCodeMaxConcurrency}`,
   );
-  let core: Awaited<ReturnType<typeof analyzeCore>>;
+  let core!: AnalyzeCoreResult;
+  let result: PersistFullResult;
   try {
-    core = await analyzeCore(project, { ...options, mode: 'full' });
+    result = await analyzeCoreAndFinalize(
+      project,
+      { ...options, mode: 'full', journalFullRun: true },
+      async (computed) => {
+        core = computed;
+        const certified = computed.pipelineResult.certifiedLlmExecution;
+        if (certified) {
+          try {
+            const plan = buildFullAnalysisFinalizationPlan(project, computed);
+            const executedAttempt = await readAnalyzeRun(project.path, { runId: certified.runId });
+            const finalizingAt = timestampAtOrAfter(executedAttempt?.updatedAt ?? computed.now);
+            await beginFinalizeAnalyzeRun(project.path, {
+              runId: certified.runId,
+              finalizingAt,
+            }, certified.completion);
+            const preparedAt = timestampAtOrAfter(finalizingAt);
+            await prepareAnalyzeRunFinalization(project.path, {
+              runId: certified.runId,
+              preparedAt,
+              promotion: plan.promotion,
+              projection: plan.projection,
+            });
+            await finalizePreparedAnalyzeRun(project.path, {
+              runId: certified.runId,
+              completedAt: timestampAtOrAfter(preparedAt),
+            });
+            return {
+              ...plan.result,
+              durationMs: Date.now() - startedAt,
+            };
+          } catch (error) {
+            const attempted = await readAnalyzeRun(
+              project.path,
+              { runId: certified.runId },
+            ).catch(() => null);
+            const recoverable = attempted?.finalization?.persistence === 'prepared';
+            if (
+              attempted
+              && !recoverable
+              && (attempted.state === 'running' || attempted.state === 'finalizing')
+            ) {
+              await dispatchAnalyzeRun(project.path, {
+                kind: 'fail',
+                runId: certified.runId,
+                failedAt: timestampAtOrAfter(attempted.updatedAt),
+                error: {
+                  code: 'ANALYZE_FINALIZATION_FAILED',
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              });
+            }
+            throw error;
+          }
+        }
+        return persistFullAnalysis(project, computed, startedAt);
+      },
+    );
   } catch (error) {
     if (isLlmSessionLimitError(error)) throw new AnalysisSessionLimitError(error);
     throw error;
   }
-  const result = await persistFullAnalysis(project, core, startedAt);
 
   if (options.source) {
     await trackEvent('analyze', {
@@ -113,3 +183,7 @@ export async function analyzeInProcess(
 
 // Re-export so the route can detect and remove a specific analysis's history entry.
 export { removeFromHistory };
+
+function timestampAtOrAfter(notBefore: string): string {
+  return new Date(Math.max(Date.now(), Date.parse(notBefore))).toISOString();
+}

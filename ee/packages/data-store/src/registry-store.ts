@@ -9,9 +9,15 @@
  * passes; the slug is derived with the shared `slugify`.
  */
 
-import { asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull, lt, or } from 'drizzle-orm';
 import { registry, type EeDb } from '@truecourse/ee-db';
-import { slugify, type RegistryEntry, type RegistryStore } from '@truecourse/core/config/registry';
+import {
+  slugify,
+  validateLastAnalyzedTimestamp,
+  type EnsureLastAnalyzedResult,
+  type RegistryEntry,
+  type RegistryStore,
+} from '@truecourse/core/config/registry';
 
 interface RegistryRow {
   slug: string;
@@ -105,10 +111,45 @@ export class PgRegistryStore implements RegistryStore {
       .where(eq(registry.slug, slug));
   }
 
-  async setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void> {
-    await this.db
+  async ensureLastAnalyzed(
+    slug: string,
+    isoTimestamp: string,
+  ): Promise<EnsureLastAnalyzedResult> {
+    validateLastAnalyzedTimestamp(isoTimestamp);
+    const current = await this.getProjectBySlug(slug);
+    if (!current) throw new Error('Cannot project lastAnalyzed for an untracked project');
+    if (current.lastAnalyzed) {
+      validateLastAnalyzedTimestamp(current.lastAnalyzed, 'Stored lastAnalyzed');
+      if (current.lastAnalyzed === isoTimestamp) return 'present';
+      if (current.lastAnalyzed > isoTimestamp) return 'superseded';
+    }
+    const updated = await this.db
       .update(registry)
       .set({ lastAnalyzed: isoTimestamp })
-      .where(eq(registry.slug, slug));
+      .where(and(
+        eq(registry.slug, slug),
+        or(isNull(registry.lastAnalyzed), lt(registry.lastAnalyzed, isoTimestamp)),
+      ))
+      .returning({ lastAnalyzed: registry.lastAnalyzed });
+    if (updated.length > 0) return 'updated';
+
+    const settled = await this.getProjectBySlug(slug);
+    if (!settled) throw new Error('Cannot project lastAnalyzed for an untracked project');
+    if (!settled.lastAnalyzed) {
+      throw new Error('Concurrent lastAnalyzed projection did not settle to a durable timestamp');
+    }
+    validateLastAnalyzedTimestamp(settled.lastAnalyzed, 'Stored lastAnalyzed');
+    if (settled.lastAnalyzed === isoTimestamp) return 'present';
+    if (settled.lastAnalyzed > isoTimestamp) return 'superseded';
+    throw new Error('Concurrent lastAnalyzed projection regressed below the requested timestamp');
+  }
+
+  async setLastAnalyzed(slug: string, isoTimestamp: string): Promise<void> {
+    try {
+      await this.ensureLastAnalyzed(slug, isoTimestamp);
+    } catch (error) {
+      if ((error as Error).message === 'Cannot project lastAnalyzed for an untracked project') return;
+      throw error;
+    }
   }
 }

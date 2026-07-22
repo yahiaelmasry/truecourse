@@ -72,6 +72,65 @@ The first `truecourse analyze` creates `.truecourse/` in your repo. Three files 
 
 Everything else (`analyses/`, `diff.json`, `history.json`, `ui-state.json`, `logs/`, `.analyze.lock`) is local-only and added to `.truecourse/.gitignore` automatically.
 
+Analyze attempts are tracked separately from the completed baseline under
+`.truecourse/analyses/runs/`. Each `<runId>.json` is an append-only-attempt
+journal entry, while `LATEST_ATTEMPT.json` points to the newest attempt. These
+files are local and gitignored: a running, blocked, or failed attempt never
+replaces the completed findings in `LATEST.json`. If a crash loses the pointer
+update after the run file is written, TrueCourse repairs it from the journals'
+durable attempt sequence. The versioned run-journal schema is owned by
+`packages/core/src/lib/analyze-run-journal.ts`. Schema v6 records the explicit
+execution-attempt number and activation time and reserves the durable
+`activated`/`executing` resume-admission states. Resume attempts that reuse a
+checkpoint carry an exact provider/resolved-model pin. A zero-checkpoint attempt
+instead records a requested-model bootstrap: its first successful call must
+prove a concrete model before that result is checkpointed, then every remaining
+call is pinned to that concrete model.
+It also records pending work,
+reset/failure information, durable execution admission, authenticated
+successful-work checkpoints, and an exact prepared finalization intent
+containing the completed-baseline promotion and secondary projection inputs.
+The intent is written to the attempted-run journal before completed artifacts
+are mutated and remains separate from `LATEST.json`.
+Prepared finalization replays completed-baseline promotion, idempotent history/
+diff/registry projections, and journal completion in that order. An exact retry
+repairs any interrupted step without replacing a newer completed descendant.
+The certified executor writes each accepted result and its usage evidence to
+the attempted-run journal before reporting that work item successful. Eligible
+journaled architecture runs therefore preserve paid successes, but reuse and
+Resume are not enabled yet. The certified planner can atomically activate an
+exact latest blocked attempt after compatibility checks, but provider execution
+is not yet wired into the production Resume flow. The journal's internal
+admission boundary durably records `executing` and revalidates the exact
+provider/model pin before and after that write, before allowing pending work to
+start. The certified runner can then replay checkpointed results, execute only
+pending work, and recover with zero calls after the final checkpoint; production
+analysis reconstruction and CLI Resume wiring remain later dependencies. A
+crash in an admitted attempt while work is still pending fails closed as
+ambiguous rather than guessing whether an uncheckpointed provider call ran.
+Resume accounting is derived once from the complete durable checkpoint ledger,
+deduplicated by provider attempt ID, and preserves each call's original
+checkpoint timestamp while discarding the provider's overlapping transient
+usage buffer.
+Schema-v1 through schema-v5 journals remain
+readable and normalize safely to schema v6 when a current lifecycle command
+writes them. Historical schema-v3 runs from before durable execution admission
+are normalized to the admitted revision lineage without rewriting the journal
+during a read-only status or compatibility inspection.
+
+The first production-wiring slice journals full analyses only when their LLM
+plan contains certified aggregate architecture work and no code-batch or
+database-schema work. Other full analyses still use the provider-wide session-
+limit circuit and keep the completed `LATEST.json` baseline safe, but their
+attempt is not journaled yet; the CLI error states which case occurred. Later
+provider-family contributions extend the same journal protocol to those plans.
+
+Completed analyses are promoted separately from attempted-run journals. Local
+prepared-promotion markers live under `.truecourse/analyses/.promotions/`
+while `LATEST.json` remains the commit point for the active completed baseline.
+The markers are local, gitignored, and removed after promotion or recovery;
+they never expose partial findings as the completed baseline.
+
 **First time, on `main`:**
 
 ```bash

@@ -33,6 +33,9 @@ class CountingTransport {
 }
 
 class TestProvider extends BaseCLIProvider {
+  get providerId() {
+    return 'test-provider';
+  }
   get binaryName() {
     return 'claude';
   }
