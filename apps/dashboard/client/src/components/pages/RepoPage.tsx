@@ -79,6 +79,11 @@ import { useViolations } from '@/hooks/useViolations';
 import { useDiffCheck } from '@/hooks/useDiffCheck';
 import { useAnalysisList } from '@/hooks/useAnalysisList';
 import { useAnalyzeRunStatus } from '@/hooks/useAnalyzeRunStatus';
+import {
+  isActiveAnalysisProgress,
+  isSettledResumeActivity,
+  shouldClearSettledResumeProgress,
+} from '@/lib/analysis-activity';
 import { useCodeViolationSummary } from '@/hooks/useCodeViolationSummary';
 import { useFlows } from '@/hooks/useFlows';
 import { Button } from '@/components/ui/button';
@@ -283,7 +288,16 @@ function RepoPageInner() {
     isLoading: analyzeRunStatusLoading,
     error: analyzeRunStatusError,
     refetch: refetchAnalyzeRunStatus,
+    resume: resumeAnalyzeRun,
+    resumeRunId,
+    resumeError,
   } = useAnalyzeRunStatus(repoId, hasVerifiedLocalFilesystem && leftTab === 'analyses');
+  const previousAnalyzeRunMode = useRef(analyzeRunStatus?.activeMode);
+  const previousResumeRunId = useRef(resumeRunId);
+  const initiatedResumeRepoId = useRef<string | null>(null);
+  const currentRepoId = useRef(repoId);
+  currentRepoId.current = repoId;
+  const progressIsResume = analysisProgress?.mode === 'resume';
   const graphAnalysisId = isDiffMode && diffResult?.diffAnalysisId
     ? diffResult.diffAnalysisId
     : selectedAnalysisId ?? undefined;
@@ -514,14 +528,51 @@ function RepoPageInner() {
   // Sync isAnalyzing with server-side progress (handles page refresh mid-analysis)
   // Skip in diff mode — diff check uses isDiffChecking instead
   useEffect(() => {
-    if (analysisProgress && !isAnalyzing && !isDiffMode) {
+    if (isActiveAnalysisProgress(analysisProgress) && !isAnalyzing && !isDiffMode) {
       setIsAnalyzing(true);
     }
   }, [analysisProgress, isAnalyzing, isDiffMode]);
 
+  useEffect(() => {
+    if (analyzeRunStatus === null) return;
+    const activeMode = analyzeRunStatus?.activeMode;
+    if (activeMode === 'resume' || resumeRunId !== null) {
+      setIsAnalyzing(true);
+    } else if (isSettledResumeActivity({
+      statusAvailable: true,
+      activeMode,
+      previousMode: previousAnalyzeRunMode.current,
+      hadPendingAction: previousResumeRunId.current !== null,
+      initiated: initiatedResumeRepoId.current === repoId,
+    })) {
+      setIsAnalyzing(false);
+      if (shouldClearSettledResumeProgress(
+        previousAnalyzeRunMode.current,
+        activeMode,
+        analysisProgress,
+        previousResumeRunId.current !== null,
+        initiatedResumeRepoId.current === repoId,
+      )) {
+        clearProgress();
+      }
+      initiatedResumeRepoId.current = null;
+    }
+    previousAnalyzeRunMode.current = activeMode;
+    previousResumeRunId.current = resumeRunId;
+  }, [analysisProgress, analyzeRunStatus, clearProgress, repoId, resumeRunId]);
+
+  useEffect(() => {
+    if (initiatedResumeRepoId.current && initiatedResumeRepoId.current !== repoId) {
+      initiatedResumeRepoId.current = null;
+      setIsAnalyzing(false);
+      clearProgress();
+    }
+  }, [clearProgress, repoId]);
+
   // Listen for analysis complete/canceled to update state
   useEffect(() => {
     const unsub1 = onEvent('analysis:complete', () => {
+      initiatedResumeRepoId.current = null;
       setIsAnalyzing(false);
       setIsCancelling(false);
       refetchGraph();
@@ -543,8 +594,14 @@ function RepoPageInner() {
   }, [onEvent, refetchGraph, refetchAnalyses, refetchCodeViolationSummary, refetchFlows, refetchAnalyzeRunStatus, repoId]);
 
   useEffect(() => {
-    if (analysisProgress?.step === 'error') void refetchAnalyzeRunStatus();
-  }, [analysisProgress?.step, refetchAnalyzeRunStatus]);
+    if (analysisProgress?.step === 'error') {
+      if (analysisProgress.mode === 'resume') {
+        initiatedResumeRepoId.current = null;
+        setIsAnalyzing(false);
+      }
+      void refetchAnalyzeRunStatus();
+    }
+  }, [analysisProgress?.mode, analysisProgress?.step, refetchAnalyzeRunStatus]);
 
   // Refresh guard/spec staleness after a Scan / guard-generate / guard-run. The
   // server emits `spec:complete` with a kind — the corpus Scan updates its view
@@ -606,6 +663,24 @@ function RepoPageInner() {
       } catch (error) {
         setIsAnalyzing(false);
         setAnalysisError(error instanceof Error ? error.message : 'Analysis failed');
+      }
+    }
+  };
+
+  const handleResumeAnalysis = async (runId: string) => {
+    const initiatingRepoId = repoId;
+    initiatedResumeRepoId.current = initiatingRepoId;
+    setIsAnalyzing(true);
+    setAnalysisError(null);
+    try {
+      await resumeAnalyzeRun(runId);
+    } catch (error) {
+      if (initiatedResumeRepoId.current === initiatingRepoId) {
+        initiatedResumeRepoId.current = null;
+      }
+      setIsAnalyzing(false);
+      if (currentRepoId.current === initiatingRepoId) {
+        setAnalysisError(error instanceof Error ? error.message : 'Analysis Resume failed');
       }
     }
   };
@@ -1481,6 +1556,9 @@ function RepoPageInner() {
               runStatus={analyzeRunStatus}
               runStatusLoading={analyzeRunStatusLoading}
               runStatusError={analyzeRunStatusError}
+              resumeRunId={resumeRunId}
+              resumeError={resumeError}
+              onResume={handleResumeAnalysis}
             />
           ) : leftTab === 'home' || leftTab === 'analytics' || leftTab === 'violations' ? (
             repo == null ? (
@@ -1718,6 +1796,7 @@ function RepoPageInner() {
           className={`fixed bottom-4 left-1/2 z-40 w-80 -translate-x-1/2 rounded-lg border bg-card p-3 shadow-lg ${
             analysisProgress.step === 'error' ? 'border-destructive/50' : 'border-border'
           }`}
+          role={analysisProgress.step === 'error' ? 'alert' : 'status'}
         >
           <div className="mb-2 flex items-center justify-between">
             <span
@@ -1726,7 +1805,9 @@ function RepoPageInner() {
               }`}
             >
               {analysisProgress.step === 'error'
-                ? 'Analysis failed'
+                ? progressIsResume ? 'Resume stopped' : 'Analysis failed'
+                : progressIsResume
+                  ? 'Resuming analysis...'
                 : isCancelling
                   ? 'Cancelling...'
                   : 'Analyzing...'}
@@ -1742,6 +1823,10 @@ function RepoPageInner() {
               >
                 <X className="h-3.5 w-3.5" />
               </button>
+            ) : progressIsResume ? (
+              <span className="shrink-0 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                Protected from cancellation
+              </span>
             ) : isCancelling ? (
               <span className="shrink-0 px-1.5 py-0.5 text-[10px] text-amber-500">Cancelling...</span>
             ) : (

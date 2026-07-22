@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { describe, expect, it, vi } from 'vitest';
 import type { AnalyzeRunStatusResponse } from '@truecourse/shared';
 import { AnalysisRunStatusCard } from '@/components/analyses/AnalysisRunStatusCard';
 import { AnalysesPanel } from '@/components/analyses/AnalysesPanel';
@@ -36,8 +37,16 @@ const blockedStatus: AnalyzeRunStatusResponse = {
 };
 
 describe('AnalysisRunStatusCard', () => {
-  it('keeps the latest attempted run distinct from the active completed baseline', () => {
-    render(<AnalysisRunStatusCard status={blockedStatus} />);
+  it('keeps the baseline distinct and starts Resume for the exact attempted run', async () => {
+    const onResume = vi.fn(async () => undefined);
+    render(
+      <AnalysisRunStatusCard
+        status={blockedStatus}
+        resumeRunId={null}
+        resumeError={null}
+        onResume={onResume}
+      />,
+    );
 
     expect(screen.getByRole('region', { name: 'Latest run' })).toHaveTextContent('blocked');
     expect(screen.getByText('60/100 LLM checks complete')).toBeInTheDocument();
@@ -48,7 +57,41 @@ describe('AnalysisRunStatusCard', () => {
     const completed = screen.getByRole('region', { name: 'Active completed analysis' });
     expect(completed).toHaveTextContent('analysis-safe-456');
     expect(completed).toHaveTextContent('trustworthy findings baseline');
-    expect(screen.queryByRole('button', { name: /resume/i })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Resume' }));
+    expect(onResume).toHaveBeenCalledWith('run-blocked-123');
+    expect(screen.getByText(/revalidates saved inputs and checkpoints before reuse/i)).toBeInTheDocument();
+    expect(screen.getByText(/CLI fallback/i)).toBeInTheDocument();
+  });
+
+  it.each([
+    ['resume', null, 'Resuming…'],
+    ['analysis', null, 'Another analysis is running'],
+    [null, 'run-blocked-123', 'Starting Resume…'],
+  ] as const)('disables the action for activeMode=%s and starting=%s', (activeMode, resumeRunId, label) => {
+    render(
+      <AnalysisRunStatusCard
+        status={{ ...blockedStatus, activeMode }}
+        resumeRunId={resumeRunId}
+        resumeError={null}
+        onResume={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: label })).toBeDisabled();
+  });
+
+  it('reports admission errors beside the exact Resume action', () => {
+    render(
+      <AnalysisRunStatusCard
+        status={blockedStatus}
+        resumeRunId={null}
+        resumeError="The selected attempted run is no longer the latest."
+        onResume={async () => undefined}
+      />,
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent(/no longer the latest/i);
+    expect(screen.getByRole('button', { name: 'Resume' })).toBeEnabled();
   });
 
   it('explains why dashboard Resume is unavailable without inventing an action', () => {
@@ -66,6 +109,9 @@ describe('AnalysisRunStatusCard', () => {
             },
           },
         }}
+        resumeRunId={null}
+        resumeError={null}
+        onResume={async () => undefined}
       />,
     );
 
@@ -92,6 +138,9 @@ describe('AnalysisRunStatusCard', () => {
             resume: { available: false, scope: 'structural', reason },
           },
         }}
+        resumeRunId={null}
+        resumeError={null}
+        onResume={async () => undefined}
       />,
     );
 
@@ -110,6 +159,9 @@ describe('AnalysisRunStatusCard', () => {
         runStatus={blockedStatus}
         runStatusLoading={false}
         runStatusError={null}
+        resumeRunId={null}
+        resumeError={null}
+        onResume={async () => undefined}
       />,
     );
 
@@ -128,6 +180,9 @@ describe('AnalysisRunStatusCard', () => {
         runStatus={null}
         runStatusLoading={false}
         runStatusError="temporary disconnect"
+        resumeRunId={null}
+        resumeError={null}
+        onResume={async () => undefined}
       />,
     );
 

@@ -16,6 +16,9 @@ type AnalysesPanelProps = {
   runStatus: AnalyzeRunStatusResponse | null;
   runStatusLoading: boolean;
   runStatusError: string | null;
+  resumeRunId: string | null;
+  resumeError: string | null;
+  onResume: (runId: string) => Promise<void>;
 };
 
 const severityColors: Record<string, string> = {
@@ -106,6 +109,9 @@ export function AnalysesPanel({
   runStatus,
   runStatusLoading,
   runStatusError,
+  resumeRunId,
+  resumeError,
+  onResume,
 }: AnalysesPanelProps) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [usageAnalysisId, setUsageAnalysisId] = useState<string | null>(null);
@@ -148,7 +154,12 @@ export function AnalysesPanel({
       )}
 
       {runStatus ? (
-        <AnalysisRunStatusCard status={runStatus} />
+        <AnalysisRunStatusCard
+          status={runStatus}
+          resumeRunId={resumeRunId}
+          resumeError={resumeError}
+          onResume={onResume}
+        />
       ) : runStatusLoading ? (
         <div
           className="mb-4 flex h-24 items-center justify-center rounded-lg border border-border"

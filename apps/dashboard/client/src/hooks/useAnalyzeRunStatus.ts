@@ -9,12 +9,27 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
   const [statusRepoId, setStatusRepoId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(enabled);
   const [error, setError] = useState<string | null>(null);
+  const [resumeRunId, setResumeRunId] = useState<string | null>(null);
+  const [resumeFailure, setResumeFailure] = useState<{ runId: string; message: string } | null>(null);
   const requestSequence = useRef(0);
   const inFlight = useRef<{ repoId: string; requestId: number } | null>(null);
+  const resumeSequence = useRef(0);
+  const currentRepoId = useRef(repoId);
+  currentRepoId.current = repoId;
+  const resumeAction = useRef<{
+    repoId: string;
+    runId: string;
+    actionId: number;
+    phase: 'posting' | 'reconciling';
+  } | null>(null);
 
-  const refetch = useCallback(async (background = false) => {
+  const refetch = useCallback(async (background = false, force = false) => {
     if (!enabled || !repoId) return;
-    if (inFlight.current?.repoId === repoId) return;
+    if (!force && inFlight.current?.repoId === repoId) return;
+    if (force) {
+      requestSequence.current += 1;
+      inFlight.current = null;
+    }
     const requestId = ++requestSequence.current;
     inFlight.current = { repoId, requestId };
     if (!background) setIsLoading(true);
@@ -25,6 +40,12 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
       setStatus(nextStatus);
       setStatusRepoId(repoId);
       setError(null);
+      const action = resumeAction.current;
+      if (action?.repoId === repoId && action.phase === 'reconciling') {
+        resumeAction.current = null;
+        setResumeRunId(null);
+      }
+      return nextStatus;
     } catch (cause) {
       if (requestId !== requestSequence.current) return;
       setError(cause instanceof Error ? cause.message : 'Unable to read analyze-run status');
@@ -34,6 +55,39 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     }
   }, [enabled, repoId]);
 
+  const resume = useCallback(async (runId: string): Promise<void> => {
+    if (!enabled || !repoId) throw new Error('Analyze Resume is unavailable.');
+    if (resumeAction.current?.repoId === repoId) return;
+
+    const actionId = ++resumeSequence.current;
+    const action = { repoId, runId, actionId, phase: 'posting' as const };
+    resumeAction.current = action;
+    requestSequence.current += 1;
+    inFlight.current = null;
+    setResumeRunId(runId);
+    setResumeFailure(null);
+
+    try {
+      await api.resumeAnalyzeRun(repoId, runId);
+      if (resumeSequence.current !== actionId || resumeAction.current !== action) return;
+      resumeAction.current = { ...action, phase: 'reconciling' };
+      await refetch(true, true);
+    } catch (cause) {
+      if (resumeSequence.current !== actionId || resumeAction.current?.actionId !== actionId) {
+        if (currentRepoId.current === repoId) throw cause;
+        return;
+      }
+      resumeAction.current = null;
+      setResumeRunId(null);
+      setResumeFailure({
+        runId,
+        message: cause instanceof Error ? cause.message : 'Unable to start Analyze Resume',
+      });
+      await refetch(true, true);
+      throw cause;
+    }
+  }, [enabled, refetch, repoId]);
+
   useEffect(() => {
     if (!enabled || !repoId) {
       requestSequence.current += 1;
@@ -42,16 +96,24 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
       setStatusRepoId(null);
       setIsLoading(false);
       setError(null);
+      resumeSequence.current += 1;
+      resumeAction.current = null;
+      setResumeRunId(null);
+      setResumeFailure(null);
       return;
     }
 
     setError(null);
+    setResumeRunId(null);
+    setResumeFailure(null);
     void refetch();
     const timer = window.setInterval(() => void refetch(true), STATUS_POLL_MS);
     return () => {
       window.clearInterval(timer);
       requestSequence.current += 1;
       inFlight.current = null;
+      resumeSequence.current += 1;
+      resumeAction.current = null;
     };
   }, [enabled, refetch, repoId]);
 
@@ -60,5 +122,11 @@ export function useAnalyzeRunStatus(repoId: string, enabled = true) {
     isLoading,
     error,
     refetch,
+    resume,
+    resumeRunId,
+    resumeError: resumeFailure && statusRepoId === repoId
+      && status?.latestAttempt?.runId === resumeFailure.runId
+      ? resumeFailure.message
+      : null,
   };
 }

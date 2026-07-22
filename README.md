@@ -113,11 +113,11 @@ executes only pending checks, and promotes the candidate only after complete
 finalization.
 It deliberately installs no graceful SIGINT cancellation handler: an abrupt
 interruption remains durably recoverable or execution-ambiguous instead of
-being mislabeled as a safe retryable failure. The local dashboard server exposes
-an exact-run Resume endpoint with protected execution ownership, but the dashboard
-Resume action remains a later #791 dependency. The local dashboard now exposes the latest attempted run and
-its durable progress separately from the active completed analysis, but keeps
-that view informational until dashboard Resume is added. The CLI will not silently replace incomplete paid work:
+being mislabeled as a safe retryable failure. The local dashboard exposes the
+latest attempted run and its durable progress separately from the active
+completed analysis. Its exact-run Resume action revalidates saved inputs before
+checkpoint reuse, reports progress and provider reset failures, and protects
+admitted execution from unsafe cancellation. The CLI will not silently replace incomplete paid work:
 resumable attempts direct the user toward recovery, execution-ambiguous
 attempts fail closed, and starting over requires exact acknowledgement with
 `--abandon-attempt <run-id>`. Dashboard enforcement and recovery actions follow
@@ -132,7 +132,7 @@ internal admission boundary durably records `executing` and revalidates the
 exact provider/model pin before and after that write, before allowing pending
 work to start. The certified runner can recover with zero calls after the final
 checkpoint, and a prepared finalization can be replayed without provider work;
-dashboard Resume wiring remains a later dependency. A
+dashboard Start over enforcement and automatic reset waiting remain later dependencies. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
 Resume accounting is derived once from the complete durable checkpoint ledger,

@@ -1,4 +1,4 @@
-import { Clock, ShieldCheck } from 'lucide-react';
+import { Clock, Loader2, RotateCcw, ShieldCheck } from 'lucide-react';
 import type {
   AnalyzeRunResumeUnavailableReason,
   AnalyzeRunStatusResponse,
@@ -6,6 +6,9 @@ import type {
 
 interface AnalysisRunStatusCardProps {
   status: AnalyzeRunStatusResponse;
+  resumeRunId: string | null;
+  resumeError: string | null;
+  onResume: (runId: string) => Promise<void>;
 }
 
 const unavailableMessages: Record<AnalyzeRunResumeUnavailableReason, string> = {
@@ -18,7 +21,12 @@ const unavailableMessages: Record<AnalyzeRunResumeUnavailableReason, string> = {
   'run-completed': 'this run is already completed',
 };
 
-export function AnalysisRunStatusCard({ status }: AnalysisRunStatusCardProps) {
+export function AnalysisRunStatusCard({
+  status,
+  resumeRunId,
+  resumeError,
+  onResume,
+}: AnalysisRunStatusCardProps) {
   const attempt = status.latestAttempt;
   const completed = status.activeCompletedAnalysis;
 
@@ -65,12 +73,37 @@ export function AnalysisRunStatusCard({ status }: AnalysisRunStatusCardProps) {
               </div>
             )}
             {attempt.resume.available ? (
-              <div className="rounded-md bg-muted/60 p-2 text-[11px] leading-4 text-muted-foreground">
-                <div>Structurally resumable. The CLI revalidates saved inputs before admission:</div>
-                <code className="mt-1 block break-all text-foreground">
-                  truecourse analyze resume {attempt.runId}
-                </code>
-                <div className="mt-1">Dashboard Resume is not available yet.</div>
+              <div className="space-y-2 rounded-md bg-muted/60 p-2 text-[11px] leading-4 text-muted-foreground">
+                <button
+                  type="button"
+                  disabled={resumeRunId === attempt.runId || status.activeMode !== null}
+                  onClick={() => void onResume(attempt.runId)}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {resumeRunId === attempt.runId || status.activeMode === 'resume' ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-3.5 w-3.5" />
+                  )}
+                  {resumeRunId === attempt.runId
+                    ? 'Starting Resume…'
+                    : status.activeMode === 'resume'
+                      ? 'Resuming…'
+                      : status.activeMode === 'analysis'
+                        ? 'Another analysis is running'
+                        : 'Resume'}
+                </button>
+                <div>
+                  Resume revalidates saved inputs and checkpoints before reuse, then runs only
+                  pending work. The active completed analysis remains trustworthy until promotion.
+                </div>
+                <div>
+                  CLI fallback:
+                  {' '}<code className="break-all text-foreground">truecourse analyze resume {attempt.runId}</code>
+                </div>
+                {resumeError && (
+                  <div className="text-destructive" role="alert">{resumeError}</div>
+                )}
               </div>
             ) : (
               <div className="text-[11px] text-muted-foreground">

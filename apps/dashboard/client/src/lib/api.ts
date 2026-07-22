@@ -11,6 +11,7 @@ import type {
   GuardScenarioInventory,
   GuardScenarioSource,
   GuardStaleness,
+  AnalyzeResumeAcceptedResponse,
   AnalyzeRunStatusResponse,
 } from '@truecourse/shared';
 import type { LlmEstimateData } from '@/hooks/useSocket';
@@ -252,6 +253,16 @@ export function getAnalyses(repoId: string): Promise<AnalysisSummary[]> {
 
 export function getAnalyzeRunStatus(repoId: string): Promise<AnalyzeRunStatusResponse> {
   return fetchApi<AnalyzeRunStatusResponse>(`/api/repos/${repoId}/analyses/status`);
+}
+
+export function resumeAnalyzeRun(
+  repoId: string,
+  runId: string,
+): Promise<AnalyzeResumeAcceptedResponse> {
+  return fetchApi<AnalyzeResumeAcceptedResponse>(
+    `/api/repos/${repoId}/analyses/${encodeURIComponent(runId)}/resume`,
+    { method: 'POST' },
+  );
 }
 
 export function getAnalysisUsage(repoId: string, analysisId: string): Promise<AnalysisUsageRow[]> {
