@@ -92,8 +92,10 @@ It also records pending work,
 reset/failure information, durable execution admission, authenticated
 successful-work checkpoints, and an exact prepared finalization intent
 containing the completed-baseline promotion and secondary projection inputs.
-The intent is written to the attempted-run journal before completed artifacts
-are mutated and remains separate from `LATEST.json`.
+Certified production finalization enters `finalizing` with that intent in one
+atomic journal write, before completed artifacts are mutated, so a crash cannot
+expose an unprepared production finalization. The intent remains separate from
+`LATEST.json`.
 Prepared finalization replays completed-baseline promotion, idempotent history/
 diff/registry projections, and journal completion in that order. An exact retry
 repairs any interrupted step without replacing a newer completed descendant.

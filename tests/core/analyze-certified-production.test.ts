@@ -30,6 +30,7 @@ import {
   setAnalysisStore,
 } from '../../packages/core/src/lib/analysis-store.js';
 import {
+  beginFinalizeAnalyzeRun,
   dispatchAnalyzeRun,
   readAnalyzeRun,
   resetAnalyzeRunStorage,
@@ -419,6 +420,35 @@ describe('certified full analyze production path', () => {
       enableLlmRulesOverride: false,
       skipStash: true,
     })).resolves.toMatchObject({ analysisId: expect.any(String) });
+  }, 30_000);
+
+  it('blocks replacement of a legacy finalizing attempt whose recovery intent is absent', async () => {
+    const computed = await analyzeCore(project, {
+      mode: 'full',
+      journalFullRun: true,
+      source: 'cli',
+      provider: new EmptyDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      skipStash: true,
+    });
+    const certified = computed.pipelineResult.certifiedLlmExecution;
+    expect(certified).not.toBeNull();
+    if (!certified) throw new Error('Expected a certified LLM execution');
+    await beginFinalizeAnalyzeRun(workDir, {
+      runId: certified.runId,
+      finalizingAt: '2099-07-19T10:00:03.000Z',
+    }, certified.completion);
+
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'abandon', runId: certified.runId },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'recovery-required',
+      runId: certified.runId,
+    });
   }, 30_000);
 
   it('rejects exact replacement of a durable execution-ambiguous attempt', async () => {

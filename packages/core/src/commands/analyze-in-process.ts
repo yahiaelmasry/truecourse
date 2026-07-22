@@ -21,9 +21,8 @@ import {
   type PersistFullResult,
 } from './analyze-persist.js';
 import {
-  beginFinalizeAnalyzeRun,
+  beginPreparedAnalyzeRunFinalization,
   dispatchAnalyzeRun,
-  prepareAnalyzeRunFinalization,
   readAnalyzeRun,
 } from '../lib/analyze-run-journal.js';
 import { finalizePreparedAnalyzeRun } from '../lib/analyze-run-finalization.js';
@@ -229,6 +228,7 @@ async function validateLatestAttemptExpectation(
   }
   if (
     (latest.resume.available && latest.state !== 'blocked')
+    || latest.state === 'finalizing'
     || latest.finalization?.persistence === 'prepared'
   ) {
     throw new AnalysisStartBlockedError('recovery-required', latest.runId);
@@ -289,17 +289,14 @@ async function finalizeCertifiedAnalysis(
     const plan = buildFullAnalysisFinalizationPlan(project, computed);
     const executedAttempt = await readAnalyzeRun(project.path, { runId: certified.runId });
     const finalizingAt = timestampAtOrAfter(executedAttempt?.updatedAt ?? computed.now);
-    await beginFinalizeAnalyzeRun(project.path, {
+    const preparedAt = timestampAtOrAfter(finalizingAt);
+    await beginPreparedAnalyzeRunFinalization(project.path, {
       runId: certified.runId,
       finalizingAt,
-    }, certified.completion);
-    const preparedAt = timestampAtOrAfter(finalizingAt);
-    await prepareAnalyzeRunFinalization(project.path, {
-      runId: certified.runId,
       preparedAt,
       promotion: plan.promotion,
       projection: plan.projection,
-    });
+    }, certified.completion);
     await finalizePreparedAnalyzeRun(project.path, {
       runId: certified.runId,
       completedAt: timestampAtOrAfter(preparedAt),

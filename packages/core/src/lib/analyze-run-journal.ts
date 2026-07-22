@@ -253,6 +253,11 @@ export interface PrepareAnalyzeRunFinalizationCommand {
   projection: CompletedAnalysisProjectionIntent;
 }
 
+export interface BeginPreparedAnalyzeRunFinalizationCommand
+  extends PrepareAnalyzeRunFinalizationCommand {
+  finalizingAt: string;
+}
+
 export interface ActivateAnalyzeRunResumeCommand extends Omit<BeginAnalyzeRunCommand, 'kind'> {
   kind: 'activate-resume';
   activatedAt: string;
@@ -1967,6 +1972,120 @@ export async function beginFinalizeAnalyzeRun(
 }
 
 /**
+ * Atomically bind certified execution completion and its exact recovery input.
+ * The durable revision advances by two logical lifecycle steps in one CAS so a
+ * process cannot expose a finalizing run without the intent needed to recover it.
+ */
+export async function beginPreparedAnalyzeRunFinalization(
+  repoKey: string,
+  command: BeginPreparedAnalyzeRunFinalizationCommand,
+  completion: AnalyzeRunExecutionCompletion,
+): Promise<AnalyzeRunView> {
+  if (
+    (typeof completion !== 'object' && typeof completion !== 'function')
+    || completion === null
+  ) {
+    throw new InvalidAnalyzeRunTransitionError('Invalid analyze execution completion receipt');
+  }
+  const certified = inspectAnalyzeRunExecutionCompletion(completion);
+  if (!certified) {
+    throw new InvalidAnalyzeRunTransitionError('Invalid analyze execution completion receipt');
+  }
+  const storage = activeStorage;
+  const detached = detachExactJson(command, 'Analyze finalization intent');
+  const runId = validateRunId(detached.runId);
+  if (
+    certified.storage !== storage
+    || certified.scopeKey !== activationScopeKey(repoKey, storage)
+    || certified.runId !== runId
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze execution completion does not belong to run ${runId}`,
+    );
+  }
+  const current = await storage.read(repoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+
+  const finalizingAt = validateTimestamp(detached.finalizingAt, 'finalizingAt');
+  const preparedAt = validateTimestamp(detached.preparedAt, 'preparedAt');
+  const storedIntent = buildStoredFinalizationIntent(
+    current,
+    detached,
+    finalizingAt,
+  );
+  const retryMatches = (
+    current.status.state === 'finalizing'
+    && current.plan.state === 'sealed'
+    && current.revision === certified.revision + 2
+    && current.status.finalizingAt === finalizingAt
+    && isDeepStrictEqual(current.finalizationIntent, storedIntent)
+    && certified.workKey === activationWorkKey(current.plan.work)
+    && isDeepStrictEqual(certified.execution, current.plan.execution)
+    && current.plan.work.every((item) => item.state !== 'pending')
+  );
+  if (retryMatches) {
+    certified.claimed = true;
+    return toView(current);
+  }
+  if (current.status.state !== 'running' || current.plan.state !== 'sealed') {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot prepare finalization for analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+  if (
+    certified.claimed
+    || certified.revision !== current.revision
+    || certified.workKey !== activationWorkKey(current.plan.work)
+    || !isDeepStrictEqual(certified.execution, current.plan.execution)
+    || current.plan.work.some((item) => item.state !== 'succeeded-checkpointed')
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze execution completion does not certify run ${runId}'s current sealed plan`,
+    );
+  }
+  if (
+    Date.parse(finalizingAt) < Date.parse(current.plan.sealedAt)
+    || Date.parse(finalizingAt) < Date.parse(current.updatedAt)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} finalization cannot precede its latest durable progress`,
+    );
+  }
+  if (Date.parse(preparedAt) < Date.parse(finalizingAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} finalization preparation cannot precede finalizing`,
+    );
+  }
+
+  const next: StoredAnalyzeRun = {
+    ...current,
+    schemaVersion: SCHEMA_VERSION,
+    revision: current.revision + 2,
+    updatedAt: preparedAt,
+    status: { state: 'finalizing', finalizingAt },
+    finalizationIntent: storedIntent,
+    plan: current.plan,
+  };
+  certified.claimed = true;
+  try {
+    await storage.compareAndSwap(repoKey, runId, current.revision, next);
+    assertAnalyzeRunStorage(storage);
+    const durablyPrepared = await storage.read(repoKey, runId);
+    assertAnalyzeRunStorage(storage);
+    if (!durablyPrepared || !isDeepStrictEqual(durablyPrepared, next)) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} sealed execution changed during finalization`,
+      );
+    }
+    return toView(durablyPrepared);
+  } catch (error) {
+    certified.claimed = false;
+    throw error;
+  }
+}
+
+/**
  * Durably bind the exact recovery input before completed-baseline promotion.
  * This command changes only the attempted-run journal.
  */
@@ -1975,8 +2094,9 @@ export async function prepareAnalyzeRunFinalization(
   command: PrepareAnalyzeRunFinalizationCommand,
 ): Promise<AnalyzeRunView> {
   const storage = activeStorage;
-  const runId = validateRunId(command.runId);
-  const preparedAt = validateTimestamp(command.preparedAt, 'preparedAt');
+  const detachedCommand = detachExactJson(command, 'Analyze finalization intent');
+  const runId = validateRunId(detachedCommand.runId);
+  const preparedAt = validateTimestamp(detachedCommand.preparedAt, 'preparedAt');
   const current = await storage.read(repoKey, runId);
   assertAnalyzeRunStorage(storage);
   if (!current) throw new AnalyzeRunNotFoundError(runId);
@@ -1986,52 +2106,11 @@ export async function prepareAnalyzeRunFinalization(
     );
   }
 
-  let persisted: unknown;
-  try {
-    persisted = JSON.parse(JSON.stringify(command));
-  } catch {
-    throw new InvalidAnalyzeRunTransitionError('Analyze finalization intent must be exactly JSON-round-trippable');
-  }
-  if (!isDeepStrictEqual(persisted, command)) {
-    throw new InvalidAnalyzeRunTransitionError('Analyze finalization intent must be exactly JSON-round-trippable');
-  }
-
-  const detachedCommand = persisted as PrepareAnalyzeRunFinalizationCommand;
-  const filename = buildAnalysisFilename(
-    detachedCommand.promotion.snapshot.id,
-    detachedCommand.promotion.snapshot.createdAt,
+  const storedIntent = buildStoredFinalizationIntent(
+    current,
+    detachedCommand,
+    current.status.finalizingAt,
   );
-  validateCompletedAnalysisPromotion(detachedCommand.promotion, filename);
-  validateCompletedAnalysisProjectionIntent(detachedCommand.projection);
-  const expectedBaselineId = detachedCommand.promotion.expectedBaseline?.analysis.id ?? null;
-  if (
-    detachedCommand.promotion.snapshot.id !== current.candidateAnalysisId
-    || expectedBaselineId !== current.completedBaselineId
-    || detachedCommand.promotion.snapshot.branch !== current.branch
-    || detachedCommand.promotion.snapshot.commitHash !== current.commitHash
-    || !isDeepStrictEqual(
-      detachedCommand.projection.promotedSnapshot,
-      detachedCommand.promotion.snapshot,
-    )
-  ) {
-    throw new InvalidAnalyzeRunTransitionError(
-      `Analyze finalization intent does not match run ${runId}`,
-    );
-  }
-  if (Date.parse(preparedAt) < Date.parse(current.status.finalizingAt)) {
-    throw new InvalidAnalyzeRunTransitionError(
-      `Analyze run ${runId} finalization preparation cannot precede finalizing`,
-    );
-  }
-
-  const storedIntent: StoredAnalyzeRunFinalizationIntent = {
-    preparedAt,
-    promotion: detachedCommand.promotion,
-    projection: {
-      projectSlug: detachedCommand.projection.projectSlug,
-      historyEntry: detachedCommand.projection.historyEntry,
-    },
-  };
   if (current.finalizationIntent !== null) {
     if (!isDeepStrictEqual(current.finalizationIntent, storedIntent)) {
       throw new InvalidAnalyzeRunTransitionError(
@@ -2051,6 +2130,62 @@ export async function prepareAnalyzeRunFinalization(
   await storage.compareAndSwap(repoKey, runId, current.revision, next);
   assertAnalyzeRunStorage(storage);
   return toView(next);
+}
+
+function detachExactJson<T>(value: T, label: string): T {
+  let persisted: unknown;
+  try {
+    persisted = JSON.parse(JSON.stringify(value));
+  } catch {
+    throw new InvalidAnalyzeRunTransitionError(
+      `${label} must be exactly JSON-round-trippable`,
+    );
+  }
+  if (!isDeepStrictEqual(persisted, value)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `${label} must be exactly JSON-round-trippable`,
+    );
+  }
+  return persisted as T;
+}
+
+function buildStoredFinalizationIntent(
+  current: StoredAnalyzeRun,
+  command: PrepareAnalyzeRunFinalizationCommand,
+  finalizingAt: string,
+): StoredAnalyzeRunFinalizationIntent {
+  const preparedAt = validateTimestamp(command.preparedAt, 'preparedAt');
+  const filename = buildAnalysisFilename(
+    command.promotion.snapshot.id,
+    command.promotion.snapshot.createdAt,
+  );
+  validateCompletedAnalysisPromotion(command.promotion, filename);
+  validateCompletedAnalysisProjectionIntent(command.projection);
+  const expectedBaselineId = command.promotion.expectedBaseline?.analysis.id ?? null;
+  if (
+    command.promotion.snapshot.id !== current.candidateAnalysisId
+    || expectedBaselineId !== current.completedBaselineId
+    || command.promotion.snapshot.branch !== current.branch
+    || command.promotion.snapshot.commitHash !== current.commitHash
+    || !isDeepStrictEqual(command.projection.promotedSnapshot, command.promotion.snapshot)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze finalization intent does not match run ${current.runId}`,
+    );
+  }
+  if (Date.parse(preparedAt) < Date.parse(finalizingAt)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${current.runId} finalization preparation cannot precede finalizing`,
+    );
+  }
+  return {
+    preparedAt,
+    promotion: command.promotion,
+    projection: {
+      projectSlug: command.projection.projectSlug,
+      historyEntry: command.projection.historyEntry,
+    },
+  };
 }
 
 async function failRun(

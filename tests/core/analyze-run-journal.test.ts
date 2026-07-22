@@ -13,6 +13,7 @@ import {
   InvalidAnalyzeRunTransitionError,
   activateAnalyzeRunResume,
   beginFinalizeAnalyzeRun,
+  beginPreparedAnalyzeRunFinalization,
   dispatchAnalyzeRun,
   prepareAnalyzeRunFinalization,
   readAnalyzeRun,
@@ -538,6 +539,56 @@ describe('analyze run journal', () => {
 
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(finalizing);
+  });
+
+  it('atomically enters finalizing with exact recovery input already prepared', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'atomic-finalization-run',
+      candidateAnalysisId: 'atomic-finalization-analysis',
+      startedAt: '2026-07-19T01:30:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'abc456',
+      completedBaselineId: null,
+    });
+    const execution = await certifySuccessfulExecution(repoPath, 'atomic-finalization-run');
+    const payload = finalizationPayload('atomic-finalization-analysis');
+
+    const command = {
+      runId: 'atomic-finalization-run',
+      finalizingAt: '2026-07-19T01:30:02.000Z',
+      preparedAt: '2026-07-19T01:30:03.000Z',
+      ...payload,
+    };
+    const prepared = await beginPreparedAnalyzeRunFinalization(
+      repoPath,
+      command,
+      execution.completion,
+    );
+
+    expect(prepared).toMatchObject({
+      revision: 5,
+      state: 'finalizing',
+      counts: { total: 1, pending: 0, running: 0, succeeded: 1, failed: 0 },
+      finalization: {
+        finalizingAt: '2026-07-19T01:30:02.000Z',
+        persistence: 'prepared',
+        preparedAt: '2026-07-19T01:30:03.000Z',
+      },
+    });
+    await expect(readPreparedAnalyzeRunFinalization(
+      repoPath,
+      'atomic-finalization-run',
+    )).resolves.toEqual({
+      preparedAt: '2026-07-19T01:30:03.000Z',
+      ...payload,
+    });
+    await expect(beginPreparedAnalyzeRunFinalization(
+      repoPath,
+      command,
+      execution.completion,
+    )).resolves.toEqual(prepared);
   });
 
   it('durably prepares exact finalization recovery input without changing analysis projections', async () => {
@@ -1695,7 +1746,7 @@ describe('analyze run journal', () => {
     }, execution.completion)).resolves.toMatchObject({ revision: 4, state: 'finalizing' });
   });
 
-  it('rejects finalization when hosted storage changes execution during the finalization write', async () => {
+  it('rejects atomic preparation when hosted storage changes execution during the write', async () => {
     const repoKey = 'hosted:finalization-execution-write-drift';
     let stored: StoredAnalyzeRun | null = null;
     const storage: AnalyzeRunStorage = {
@@ -1733,7 +1784,7 @@ describe('analyze run journal', () => {
       startedAt: '2026-07-19T01:45:00.000Z',
       source: 'hosted',
       branch: 'main',
-      commitHash: 'finalization-execution-write-drift-commit',
+      commitHash: 'abc456',
       completedBaselineId: null,
     });
     const execution = await certifySuccessfulExecution(
@@ -1742,13 +1793,16 @@ describe('analyze run journal', () => {
       '2026-07-19T01:45:01.000Z',
     );
 
-    await expect(beginFinalizeAnalyzeRun(repoKey, {
+    await expect(beginPreparedAnalyzeRunFinalization(repoKey, {
       runId: 'finalization-execution-write-drift',
       finalizingAt: '2026-07-19T01:45:02.000Z',
+      preparedAt: '2026-07-19T01:45:03.000Z',
+      ...finalizationPayload('finalization-execution-write-drift-analysis'),
     }, execution.completion)).rejects.toThrow(/sealed execution changed during finalization/);
     expect(stored).toMatchObject({
-      revision: 4,
+      revision: 5,
       status: { state: 'finalizing' },
+      finalizationIntent: { preparedAt: '2026-07-19T01:45:03.000Z' },
       plan: { execution: { provider: 'claude-code', requestedModel: 'sonnet' } },
     });
   });

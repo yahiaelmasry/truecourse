@@ -216,6 +216,41 @@ describe('analyze run CLI status', () => {
       .not.toContain('--abandon-attempt');
   });
 
+  it('does not offer start-over for a legacy finalizing attempt without recovery input', async () => {
+    const status = blockedStatus();
+    status.latestAttempt!.state = 'finalizing';
+    status.latestAttempt!.blocked = null;
+    status.latestAttempt!.counts = {
+      total: 2,
+      pending: 0,
+      running: 0,
+      succeeded: 2,
+      failed: 0,
+    };
+    status.latestAttempt!.finalization = {
+      finalizingAt: '2026-07-19T10:00:03.000Z',
+      persistence: 'unprepared',
+      preparedAt: null,
+    };
+    status.latestAttempt!.resume = {
+      available: false,
+      scope: 'structural',
+      reason: 'finalization-unprepared',
+    };
+
+    await expect(resolveAnalyzeStartExpectation({
+      repositoryKey: '/repo',
+      abandonAttemptRunId: 'run-interrupted',
+      readStatus: async () => status,
+      interactive: false,
+      confirmAbandon: async () => true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'recovery-required',
+      runId: 'run-interrupted',
+    });
+  });
+
   it('blocks an execution-ambiguous attempt even with exact replacement input', async () => {
     const status = blockedStatus();
     status.latestAttempt!.state = 'running';

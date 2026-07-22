@@ -151,6 +151,7 @@ function requiresRecoveryBeforeReplacement(status: AnalyzeRunStatus): boolean {
   const run = status.latestAttempt;
   if (run === null || run.state === 'completed') return false;
   return (run.resume.available && run.state !== 'blocked')
+    || run.state === 'finalizing'
     || run.finalization?.persistence === 'prepared';
 }
 
