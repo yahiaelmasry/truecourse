@@ -2,7 +2,12 @@ import * as p from "@clack/prompts";
 import fs from "node:fs";
 import path from "node:path";
 import { agentTransport } from "@truecourse/shared/llm";
-import { analyzeInProcess } from "@truecourse/core/commands/analyze-in-process";
+import {
+  AnalysisSessionLimitError,
+  AnalysisStartBlockedError,
+  analyzeInProcess,
+  type LatestAttemptExpectation,
+} from "@truecourse/core/commands/analyze-in-process";
 import { StepTracker, buildAnalysisSteps, type AnalysisStep } from "@truecourse/core/progress";
 import { ensureRepoTruecourseDir, resolveRepoDir, wipeLegacyPostgresData } from "@truecourse/core/config/paths";
 import { registerProject, type RegistryEntry } from "@truecourse/core/config/registry";
@@ -15,6 +20,10 @@ import { promptLlmEstimate } from "./llm-prompt.js";
 import { promptModelChoice } from "./model-prompt.js";
 import { showFirstRunNotice } from "../telemetry.js";
 import { recordAnalyzeAndMaybePrompt } from "../community-prompts.js";
+import {
+  formatAnalysisStartBlockedError,
+  resolveAnalyzeStartExpectation,
+} from "./analyze-runs.js";
 
 async function resolveOrInitProject(): Promise<RegistryEntry> {
   const repoDir = resolveRepoDir(process.cwd()) ?? process.cwd();
@@ -167,6 +176,8 @@ export interface AnalyzeOptions {
   stash?: boolean;
   /** Force-install / force-skip the Claude Code skills first-run prompt. */
   installSkills?: boolean;
+  /** Exact incomplete attempted run explicitly acknowledged for replacement. */
+  abandonAttemptRunId?: string;
 }
 
 /** Resolve the per-run `enableLlmRules` decision from flag + config + TTY state. */
@@ -260,6 +271,35 @@ export async function runAnalyze(options: AnalyzeOptions = {}): Promise<void> {
   const project = await resolveOrInitProject();
   p.log.step(`Repository: ${project.name}`);
 
+  let latestAttemptExpectation: LatestAttemptExpectation;
+  try {
+    const resolved = await resolveAnalyzeStartExpectation({
+      repositoryKey: project.path,
+      abandonAttemptRunId: options.abandonAttemptRunId,
+      interactive: isInteractive(),
+      confirmAbandon: async (message) => {
+        const answer = await p.confirm({ message });
+        return !p.isCancel(answer) && answer;
+      },
+    });
+    if (resolved === null) {
+      p.cancel("Starting over cancelled — the saved attempt was left unchanged");
+      return;
+    }
+    latestAttemptExpectation = resolved;
+    if (options.abandonAttemptRunId) {
+      p.log.warn(
+        `Starting over from attempted run ${options.abandonAttemptRunId}; paid LLM calls may repeat. The active completed analysis stays canonical until this run succeeds.`,
+      );
+    }
+  } catch (error) {
+    p.log.error(error instanceof AnalysisStartBlockedError
+      ? formatAnalysisStartBlockedError(error)
+      : error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+    return;
+  }
+
   // First-time setup convenience: offer to install Claude Code skills if
   // they haven't been installed for this repo yet. `--install-skills` /
   // `--no-skills` bypasses the prompt; non-interactive runs skip silently.
@@ -341,6 +381,7 @@ export async function runAnalyze(options: AnalyzeOptions = {}): Promise<void> {
       enableLlmRulesOverride: enableLlmRules,
       selectedModel,
       source: "cli",
+      latestAttemptExpectation,
       onLlmEstimate: async (estimate) => {
         stopSpinner();
         const proceed = await promptLlmEstimate(estimate, {
@@ -364,7 +405,16 @@ export async function runAnalyze(options: AnalyzeOptions = {}): Promise<void> {
       p.outro("Analysis cancelled");
       process.exit(130);
     }
-    p.log.error(err instanceof Error ? err.message : String(err));
+    if (err instanceof AnalysisStartBlockedError) {
+      p.log.error(formatAnalysisStartBlockedError(err));
+    } else if (err instanceof AnalysisSessionLimitError) {
+      const run = err.runId ? ` Saved run: ${err.runId}.` : '';
+      p.log.error(
+        `${err.message} Inspect attempted-run progress with truecourse analyze status.${run} The CLI Resume action is not available in this version; a later full analysis will not silently replace eligible saved work.`,
+      );
+    } else {
+      p.log.error(err instanceof Error ? err.message : String(err));
+    }
     process.exit(1);
   } finally {
     process.removeListener("SIGINT", onSigint);

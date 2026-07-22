@@ -129,14 +129,27 @@ const analyzeCmd = program
   .option("--io <dir>", "Mailbox dir for --llm-transport agent (request/response files)")
   .option("--stash", "Pre-approve stashing pending changes before analysis")
   .option("--no-stash", "Analyze the working tree as-is without stashing")
+  .option("--abandon-attempt <run-id>", "Acknowledge replacing one exact incomplete attempted run")
   .option("--install-skills", "Install Claude Code skills without prompting")
   .option("--no-skills", "Skip the Claude Code skills prompt")
   .action(async (options) => {
     const llm: boolean | undefined = typeof options.llm === "boolean" ? options.llm : undefined;
     const stash: boolean | undefined = typeof options.stash === "boolean" ? options.stash : undefined;
     const installSkills = resolveInstallSkills(options);
-    const common = { llm, stash, installSkills, llmTransport: options.llmTransport, io: options.io };
+    const common = {
+      llm,
+      stash,
+      installSkills,
+      llmTransport: options.llmTransport,
+      io: options.io,
+      abandonAttemptRunId: options.abandonAttempt,
+    };
     if (options.diff) {
+      if (options.abandonAttempt) {
+        p.log.error("--abandon-attempt applies only to a full analysis, not --diff");
+        process.exitCode = 1;
+        return;
+      }
       await runAnalyzeDiff(common);
     } else {
       await runAnalyze(common);
@@ -146,7 +159,12 @@ const analyzeCmd = program
 analyzeCmd
   .command("status")
   .description("Show the latest attempted run and active completed analysis")
-  .action(async () => {
+  .action(async (_options, command: Command) => {
+    if (command.parent?.opts().abandonAttempt) {
+      p.log.error("--abandon-attempt applies only to a full analysis, not status");
+      process.exitCode = 1;
+      return;
+    }
     await runAnalyzeStatus();
   });
 

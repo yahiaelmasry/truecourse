@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ARCHITECTURE_LLM_RULES } from '../../packages/analyzer/src/index.js';
 import { analyzeCore } from '../../packages/core/src/commands/analyze-core.js';
 import {
+  AnalysisStartBlockedError,
   AnalysisResumeUnavailableError,
   analyzeInProcess,
   resumeAnalyzeInProcess,
@@ -29,6 +30,7 @@ import {
   setAnalysisStore,
 } from '../../packages/core/src/lib/analysis-store.js';
 import {
+  dispatchAnalyzeRun,
   readAnalyzeRun,
   resetAnalyzeRunStorage,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
@@ -321,6 +323,230 @@ describe('certified full analyze production path', () => {
     });
   }, 30_000);
 
+  it('rechecks and permits exact CLI replacement of a structurally resumable attempt', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new LimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const interrupted = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'none-incomplete' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'expectation-changed',
+      runId: interrupted?.runId,
+    });
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'abandon', runId: interrupted!.runId },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).resolves.toMatchObject({ analysisId: expect.any(String) });
+    await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
+      runId: interrupted?.runId,
+      state: 'blocked',
+    });
+  }, 30_000);
+
+  it('does not guard adapters that have not yet exposed an attempted-run recovery action', async () => {
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new LimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+
+    await expect(analyzeInProcess(project, {
+      source: 'dashboard',
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).resolves.toMatchObject({ analysisId: expect.any(String) });
+  }, 30_000);
+
+  it('requires exact consent to replace a non-resumable incomplete attempt', async () => {
+    await dispatchAnalyzeRun(workDir, {
+      kind: 'begin',
+      runId: 'non-resumable-attempt',
+      candidateAnalysisId: 'non-resumable-analysis',
+      startedAt: '2026-07-19T10:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'old',
+      completedBaselineId: null,
+    });
+
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'none-incomplete' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'expectation-changed',
+      runId: 'non-resumable-attempt',
+    });
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'abandon', runId: 'wrong-attempt' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'expectation-changed',
+    });
+
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'abandon', runId: 'non-resumable-attempt' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).resolves.toMatchObject({ analysisId: expect.any(String) });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { status: 'completed' },
+    });
+
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'none-incomplete' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).resolves.toMatchObject({ analysisId: expect.any(String) });
+  }, 30_000);
+
+  it('rejects exact replacement of a durable execution-ambiguous attempt', async () => {
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    resetAnalyzeRunStorage();
+    await analyzeCore(project, {
+      mode: 'full',
+      resumeFullRunId: blocked!.runId,
+      provider: new ResumingDirectClaudeProvider(),
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    });
+
+    const runPath = path.join(
+      workDir,
+      '.truecourse',
+      'analyses',
+      'runs',
+      `${blocked!.runId}.json`,
+    );
+    const stored = JSON.parse(fs.readFileSync(runPath, 'utf8')) as {
+      revision: number;
+      updatedAt: string;
+      executionAttempt: { resume: { admittedAt: string } };
+      plan: {
+        work: Array<{
+          state: string;
+          checkpoint?: { checkpointedAt: string };
+        }>;
+      };
+    };
+    const admittedAt = stored.executionAttempt.resume.admittedAt;
+    const resumedCheckpoint = stored.plan.work.find(
+      (item) => item.checkpoint && item.checkpoint.checkpointedAt >= admittedAt,
+    );
+    expect(resumedCheckpoint).toBeDefined();
+    resumedCheckpoint!.state = 'pending';
+    delete resumedCheckpoint!.checkpoint;
+    stored.revision -= 1;
+    stored.updatedAt = admittedAt;
+    fs.writeFileSync(runPath, `${JSON.stringify(stored, null, 2)}\n`);
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
+      runId: blocked!.runId,
+      state: 'running',
+      resume: { available: false, reason: 'resume-execution-ambiguous' },
+    });
+    const newerBaseline = await analyzeInProcess(project, {
+      source: 'dashboard',
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: newerBaseline.analysisId, status: 'completed' },
+    });
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'abandon', runId: blocked!.runId },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'resume-execution-ambiguous',
+      runId: blocked!.runId,
+    });
+  }, 30_000);
+
+  it('rechecks an observed absence of incomplete attempts inside the lifecycle lock', async () => {
+    await dispatchAnalyzeRun(workDir, {
+      kind: 'begin',
+      runId: 'concurrent-attempt',
+      candidateAnalysisId: 'concurrent-analysis',
+      startedAt: '2026-07-19T10:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'concurrent',
+      completedBaselineId: null,
+    });
+
+    const error = await analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'none-incomplete' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(AnalysisStartBlockedError);
+    expect(error).toMatchObject({
+      reason: 'expectation-changed',
+      runId: 'concurrent-attempt',
+    });
+  }, 30_000);
+
+  it('does not treat disappearance of an expected completed baseline as supersession', async () => {
+    await dispatchAnalyzeRun(workDir, {
+      kind: 'begin',
+      runId: 'missing-baseline-attempt',
+      candidateAnalysisId: 'missing-baseline-candidate',
+      startedAt: '2026-07-19T10:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'old',
+      completedBaselineId: 'disappeared-analysis',
+    });
+
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'none-incomplete' },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'expectation-changed',
+      runId: 'missing-baseline-attempt',
+    });
+    await expect(readLatest(workDir)).resolves.toBeNull();
+  }, 30_000);
+
   it('blocks a direct-CLI attempt with reset information without replacing the completed baseline', async () => {
     await analyzeInProcess(project, {
       enableLlmRulesOverride: false,
@@ -355,7 +581,7 @@ describe('certified full analyze production path', () => {
       },
     });
     expect(outcome.error instanceof Error ? outcome.error.message : '').toMatch(
-      /successful LLM results were checkpointed.*LATEST\.json was not updated.*truecourse analyze status.*starting a new run may repeat paid calls/is,
+      /successful LLM results were checkpointed.*LATEST\.json was not updated.*durable attempt can be inspected.*resumed through the core API.*Starting a replacement may repeat paid calls/is,
     );
     await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
       state: 'blocked',
@@ -741,7 +967,7 @@ describe('certified full analyze production path', () => {
       resetHint: 'tomorrow 8pm (Africa/Cairo)',
     });
     expect(failure instanceof Error ? failure.message : '').toMatch(
-      /saved as the latest attempted run.*truecourse analyze status.*Core API callers can attempt Resume.*CLI\/dashboard Resume actions remain later.*starting a new run may repeat paid calls/is,
+      /saved as the latest attempted run.*durable attempt can be inspected.*resumed through the core API.*Starting a replacement may repeat paid calls/is,
     );
 
     expect(provider.stages).toEqual(['analyze.module']);
@@ -969,6 +1195,16 @@ describe('certified full analyze production path', () => {
 
     setAnalysisStore(baseStore);
     resetAnalyzeRunStorage();
+    await expect(analyzeInProcess(project, {
+      latestAttemptExpectation: { kind: 'abandon', runId: attempted!.runId },
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    })).rejects.toMatchObject({
+      name: 'AnalysisStartBlockedError',
+      reason: 'recovery-required',
+      runId: attempted!.runId,
+    });
+
     const provider = new NeverCallDirectClaudeProvider();
     const recovered = await resumeAnalyzeInProcess(project, {
       runId: attempted!.runId,

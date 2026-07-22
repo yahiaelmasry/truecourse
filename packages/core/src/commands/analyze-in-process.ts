@@ -5,7 +5,11 @@
  * the internal split becomes core-compute vs mode-specific-persist.
  */
 
-import { readLatest, removeFromHistory } from '../lib/analysis-store.js';
+import {
+  activeCompletedBaselineId,
+  readLatest,
+  removeFromHistory,
+} from '../lib/analysis-store.js';
 import type { RegistryEntry } from '../config/registry.js';
 import type { LLMProvider } from '../services/llm/provider.js';
 import type { LlmTransport } from '@truecourse/shared/llm';
@@ -42,6 +46,27 @@ import {
 } from '../services/telemetry.service.js';
 
 export type { LlmEstimate };
+
+export type LatestAttemptExpectation =
+  | Readonly<{ kind: 'none-incomplete' }>
+  | Readonly<{ kind: 'abandon'; runId: string }>;
+
+export type AnalysisStartBlockedReason =
+  | 'resume-required'
+  | 'recovery-required'
+  | 'resume-execution-ambiguous'
+  | 'abandon-confirmation-required'
+  | 'expectation-changed';
+
+export class AnalysisStartBlockedError extends Error {
+  constructor(
+    readonly reason: AnalysisStartBlockedReason,
+    readonly runId: string | null,
+  ) {
+    super(`Analysis start blocked: ${reason}${runId === null ? '' : ` (${runId})`}`);
+    this.name = 'AnalysisStartBlockedError';
+  }
+}
 
 export interface AnalyzeInProcessOptions {
   /**
@@ -80,6 +105,12 @@ export interface AnalyzeInProcessOptions {
    * we can attribute analyses to CLI vs dashboard. Omit to skip telemetry.
    */
   source?: TelemetrySource;
+  /**
+   * Exact incomplete latest attempt the user acknowledged replacing. Opt-in
+   * adapters must obtain this from a read-only status check; core rechecks it
+   * under the repository lifecycle lock before any analysis work starts.
+   */
+  latestAttemptExpectation?: LatestAttemptExpectation;
 }
 
 export interface ResumeAnalyzeInProcessOptions extends Pick<
@@ -116,7 +147,7 @@ export class AnalysisSessionLimitError extends LlmSessionLimitError {
     this.name = 'AnalysisSessionLimitError';
     this.runId = error instanceof JournaledAnalyzeSessionLimitError ? error.runId : null;
     this.message = error instanceof JournaledAnalyzeSessionLimitError
-      ? `${this.message} The interrupted run was saved as the latest attempted run and any successful LLM results were checkpointed, but LATEST.json was not updated and the previous completed analysis remains unchanged. Inspect it with truecourse analyze status. Core API callers can attempt Resume after the provider limit resets; CLI/dashboard Resume actions remain later #791 dependencies, and starting a new run may repeat paid calls.`
+      ? `${this.message} The interrupted run was saved as the latest attempted run and any successful LLM results were checkpointed, but LATEST.json was not updated and the previous completed analysis remains unchanged. The durable attempt can be inspected and, when eligible, resumed through the core API after the provider limit resets. Starting a replacement may repeat paid calls.`
       : `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
   }
 }
@@ -133,6 +164,7 @@ export async function analyzeInProcess(
   );
   let core!: AnalyzeCoreResult;
   let result: PersistFullResult;
+  const startExpectation = options.latestAttemptExpectation;
   try {
     result = await analyzeCoreAndFinalize(
       project,
@@ -143,6 +175,9 @@ export async function analyzeInProcess(
         if (finalized) return finalized;
         return persistFullAnalysis(project, computed, startedAt);
       },
+      startExpectation === undefined
+        ? undefined
+        : () => validateLatestAttemptExpectation(project.path, startExpectation),
     );
   } catch (error) {
     if (isLlmSessionLimitError(error)) throw new AnalysisSessionLimitError(error);
@@ -162,6 +197,43 @@ export async function analyzeInProcess(
   }
 
   return result;
+}
+
+async function validateLatestAttemptExpectation(
+  repositoryKey: string,
+  expectation: LatestAttemptExpectation,
+): Promise<Readonly<{ handled: false }>> {
+  const [latest, completed] = await Promise.all([
+    readAnalyzeRun(repositoryKey, 'latest-attempt'),
+    readLatest(repositoryKey),
+  ]);
+  if (latest === null || latest.state === 'completed') {
+    if (expectation.kind === 'none-incomplete') return { handled: false };
+    throw new AnalysisStartBlockedError('expectation-changed', latest?.runId ?? null);
+  }
+
+  if (!latest.resume.available && latest.resume.reason === 'resume-execution-ambiguous') {
+    throw new AnalysisStartBlockedError('resume-execution-ambiguous', latest.runId);
+  }
+
+  const activeCompletedId = completed === null ? null : activeCompletedBaselineId(completed);
+  const superseded = activeCompletedId !== null
+    && latest.completedBaselineId !== activeCompletedId
+    && latest.candidateAnalysisId !== activeCompletedId;
+  if (superseded) {
+    if (expectation.kind === 'none-incomplete') return { handled: false };
+    throw new AnalysisStartBlockedError('expectation-changed', latest.runId);
+  }
+  if (expectation.kind === 'none-incomplete' || latest.runId !== expectation.runId) {
+    throw new AnalysisStartBlockedError('expectation-changed', latest.runId);
+  }
+  if (
+    (latest.resume.available && latest.state !== 'blocked')
+    || latest.finalization?.persistence === 'prepared'
+  ) {
+    throw new AnalysisStartBlockedError('recovery-required', latest.runId);
+  }
+  return { handled: false };
 }
 
 /** Resume one explicitly selected durable full-analysis attempt. */
