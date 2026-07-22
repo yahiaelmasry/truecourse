@@ -9,6 +9,32 @@ export interface LlmWorkExecutionIntent {
   readonly requestedModel: string | null;
 }
 
+export function validateLlmWorkExecutionIntent(
+  value: unknown,
+): Readonly<LlmWorkExecutionIntent> {
+  if (typeof value !== 'object' || value === null) {
+    throw new TypeError('Invalid LLM execution intent');
+  }
+  const execution = value as Record<string, unknown>;
+  if (
+    typeof execution.provider !== 'string'
+    || execution.provider.length === 0
+    || execution.provider.trim() !== execution.provider
+    || execution.provider === 'transport:unverified'
+    || (execution.requestedModel !== null && (
+      typeof execution.requestedModel !== 'string'
+      || execution.requestedModel.length === 0
+      || execution.requestedModel.trim() !== execution.requestedModel
+    ))
+  ) {
+    throw new TypeError('Invalid LLM execution intent');
+  }
+  return Object.freeze({
+    provider: execution.provider,
+    requestedModel: execution.requestedModel,
+  }) as Readonly<LlmWorkExecutionIntent>;
+}
+
 export interface LlmWorkComponentFingerprints {
   readonly repository: string;
   readonly baseline: string;

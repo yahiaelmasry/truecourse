@@ -205,6 +205,7 @@ async function prepareRun(
   }, adapter);
   const activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
     runId,
     sealedAt: '2026-07-19T10:00:01.000Z',
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({

@@ -118,6 +118,7 @@ beforeEach(async () => {
   });
   activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'sonnet' },
     runId: 'checkpoint-run',
     sealedAt: '2026-07-19T04:00:01.000Z',
     work: certified.manifest.work,

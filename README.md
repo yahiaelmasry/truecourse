@@ -79,7 +79,9 @@ files are local and gitignored: a running, blocked, or failed attempt never
 replaces the completed findings in `LATEST.json`. If a crash loses the pointer
 update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
-`packages/core/src/lib/analyze-run-journal.ts`. Schema v6 records the explicit
+`packages/core/src/lib/analyze-run-journal.ts`. Schema v7 binds the sealed work
+plan to its provider and originally requested model so a later process can
+reconstruct the same execution choice. Schema v6 records the explicit
 execution-attempt number and activation time and reserves the durable
 `activated`/`executing` resume-admission states. Resume attempts that reuse a
 checkpoint carry an exact provider/resolved-model pin. A zero-checkpoint attempt
@@ -112,9 +114,10 @@ Resume accounting is derived once from the complete durable checkpoint ledger,
 deduplicated by provider attempt ID, and preserves each call's original
 checkpoint timestamp while discarding the provider's overlapping transient
 usage buffer.
-Schema-v1 through schema-v5 journals remain
-readable and normalize safely to schema v6 when a current lifecycle command
-writes them. Historical schema-v3 runs from before durable execution admission
+Schema-v1 through schema-v6 journals remain readable. A current lifecycle write
+normalizes a sealed legacy plan to schema v7 with an explicit
+`legacy-unbound` execution marker; it remains inspectable but is not resumable
+under an unproven provider/model choice. Historical schema-v3 runs from before durable execution admission
 are normalized to the admitted revision lineage without rewriting the journal
 during a read-only status or compatibility inspection.
 

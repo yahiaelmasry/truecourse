@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -14,6 +22,7 @@ import {
 import {
   type AnalyzeRunStorage,
   type StoredAnalyzeRun,
+  beginFinalizeAnalyzeRun,
   dispatchAnalyzeRun,
   resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
@@ -207,6 +216,7 @@ async function activate(
   });
   return sealAnalyzeRunPlan(repository, {
     kind: 'seal-plan',
+    execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
     runId,
     sealedAt: '2026-07-19T00:00:01.000Z',
     work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -660,6 +670,7 @@ describe('certified analyze LLM run', () => {
     });
     const sealCommand = {
       kind: 'seal-plan' as const,
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId,
       sealedAt: '2026-07-19T00:00:01.000Z',
       work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -816,6 +827,7 @@ describe('certified analyze LLM run', () => {
     });
     await dispatchAnalyzeRun(secondRepository, {
       kind: 'seal-plan',
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'retargeted-alias',
       sealedAt: '2026-07-19T00:00:01.000Z',
       work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
@@ -865,6 +877,26 @@ describe('certified analyze LLM run', () => {
     }));
   });
 
+  it.each([
+    { provider: ' claude-code', requestedModel: 'opus[1m]' },
+    { provider: 'claude-code ', requestedModel: 'opus[1m]' },
+    { provider: 'claude-code', requestedModel: '' },
+    { provider: 'claude-code', requestedModel: ' opus[1m]' },
+    { provider: 'claude-code', requestedModel: 'opus[1m] ' },
+  ])('rejects execution intent that cannot be sealed and resumed: %j', (execution) => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution,
+      async execute(work) { return outcomeFor(work); },
+    };
+
+    expect(() => certifyAnalyzeLlmRun({
+      runId: 'invalid-execution-intent',
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter)).toThrow(expect.objectContaining({ code: 'provider-not-certifiable' }));
+  });
+
   it('revalidates provider intent after durable activation', async () => {
     let execution = { provider: 'claude-code', requestedModel: 'opus[1m]' };
     const calls: CertifiedAnalyzeLlmWork[] = [];
@@ -891,6 +923,50 @@ describe('certified analyze LLM run', () => {
       completion: expect.any(Object),
     });
     expect(calls).toHaveLength(1);
+  });
+
+  it('does not issue an activation receipt when storage changes the sealed execution write', async () => {
+    const repoKey = 'hosted:sealed-execution-write-drift';
+    let stored: StoredAnalyzeRun | null = null;
+    const storage: AnalyzeRunStorage = {
+      async createLatest(_receivedRepoKey, run) {
+        stored = { ...run, attemptSequence: 1 };
+        return stored;
+      },
+      async read(_receivedRepoKey, runId) {
+        return stored?.runId === runId ? stored : null;
+      },
+      async readLatest() { return stored; },
+      async inspectLatest() { return stored; },
+      async compareAndSwap(_receivedRepoKey, _runId, expectedRevision, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = expectedRevision === 0 && next.plan.state === 'sealed'
+          ? {
+              ...next,
+              plan: {
+                ...next.plan,
+                execution: { provider: 'other-provider', requestedModel: 'other-model' },
+              },
+            }
+          : next;
+      },
+      async compareAndSwapLatest(_receivedRepoKey, _runId, expectedRevision, _attempt, _latest, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = next;
+      },
+    };
+    setAnalyzeRunStorage(storage);
+    const adapter = new RecordingAdapter();
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'sealed-execution-write-drift',
+      journalKey: repoKey,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+
+    await expect(activate(certified, 'sealed-execution-write-drift', repoKey))
+      .rejects.toThrow(/sealed plan changed during activation/);
+    expect(adapter.calls).toEqual([]);
   });
 
   it('revalidates provider intent after the durable admission write', async () => {
@@ -949,6 +1025,94 @@ describe('certified analyze LLM run', () => {
     await expect(result).rejects.toMatchObject({ code: 'provider-not-certifiable' });
     expect(calls).toEqual([]);
     expect(stored).toMatchObject({ revision: 2, status: { state: 'running' } });
+  });
+
+  it('revalidates the sealed execution identity after the durable admission write', async () => {
+    const repoKey = 'hosted:durable-execution-admission-drift';
+    let stored: StoredAnalyzeRun | null = null;
+    const storage: AnalyzeRunStorage = {
+      async createLatest(_receivedRepoKey, run) {
+        stored = { ...run, attemptSequence: 1 };
+        return stored;
+      },
+      async read(_receivedRepoKey, runId) {
+        return stored?.runId === runId ? stored : null;
+      },
+      async readLatest() { return stored; },
+      async inspectLatest() { return stored; },
+      async compareAndSwap(_receivedRepoKey, _runId, expectedRevision, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = expectedRevision === 1 && next.plan.state === 'sealed'
+          ? {
+              ...next,
+              plan: {
+                ...next.plan,
+                execution: { provider: 'other-provider', requestedModel: 'opus[1m]' },
+              },
+            }
+          : next;
+      },
+      async compareAndSwapLatest(_receivedRepoKey, _runId, expectedRevision, _attempt, _latest, next) {
+        expect(stored).toMatchObject({ revision: expectedRevision });
+        stored = next;
+      },
+    };
+    setAnalyzeRunStorage(storage);
+    const calls: CertifiedAnalyzeLlmWork[] = [];
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
+      async execute(work) {
+        calls.push(work);
+        return outcomeFor(work);
+      },
+    };
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'durable-execution-admission-drift',
+      journalKey: repoKey,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, adapter);
+    const activation = await activate(certified, 'durable-execution-admission-drift', repoKey);
+
+    await expect(certified.execute(activation)).rejects.toThrow(
+      /sealed execution changed during provider admission/,
+    );
+    expect(calls).toEqual([]);
+    expect(stored).toMatchObject({
+      revision: 2,
+      plan: { execution: { provider: 'other-provider' } },
+    });
+  });
+
+  it('does not finalize after the certified sealed execution identity changes', async () => {
+    const runId = 'completion-execution-drift';
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, new RecordingAdapter());
+    const activation = await activate(certified, runId);
+    const execution = await certified.execute(activation);
+    const file = path.join(
+      journalRepository,
+      '.truecourse',
+      'analyses',
+      'runs',
+      `${runId}.json`,
+    );
+    const stored = JSON.parse(readFileSync(file, 'utf8')) as {
+      plan: { execution: unknown };
+    };
+    stored.plan.execution = { provider: 'other-provider', requestedModel: 'opus[1m]' };
+    writeFileSync(file, `${JSON.stringify(stored, null, 2)}\n`);
+    const before = readFileSync(file);
+
+    await expect(beginFinalizeAnalyzeRun(journalRepository, {
+      runId,
+      finalizingAt: '2026-07-19T00:00:03.000Z',
+    }, execution.completion)).rejects.toThrow(/does not certify.*current sealed plan/);
+    expect(readFileSync(file)).toEqual(before);
   });
 
   it('drains admitted siblings before preserving the provider failure', async () => {

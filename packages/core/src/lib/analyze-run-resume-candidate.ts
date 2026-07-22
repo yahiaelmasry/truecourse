@@ -62,6 +62,10 @@ export interface AnalyzeRunResumeCandidate {
   }>;
   readonly plan: 'unsealed' | Readonly<{
     sealedAt: string;
+    execution: null | Readonly<{
+      provider: string;
+      requestedModel: string | null;
+    }>;
     work: readonly AnalyzeRunResumeWorkCandidate[];
   }>;
 }
