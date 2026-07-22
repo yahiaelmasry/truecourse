@@ -1880,11 +1880,17 @@ export async function admitAnalyzeRunResumeExecution<T>(
         .filter((item) => item.state === 'succeeded-checkpointed')
         .map((item) => item.workId)
     : [];
-  const activatedIsExecutable = activation.mode === 'activated'
+  const activatedResumeKind = activation.mode === 'activated'
+    ? 'provider-session-limit'
+    : activation.mode === 'ambiguous-activated'
+      ? 'ambiguous-rearm'
+      : null;
+  const activatedIsExecutable = activatedResumeKind !== null
     && stored?.status.state === 'running'
     && stored.plan.state === 'sealed'
     && stored.revision === activation.revision
     && stored.attemptSequence === activation.attemptSequence
+    && stored.executionAttempt.resume?.activation === activatedResumeKind
     && stored.executionAttempt.resume?.admission === 'activated'
     && isDeepStrictEqual(stored.executionAttempt.resume.executionPin, activation.executionPin)
     && isDeepStrictEqual(stored.plan.execution, activation.execution)
@@ -1913,7 +1919,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
 
   validate();
   let executing = stored;
-  if (activation.mode === 'activated') {
+  if (activatedResumeKind !== null) {
     const canonicalAdmittedAt = canonicalTimestamp(admittedAt, 'admittedAt');
     if (Date.parse(canonicalAdmittedAt) < Date.parse(stored.updatedAt)) {
       throw new InvalidAnalyzeRunTransitionError(
@@ -1945,7 +1951,7 @@ export async function admitAnalyzeRunResumeExecution<T>(
     active: boolean;
   } | undefined;
   try {
-    if (activation.mode === 'activated') {
+    if (activatedResumeKind !== null) {
       await storage.compareAndSwapLatest(
         activation.repoKey,
         activation.runId,
