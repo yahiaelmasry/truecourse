@@ -241,6 +241,8 @@ describe('analyze run journal', () => {
     const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
     const result = { violations: [] };
     stored.revision = 3;
+    stored.schemaVersion = 8;
+    delete stored.rearmHistory;
     stored.updatedAt = '2026-07-22T10:00:03.000Z';
     stored.plan.work[0] = {
       ...stored.plan.work[0],
@@ -259,7 +261,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 3,
       rearm: {
         evidence: {
@@ -316,6 +318,8 @@ describe('analyze run journal', () => {
     const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
     const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
     const result = { violations: [] };
+    stored.schemaVersion = 8;
+    delete stored.rearmHistory;
     stored.revision = 6;
     stored.updatedAt = '2026-07-22T11:00:06.000Z';
     stored.executionAttempt = {
@@ -355,7 +359,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 6,
       rearm: {
         evidence: {
@@ -392,7 +396,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 6,
       executionAttempt: {
         number: 2,
@@ -571,7 +575,7 @@ describe('analyze run journal', () => {
     });
 
     expect(begun).toEqual({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 0,
       runId: 'run-2026-07-19',
       candidateAnalysisId: 'analysis-2026-07-19',
@@ -659,7 +663,7 @@ describe('analyze run journal', () => {
       'run-with-plan.json',
     ), 'utf8'));
     expect(stored).toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       plan: {
         state: 'sealed',
         execution: { provider: 'claude-code', requestedModel: 'sonnet' },
@@ -704,7 +708,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'offset-timestamp-run' }))
       .resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         updatedAt: '2026-07-19T02:00:01+02:00',
         executionAttempt: { number: 1, activatedAt: '2026-07-19T02:00:00+02:00', resume: null },
       });
@@ -852,7 +856,7 @@ describe('analyze run journal', () => {
       ...payload,
     });
     expect(prepared).toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 5,
       state: 'finalizing',
       finalization: {
@@ -1245,13 +1249,13 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 3,
       state: 'finalizing',
       finalization: { persistence: 'unprepared', preparedAt: null },
     });
     expect(JSON.parse(fs.readFileSync(pointerFile, 'utf8'))).toEqual({
-      schemaVersion: 8,
+      schemaVersion: 9,
       runId: 'legacy-finalizing-run',
     });
     await expect(prepareAnalyzeRunFinalization(repoPath, {
@@ -1259,12 +1263,12 @@ describe('analyze run journal', () => {
       preparedAt: '2026-07-19T01:35:03.000Z',
       ...finalizationPayload('legacy-finalizing-analysis'),
     })).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 4,
       finalization: { persistence: 'prepared' },
     });
     expect(JSON.parse(fs.readFileSync(runFile, 'utf8'))).toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 4,
       finalizationIntent: { preparedAt: '2026-07-19T01:35:03.000Z' },
     });
@@ -1331,10 +1335,10 @@ describe('analyze run journal', () => {
       runId: 'legacy-finalizing-failure',
       failedAt: '2026-07-19T01:36:03.000Z',
       error: { code: 'FINALIZE_FAILED', message: 'Legacy finalization failed.' },
-    })).resolves.toMatchObject({ schemaVersion: 8, revision: 4, state: 'failed' });
+    })).resolves.toMatchObject({ schemaVersion: 9, revision: 4, state: 'failed' });
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-failure' }))
-      .resolves.toMatchObject({ schemaVersion: 8, revision: 4, state: 'failed' });
+      .resolves.toMatchObject({ schemaVersion: 9, revision: 4, state: 'failed' });
   });
 
   it.each([[1, 2], [2, 2], [3, 3]] as const)(
@@ -1382,7 +1386,7 @@ describe('analyze run journal', () => {
 
       await expect(readAnalyzeRun(repoPath, { runId: 'legacy-blocked-attempt' }))
         .resolves.toMatchObject({
-          schemaVersion: 8,
+          schemaVersion: 9,
           revision: normalizedRevision,
           state: 'blocked',
           executionAttempt: {
@@ -1461,7 +1465,7 @@ describe('analyze run journal', () => {
       resetAnalyzeRunStorage();
 
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         revision: normalizedRevision,
         state: state === 'prepared' ? 'finalizing' : state,
         executionAttempt: { number: 1, activatedAt: startedAt, resume: null },
@@ -1498,7 +1502,7 @@ describe('analyze run journal', () => {
 
     await expect(readAnalyzeRun(repoPath, { runId: 'schema-v4-attempt' }))
       .resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         executionAttempt: {
           number: 1,
           activatedAt: '2026-07-19T01:36:30.000Z',
@@ -1552,7 +1556,7 @@ describe('analyze run journal', () => {
       resetAnalyzeRunStorage();
 
       await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         revision: 1,
         executionAttempt: {
           number: 1,
@@ -1597,7 +1601,7 @@ describe('analyze run journal', () => {
       resetAnalyzeRunStorage();
 
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         executionAttempt: {
           initialAdmission: {
             admission: 'executing',
@@ -1862,7 +1866,7 @@ describe('analyze run journal', () => {
     }));
 
     expect(activated.view).toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 5,
       state: 'running',
       updatedAt: '2026-07-19T01:38:04.000Z',
@@ -2061,7 +2065,7 @@ describe('analyze run journal', () => {
       }))).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
       expect(fs.readFileSync(file)).toEqual(before);
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         revision: observedRevision,
         state: 'blocked',
       });
@@ -2130,7 +2134,7 @@ describe('analyze run journal', () => {
 
     await expect(readAnalyzeRun(repoPath, { runId: `reserved-${admission}` }))
       .resolves.toMatchObject({
-        schemaVersion: 8,
+        schemaVersion: 9,
         revision,
         state: 'running',
         executionAttempt: {
@@ -3003,7 +3007,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, command)).resolves.toEqual(begun);
     expect(JSON.parse(fs.readFileSync(latestAttemptPath, 'utf8'))).toEqual({
-      schemaVersion: 8,
+      schemaVersion: 9,
       runId: command.runId,
     });
   });
@@ -3029,7 +3033,7 @@ describe('analyze run journal', () => {
     })).rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
     expect(fs.existsSync(path.join(runsPath, 'must-not-mask-third-run.json'))).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(runsPath, 'LATEST_ATTEMPT.json'), 'utf8'))).toEqual({
-      schemaVersion: 8,
+      schemaVersion: 9,
       runId: 'missing-second-run',
     });
   });
@@ -3095,7 +3099,7 @@ describe('analyze run journal', () => {
       'runs',
       'LATEST_ATTEMPT.json',
     ), 'utf8'))).toEqual({
-      schemaVersion: 8,
+      schemaVersion: 9,
       runId: second.runId,
     });
 

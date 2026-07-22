@@ -250,7 +250,7 @@ describe('certified analyze LLM run', () => {
 
     await expect(certified.execute(activation)).rejects.toBe(providerFailure);
     expect(observedDuringProvider).toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 2,
       state: 'running',
       executionAttempt: {

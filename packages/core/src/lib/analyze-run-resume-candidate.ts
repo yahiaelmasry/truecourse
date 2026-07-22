@@ -40,9 +40,10 @@ export interface AnalyzeRunResumeCandidate {
     number: number;
     activatedAt: string;
     resume: null | Readonly<{
+      activation: 'provider-session-limit' | 'ambiguous-rearm';
       admission: 'activated' | 'executing';
       admittedAt: string | null;
-      resumedFrom: Readonly<{
+      resumedFrom: null | Readonly<{
         reason: 'provider-session-limit';
         resetHint: string;
         blockedAt: string;

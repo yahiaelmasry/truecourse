@@ -45,14 +45,22 @@ import {
 } from './analyze-run-resume-activation-certification.js';
 import {
   buildAnalyzeRunAmbiguousRearmOffer,
+  inspectAnalyzeRunAmbiguousRearmConsent,
+  type AnalyzeRunAmbiguousRearmConsent,
+  type AnalyzeRunAmbiguousRearmEvidence,
   type AnalyzeRunAmbiguousRearmExecutionEpochState,
   type AnalyzeRunAmbiguousRearmOffer,
 } from './analyze-run-ambiguous-rearm.js';
+import {
+  inspectAnalyzeRunAmbiguousRearmActivationCertification,
+  type AnalyzeRunAmbiguousRearmActivationCertification,
+} from './analyze-run-ambiguous-rearm-activation-certification.js';
 import { certifyClaudeSessionResetAt } from '@truecourse/shared/llm';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
 
-const SCHEMA_VERSION = 8 as const;
+const SCHEMA_VERSION = 9 as const;
+const INITIAL_ADMISSION_SCHEMA_VERSION = 8 as const;
 const SEALED_EXECUTION_SCHEMA_VERSION = 7 as const;
 const REQUESTED_MODEL_PIN_SCHEMA_VERSION = 6 as const;
 const RESUME_ADMISSION_SCHEMA_VERSION = 5 as const;
@@ -65,7 +73,7 @@ const LATEST_ATTEMPT_FILE = 'LATEST_ATTEMPT.json';
 
 function isSupportedSchemaVersion(
   value: unknown,
-): value is 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 {
+): value is 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 {
   return value === LEGACY_SCHEMA_VERSION
     || value === PREVIOUS_SCHEMA_VERSION
     || value === CHECKPOINT_SCHEMA_VERSION
@@ -73,6 +81,7 @@ function isSupportedSchemaVersion(
     || value === RESUME_ADMISSION_SCHEMA_VERSION
     || value === REQUESTED_MODEL_PIN_SCHEMA_VERSION
     || value === SEALED_EXECUTION_SCHEMA_VERSION
+    || value === INITIAL_ADMISSION_SCHEMA_VERSION
     || value === SCHEMA_VERSION;
 }
 
@@ -190,7 +199,7 @@ const analyzeRunResumePlanActivations = new WeakMap<object, {
   reusedWorkIds: readonly string[];
   executionPin: AnalyzeRunResumeExecutionPin;
   attemptSequence: number;
-  mode: 'activated' | 'executing-complete';
+  mode: 'activated' | 'ambiguous-activated' | 'executing-complete';
   claimed: boolean;
 }>();
 
@@ -281,10 +290,18 @@ export interface ActivateAnalyzeRunResumeCommand extends Omit<BeginAnalyzeRunCom
   }>;
 }
 
+export interface ActivateAnalyzeRunAmbiguousRearmCommand
+  extends Omit<ActivateAnalyzeRunResumeCommand, 'kind'> {
+  kind: 'activate-ambiguous-rearm';
+  consent: AnalyzeRunAmbiguousRearmConsent;
+}
+
 export type ActivateAnalyzeRunResumeResult = Readonly<{
   view: AnalyzeRunView;
   activation: AnalyzeRunResumePlanActivation;
 }>;
+
+export type ActivateAnalyzeRunAmbiguousRearmResult = ActivateAnalyzeRunResumeResult;
 
 interface AnalyzeRunResumeExecutionBasePin {
   provider: string;
@@ -323,15 +340,24 @@ export interface AnalyzeRunExecutionAttempt {
   activatedAt: string;
   initialAdmission: AnalyzeRunInitialAdmission | null;
   resume: null | {
+    activation: 'provider-session-limit' | 'ambiguous-rearm';
     admission: 'activated' | 'executing';
     admittedAt: string | null;
-    resumedFrom: {
+    resumedFrom: null | {
       reason: 'provider-session-limit';
       resetHint: string;
       blockedAt: string;
     };
     executionPin: AnalyzeRunResumeExecutionPin;
   };
+}
+
+export interface AnalyzeRunAmbiguousRearmRecord {
+  evidence: AnalyzeRunAmbiguousRearmEvidence;
+  acceptedAt: string;
+  acceptedRisk: 'repeat-up-to-pending-provider-calls';
+  acceptedMaxRepeatProviderCalls: number;
+  executionPin: AnalyzeRunResumeExecutionPin;
 }
 
 interface StoredAnalyzeRunFinalizationIntent {
@@ -446,6 +472,7 @@ export interface StoredAnalyzeRun {
   commitHash: string | null;
   completedBaselineId: string | null;
   executionAttempt: AnalyzeRunExecutionAttempt;
+  rearmHistory: AnalyzeRunAmbiguousRearmRecord[];
   finalizationIntent: StoredAnalyzeRunFinalizationIntent | null;
   plan:
     | { state: 'unsealed' }
@@ -478,6 +505,7 @@ interface ParsedLatestAttemptPointer {
     | typeof RESUME_ADMISSION_SCHEMA_VERSION
     | typeof REQUESTED_MODEL_PIN_SCHEMA_VERSION
     | typeof SEALED_EXECUTION_SCHEMA_VERSION
+    | typeof INITIAL_ADMISSION_SCHEMA_VERSION
     | typeof SCHEMA_VERSION;
   runId: string;
 }
@@ -946,6 +974,7 @@ export async function dispatchAnalyzeRun(
       },
       resume: null,
     },
+    rearmHistory: [],
     finalizationIntent: null,
     plan: { state: 'unsealed' },
   };
@@ -1249,9 +1278,11 @@ export async function activateAnalyzeRunResume(
   assertAnalyzeRunStorage(storage);
   const recoveringActivated = current.status.state === 'running'
     && current.executionAttempt.number > 1
+    && current.executionAttempt.resume?.activation === 'provider-session-limit'
     && current.executionAttempt.resume?.admission === 'activated';
   const recoveringCompletedExecution = current.status.state === 'running'
     && current.executionAttempt.number > 1
+    && current.executionAttempt.resume?.activation === 'provider-session-limit'
     && current.executionAttempt.resume?.admission === 'executing'
     && current.plan.state === 'sealed'
     && current.plan.work.every((work) => work.state === 'succeeded-checkpointed');
@@ -1401,6 +1432,7 @@ export async function activateAnalyzeRunResume(
           activatedAt,
           initialAdmission: null,
           resume: {
+            activation: 'provider-session-limit',
             admission: 'activated',
             admittedAt: null,
             resumedFrom: {
@@ -1473,6 +1505,339 @@ export async function activateAnalyzeRunResume(
     claimed: false,
   });
   return Object.freeze({ view: toView(next), activation });
+}
+
+/**
+ * Atomically accept one exact duplicate-spend consent and rearm the ambiguous
+ * latest execution epoch. This transition records intent only: provider work
+ * remains impossible until a later admission consumes the opaque receipt.
+ */
+export async function activateAnalyzeRunAmbiguousRearm(
+  repoKey: string,
+  certification: AnalyzeRunAmbiguousRearmActivationCertification,
+): Promise<ActivateAnalyzeRunAmbiguousRearmResult> {
+  const command = inspectAnalyzeRunAmbiguousRearmActivationCertification(certification);
+  if (!command) {
+    throw new InvalidAnalyzeRunTransitionError('Analyze ambiguous rearm activation is not certified');
+  }
+  const storage = activeStorage;
+  const durableRepoKey = activationScopeKey(repoKey, storage);
+  const runId = validateRunId(command.runId);
+  const current = await storage.read(durableRepoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!current) throw new AnalyzeRunNotFoundError(runId);
+  const latest = await storage.inspectLatest(durableRepoKey);
+  assertAnalyzeRunStorage(storage);
+  const requestedActivatedAt = canonicalTimestamp(command.activatedAt, 'activatedAt');
+  const recoveryRecord = current.rearmHistory.at(-1);
+  const recoveringDurableActivation = current.status.state === 'running'
+    && current.plan.state === 'sealed'
+    && current.finalizationIntent === null
+    && current.revision === command.observed.runRevision + 1
+    && current.executionAttempt.resume?.activation === 'ambiguous-rearm'
+    && current.executionAttempt.resume.admission === 'activated'
+    && current.executionAttempt.activatedAt === requestedActivatedAt
+    && recoveryRecord?.acceptedAt === requestedActivatedAt
+    && isDeepStrictEqual(recoveryRecord.evidence, command.consent.evidence)
+    && recoveryRecord.acceptedRisk === command.consent.acceptedRisk
+    && recoveryRecord.acceptedMaxRepeatProviderCalls
+      === command.consent.acceptedMaxRepeatProviderCalls;
+  if (
+    latest?.runId !== current.runId
+    || latest.attemptSequence !== current.attemptSequence
+    || (!recoveringDurableActivation && command.observed.runRevision !== current.revision)
+    || command.observed.attemptSequence !== current.attemptSequence
+    || command.observed.latestAttemptSequence !== latest.attemptSequence
+  ) {
+    throw new AnalyzeRunLatestAttemptConflictError(runId);
+  }
+  if (
+    current.status.state !== 'running'
+    || current.plan.state !== 'sealed'
+    || current.finalizationIntent !== null
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Cannot rearm analyze run ${runId} from ${current.status.state}/${current.plan.state}`,
+    );
+  }
+
+  const offer = recoveringDurableActivation ? null : toView(current, true).rearm;
+  const consentMismatch = recoveringDurableActivation
+    ? null
+    : inspectAnalyzeRunAmbiguousRearmConsent(offer, command.consent);
+  if (consentMismatch !== null) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} ambiguous rearm consent was rejected: ${consentMismatch}`,
+    );
+  }
+  const expectedIdentity = {
+    candidateAnalysisId: requireNonEmpty(command.candidateAnalysisId, 'candidateAnalysisId'),
+    startedAt: validateTimestamp(command.startedAt, 'startedAt'),
+    source: validateSource(command.source),
+    branch: validateNullableString(command.branch, 'branch'),
+    commitHash: validateNullableString(command.commitHash, 'commitHash'),
+    completedBaselineId: validateNullableString(
+      command.completedBaselineId,
+      'completedBaselineId',
+    ),
+  };
+  if (!isDeepStrictEqual(expectedIdentity, {
+    candidateAnalysisId: current.candidateAnalysisId,
+    startedAt: current.startedAt,
+    source: current.source,
+    branch: current.branch,
+    commitHash: current.commitHash,
+    completedBaselineId: current.completedBaselineId,
+  })) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} identity changed before ambiguous rearm activation`,
+    );
+  }
+  if (activationWorkKey(command.work) !== activationWorkKey(current.plan.work)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} sealed work changed before ambiguous rearm activation`,
+    );
+  }
+  const pendingWorkIds = current.plan.work
+    .filter((work) => work.state === 'pending')
+    .map((work) => work.workId);
+  const reusedWorkIds = current.plan.work
+    .filter((work) => work.state === 'succeeded-checkpointed')
+    .map((work) => work.workId);
+  if (
+    current.plan.work.some((work) => work.state === 'succeeded-uncheckpointed')
+    || !isDeepStrictEqual([...command.pendingWorkIds].sort(), [...pendingWorkIds].sort())
+    || !isDeepStrictEqual([...command.reusedWorkIds].sort(), [...reusedWorkIds].sort())
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} work partition changed before ambiguous rearm activation `
+      + `(pending=${pendingWorkIds.join(',')}; reused=${reusedWorkIds.join(',')})`,
+    );
+  }
+  const executionPin = normalizeResumeExecutionPin(command.executionPin);
+  const executionPinBase = normalizeExecutionIntent(executionPin);
+  if (
+    current.plan.execution === null
+    || !isDeepStrictEqual(current.plan.execution, executionPinBase)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} sealed execution changed before ambiguous rearm activation`,
+    );
+  }
+  validateAmbiguousRearmModelPin(
+    current.plan.work,
+    current.plan.execution,
+    current.executionAttempt,
+    executionPin,
+    runId,
+  );
+  if (
+    recoveringDurableActivation
+    && (
+      !isDeepStrictEqual(current.executionAttempt.resume?.executionPin, executionPin)
+      || !isDeepStrictEqual(recoveryRecord?.executionPin, executionPin)
+      || current.executionAttempt.number
+        !== command.consent.evidence.executionEpoch.attemptNumber + 1
+    )
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} durable ambiguous rearm recovery changed`,
+    );
+  }
+
+  const analysisStore = getAnalysisStore();
+  const baselineFingerprint = await readActiveCompletedBaselineFingerprint(
+    analysisStore,
+    durableRepoKey,
+    current.completedBaselineId,
+  );
+  if (
+    getAnalysisStore() !== analysisStore
+    || baselineFingerprint !== command.observed.completedBaselineFingerprint
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} completed baseline changed before ambiguous rearm activation`,
+    );
+  }
+  const activatedAt = recoveringDurableActivation
+    ? current.executionAttempt.activatedAt
+    : requestedActivatedAt;
+  if (
+    recoveringDurableActivation
+      ? current.updatedAt !== activatedAt
+      : Date.parse(activatedAt) < Date.parse(current.updatedAt)
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} ambiguous rearm activation predates durable progress`,
+    );
+  }
+  const sourceResume = current.executionAttempt.resume;
+  const next: StoredAnalyzeRun = recoveringDurableActivation ? current : {
+    ...current,
+    schemaVersion: SCHEMA_VERSION,
+    revision: current.revision + 1,
+    updatedAt: activatedAt,
+    executionAttempt: {
+      number: current.executionAttempt.number + 1,
+      activatedAt,
+      initialAdmission: null,
+      resume: {
+        activation: 'ambiguous-rearm',
+        admission: 'activated',
+        admittedAt: null,
+        resumedFrom: sourceResume?.resumedFrom ?? null,
+        executionPin,
+      },
+    },
+    rearmHistory: [
+      ...current.rearmHistory,
+      {
+        evidence: structuredClone(command.consent.evidence),
+        acceptedAt: activatedAt,
+        acceptedRisk: command.consent.acceptedRisk,
+        acceptedMaxRepeatProviderCalls: command.consent.acceptedMaxRepeatProviderCalls,
+        executionPin,
+      },
+    ],
+  };
+
+  const baselineFingerprintBeforeCas = await readActiveCompletedBaselineFingerprint(
+    analysisStore,
+    durableRepoKey,
+    current.completedBaselineId,
+  );
+  if (
+    activeStorage !== storage
+    || getAnalysisStore() !== analysisStore
+    || baselineFingerprintBeforeCas !== baselineFingerprint
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} storage or completed baseline changed before ambiguous rearm activation`,
+    );
+  }
+  if (recoveringDurableActivation) {
+    const currentBeforeReceipt = await storage.read(durableRepoKey, runId);
+    assertAnalyzeRunStorage(storage);
+    const latestBeforeReceipt = await storage.inspectLatest(durableRepoKey);
+    assertAnalyzeRunStorage(storage);
+    if (
+      !currentBeforeReceipt
+      || !isDeepStrictEqual(currentBeforeReceipt, current)
+      || latestBeforeReceipt?.runId !== runId
+      || latestBeforeReceipt.attemptSequence !== current.attemptSequence
+    ) {
+      throw new AnalyzeRunLatestAttemptConflictError(runId);
+    }
+  } else {
+    await storage.compareAndSwapLatest(
+      durableRepoKey,
+      runId,
+      current.revision,
+      current.attemptSequence,
+      latest.attemptSequence,
+      next,
+    );
+  }
+  assertAnalyzeRunStorage(storage);
+  const activatedStored = await storage.read(durableRepoKey, runId);
+  assertAnalyzeRunStorage(storage);
+  if (!activatedStored || !isDeepStrictEqual(activatedStored, next)) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} durable state changed during ambiguous rearm activation`,
+    );
+  }
+  const activation = Object.freeze({}) as AnalyzeRunResumePlanActivation;
+  analyzeRunResumePlanActivations.set(activation, {
+    storage,
+    repoKey: durableRepoKey,
+    runId,
+    revision: next.revision,
+    workKey: activationWorkKey(current.plan.work),
+    execution: current.plan.execution,
+    pendingWorkIds: Object.freeze([...pendingWorkIds]),
+    reusedWorkIds: Object.freeze([...reusedWorkIds]),
+    executionPin,
+    attemptSequence: next.attemptSequence,
+    mode: 'ambiguous-activated',
+    claimed: false,
+  });
+  return Object.freeze({ view: toView(next, true), activation });
+}
+
+function normalizeResumeExecutionPin(value: Readonly<AnalyzeRunResumeExecutionPin>): AnalyzeRunResumeExecutionPin {
+  const base = normalizeExecutionIntent(value);
+  if (value.modelSelection === 'requested' && value.resolvedModel === null) {
+    return { ...base, modelSelection: 'requested', resolvedModel: null };
+  }
+  if (value.modelSelection === 'resolved') {
+    const resolvedModel = requireNonEmpty(value.resolvedModel, 'executionPin.resolvedModel');
+    if (resolvedModel.trim() !== resolvedModel) {
+      throw new InvalidAnalyzeRunTransitionError(
+        'Resume execution pin contains surrounding whitespace',
+      );
+    }
+    return { ...base, modelSelection: 'resolved', resolvedModel };
+  }
+  throw new InvalidAnalyzeRunTransitionError('Invalid resume model selection');
+}
+
+function validateAmbiguousRearmModelPin(
+  work: readonly StoredAnalyzeRunWork[],
+  execution: AnalyzeRunExecutionIntent,
+  sourceAttempt: AnalyzeRunExecutionAttempt,
+  pin: AnalyzeRunResumeExecutionPin,
+  runId: string,
+): void {
+  const checkpointed = work.filter(
+    (item): item is Extract<StoredAnalyzeRunWork, { state: 'succeeded-checkpointed' }> =>
+      item.state === 'succeeded-checkpointed',
+  );
+  const checkpointUsage = checkpointed
+    .map((item) => item.checkpoint.usage)
+    .filter((usage): usage is AnalyzeLlmExecutionUsage => usage !== null);
+  if (checkpointed.length > 0) {
+    const resolvedModels = new Set(checkpointUsage.map((usage) => usage.resolvedModel));
+    if (
+      checkpointUsage.length !== checkpointed.length
+      || checkpointUsage.some((usage) =>
+        usage.provider !== execution.provider
+        || usage.requestedModel !== execution.requestedModel
+        || usage.resolvedModel === null)
+      || resolvedModels.size !== 1
+      || pin.modelSelection !== 'resolved'
+      || pin.resolvedModel !== checkpointUsage[0]!.resolvedModel
+    ) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} checkpoint model cannot certify ambiguous rearm`,
+      );
+    }
+    return;
+  }
+  if (sourceAttempt.number > 1) {
+    const durablePin = sourceAttempt.resume?.executionPin;
+    if (
+      durablePin === undefined
+      || !isDeepStrictEqual(pin, durablePin)
+      || (
+        durablePin.modelSelection === 'requested'
+        && execution.requestedModel === null
+      )
+    ) {
+      throw new InvalidAnalyzeRunTransitionError(
+        `Analyze run ${runId} checkpoint model is unverified for ambiguous rearm`,
+      );
+    }
+    return;
+  }
+  if (
+    execution.requestedModel === null
+    || pin.modelSelection !== 'requested'
+    || pin.resolvedModel !== null
+  ) {
+    throw new InvalidAnalyzeRunTransitionError(
+      `Analyze run ${runId} checkpoint model is unverified for ambiguous rearm`,
+    );
+  }
 }
 
 /**
@@ -1860,10 +2225,12 @@ function toView(run: StoredAnalyzeRun, isLatestAttempt = false): AnalyzeRunView 
     && !run.plan.work.some((work) => work.state === 'succeeded-uncheckpointed');
   const recoveringActivated = run.status.state === 'running'
     && run.executionAttempt.number > 1
+    && run.executionAttempt.resume?.activation === 'provider-session-limit'
     && run.executionAttempt.resume?.admission === 'activated'
     && hasSafeSealedPlan;
   const recoveringCompletedExecution = run.status.state === 'running'
     && run.executionAttempt.number > 1
+    && run.executionAttempt.resume?.activation === 'provider-session-limit'
     && run.executionAttempt.resume?.admission === 'executing'
     && run.plan.state === 'sealed'
     && run.plan.execution !== null
@@ -1906,7 +2273,7 @@ function toView(run: StoredAnalyzeRun, isLatestAttempt = false): AnalyzeRunView 
           blockedAt: run.status.blockedAt,
           resetAt: certifyClaudeSessionResetAt(run.status.resetHint, run.status.blockedAt),
         }
-      : run.executionAttempt.resume === null
+      : run.executionAttempt.resume?.resumedFrom == null
         ? null
         : {
             ...structuredClone(run.executionAttempt.resume.resumedFrom),
@@ -1951,8 +2318,8 @@ function toView(run: StoredAnalyzeRun, isLatestAttempt = false): AnalyzeRunView 
     rearm: buildAnalyzeRunAmbiguousRearmOffer({
       isLatestAttempt,
       admissionEvidence: (sourceAnalyzeRunSchemaVersions.get(run) ?? SCHEMA_VERSION)
-          === SCHEMA_VERSION
-        ? 'current-schema'
+          >= INITIAL_ADMISSION_SCHEMA_VERSION
+        ? 'explicit-admission-schema'
         : 'legacy-schema',
       runId: run.runId,
       runRevision: run.revision,
@@ -2706,6 +3073,9 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
   const status = parseStoredStatus(value.status, file);
   const schemaVersion = value.schemaVersion as ParsedLatestAttemptPointer['schemaVersion'];
   const plan = parseStoredPlan(value.plan, file, schemaVersion);
+  const rearmHistory = schemaVersion === SCHEMA_VERSION
+    ? parseStoredAmbiguousRearmHistory(value.rearmHistory, file)
+    : [];
   if (
     (
       value.schemaVersion === CHECKPOINT_SCHEMA_VERSION
@@ -2713,6 +3083,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
       || value.schemaVersion === RESUME_ADMISSION_SCHEMA_VERSION
       || value.schemaVersion === REQUESTED_MODEL_PIN_SCHEMA_VERSION
       || value.schemaVersion === SEALED_EXECUTION_SCHEMA_VERSION
+      || value.schemaVersion === INITIAL_ADMISSION_SCHEMA_VERSION
       || value.schemaVersion === SCHEMA_VERSION
     )
     && !Object.hasOwn(value, 'finalizationIntent')
@@ -2741,7 +3112,9 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
       ? parseStoredSchemaV4ExecutionAttempt(value.executionAttempt, file)
       : { number: 1, activatedAt: startedAt, initialAdmission: null, resume: null };
   const executionAttempt = value.schemaVersion === SCHEMA_VERSION
-    ? parseStoredExecutionAttempt(value.executionAttempt, file)
+    ? parseStoredSchemaV9ExecutionAttempt(value.executionAttempt, file)
+    : value.schemaVersion === INITIAL_ADMISSION_SCHEMA_VERSION
+      ? parseStoredExecutionAttempt(value.executionAttempt, file)
     : {
         ...legacyExecutionAttempt,
         initialAdmission: inferLegacyInitialAdmission({
@@ -2820,6 +3193,13 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
         plan.sealedAt,
       )
     : value.startedAt;
+  const rearmHistoryIsReachable = validateStoredAmbiguousRearmHistory({
+    history: rearmHistory,
+    runId: value.runId,
+    startedAt,
+    plan,
+    executionAttempt,
+  });
   const checkpointTimestampsAreReachable = plan.state !== 'sealed'
     || plan.work.every((work) => work.state !== 'succeeded-checkpointed'
       || Date.parse(work.checkpoint.checkpointedAt) >= Date.parse(plan.sealedAt));
@@ -2871,8 +3251,11 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     || plan.work.every((work) => {
       if (work.state !== 'succeeded-checkpointed') return true;
       const checkpointedAt = Date.parse(work.checkpoint.checkpointedAt);
-      const priorBlockAt = Date.parse(executionAttempt.resume!.resumedFrom.blockedAt);
-      if (checkpointedAt <= priorBlockAt) return true;
+      const priorEpochCutoff = executionAttempt.resume!.activation === 'ambiguous-rearm'
+        ? rearmHistory.at(-1)?.acceptedAt
+        : executionAttempt.resume!.resumedFrom?.blockedAt;
+      if (priorEpochCutoff === undefined) return false;
+      if (checkpointedAt <= Date.parse(priorEpochCutoff)) return true;
       return resumeAdmission === 'executing'
         && checkpointedAt >= Date.parse(executionAttempt.resume!.admittedAt!);
     });
@@ -2883,7 +3266,10 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     || executionAttempt.initialAdmission?.admission === 'ambiguous'
     ? 1
     : 2 + checkpointCount;
-  const resumedActivationRevision = 1 + (3 * (executionAttempt.number - 1)) + checkpointCount;
+  const resumedActivationRevision = 1
+    + (3 * (executionAttempt.number - 1))
+    - rearmHistory.length
+    + checkpointCount;
   const runningRevision = executionAttempt.number === 1
     ? initialRunningRevision
     : resumedActivationRevision + (resumeAdmission === 'executing' ? 1 : 0);
@@ -3035,6 +3421,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     !lifecycleIsReachable
     || terminalTimestampIsImpossible
     || !checkpointTimestampsAreReachable
+    || !rearmHistoryIsReachable
     || !resumedCheckpointTimestampsAreReachable
     || !initialCheckpointAdmissionIsReachable
     || terminalPredatesCheckpoint
@@ -3071,6 +3458,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     commitHash: value.commitHash,
     completedBaselineId: value.completedBaselineId,
     executionAttempt,
+    rearmHistory,
     finalizationIntent,
     plan,
   };
@@ -3239,6 +3627,237 @@ function parseStoredExecutionAttempt(
   return { ...legacyShape, initialAdmission: null };
 }
 
+function parseStoredSchemaV9ExecutionAttempt(
+  value: unknown,
+  file: string,
+): StoredAnalyzeRun['executionAttempt'] {
+  if (!isRecord(value) || !Object.hasOwn(value, 'initialAdmission')) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze execution attempt: ${file}`);
+  }
+  if (value.number === 1) return parseStoredExecutionAttempt(value, file);
+  if (
+    !Number.isSafeInteger(value.number)
+    || (value.number as number) <= 1
+    || typeof value.activatedAt !== 'string'
+    || value.initialAdmission !== null
+    || !isRecord(value.resume)
+    || (
+      value.resume.activation !== 'provider-session-limit'
+      && value.resume.activation !== 'ambiguous-rearm'
+    )
+    || (value.resume.admission !== 'activated' && value.resume.admission !== 'executing')
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze resume admission state: ${file}`);
+  }
+  const activatedAt = validateTimestamp(value.activatedAt, 'executionAttempt.activatedAt');
+  const admittedAt = value.resume.admittedAt === null
+    ? null
+    : validateTimestamp(value.resume.admittedAt, 'executionAttempt.resume.admittedAt');
+  if (
+    (value.resume.admission === 'activated' && admittedAt !== null)
+    || (value.resume.admission === 'executing' && admittedAt === null)
+    || (admittedAt !== null && new Date(admittedAt).toISOString() !== admittedAt)
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze resume admission timestamp: ${file}`);
+  }
+  const resumedFrom = value.resume.resumedFrom === null
+    ? null
+    : parseStoredProviderLimit(value.resume.resumedFrom, file);
+  if (
+    value.resume.activation === 'provider-session-limit' && resumedFrom === null
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Provider-limit resume is missing its limit record: ${file}`);
+  }
+  if (
+    (resumedFrom !== null && Date.parse(resumedFrom.blockedAt) > Date.parse(activatedAt))
+    || (admittedAt !== null && Date.parse(admittedAt) < Date.parse(activatedAt))
+  ) {
+    throw new AnalyzeRunJournalCorruptError(`Impossible analyze resume chronology: ${file}`);
+  }
+  return {
+    number: value.number as number,
+    activatedAt,
+    initialAdmission: null,
+    resume: {
+      activation: value.resume.activation,
+      admission: value.resume.admission,
+      admittedAt,
+      resumedFrom,
+      executionPin: parseStoredResumeExecutionPin(value.resume.executionPin, file),
+    },
+  };
+}
+
+function parseStoredProviderLimit(
+  value: unknown,
+  file: string,
+): NonNullable<NonNullable<AnalyzeRunExecutionAttempt['resume']>['resumedFrom']> {
+  if (!isRecord(value) || value.reason !== 'provider-session-limit') {
+    throw new AnalyzeRunJournalCorruptError(`Invalid analyze resume provider limit: ${file}`);
+  }
+  return {
+    reason: 'provider-session-limit',
+    resetHint: requireNonEmpty(value.resetHint, 'resetHint'),
+    blockedAt: validateTimestamp(value.blockedAt, 'executionAttempt.resume.resumedFrom.blockedAt'),
+  };
+}
+
+function parseStoredResumeExecutionPin(
+  value: unknown,
+  file: string,
+): AnalyzeRunResumeExecutionPin {
+  if (!isRecord(value)) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid resume execution pin: ${file}`);
+  }
+  const pinBase = {
+    provider: requireNonEmpty(value.provider, 'executionPin.provider'),
+    requestedModel: validateNullableString(value.requestedModel, 'executionPin.requestedModel'),
+  };
+  if (value.modelSelection === 'requested' && value.resolvedModel === null) {
+    return { ...pinBase, modelSelection: 'requested', resolvedModel: null };
+  }
+  if (value.modelSelection === 'resolved') {
+    const resolvedModel = requireNonEmpty(value.resolvedModel, 'executionPin.resolvedModel');
+    if (resolvedModel.trim() !== resolvedModel) {
+      throw new AnalyzeRunJournalCorruptError(`Invalid resolved resume model: ${file}`);
+    }
+    return { ...pinBase, modelSelection: 'resolved', resolvedModel };
+  }
+  throw new AnalyzeRunJournalCorruptError(`Invalid resume model selection: ${file}`);
+}
+
+function parseStoredAmbiguousRearmHistory(
+  value: unknown,
+  file: string,
+): AnalyzeRunAmbiguousRearmRecord[] {
+  if (!Array.isArray(value)) {
+    throw new AnalyzeRunJournalCorruptError(`Invalid ambiguous rearm history: ${file}`);
+  }
+  return value.map((entry) => {
+    if (
+      !isRecord(entry)
+      || !isRecord(entry.evidence)
+      || !isRecord(entry.evidence.executionEpoch)
+      || entry.acceptedRisk !== 'repeat-up-to-pending-provider-calls'
+      || !Number.isSafeInteger(entry.acceptedMaxRepeatProviderCalls)
+      || (entry.acceptedMaxRepeatProviderCalls as number) < 0
+      || typeof entry.evidence.runId !== 'string'
+      || !Number.isSafeInteger(entry.evidence.runRevision)
+      || (entry.evidence.runRevision as number) < 0
+      || (entry.evidence.executionEpoch.kind !== 'initial'
+        && entry.evidence.executionEpoch.kind !== 'resume')
+      || !Number.isSafeInteger(entry.evidence.executionEpoch.attemptNumber)
+      || (entry.evidence.executionEpoch.attemptNumber as number) < 1
+      || !Number.isSafeInteger(entry.evidence.pendingWorkCount)
+      || (entry.evidence.pendingWorkCount as number) < 1
+    ) {
+      throw new AnalyzeRunJournalCorruptError(`Invalid ambiguous rearm history: ${file}`);
+    }
+    const epochActivatedAt = canonicalTimestamp(
+      entry.evidence.executionEpoch.activatedAt,
+      'rearmHistory.evidence.executionEpoch.activatedAt',
+    );
+    const admittedAt = canonicalTimestamp(
+      entry.evidence.admittedAt,
+      'rearmHistory.evidence.admittedAt',
+    );
+    const acceptedAt = canonicalTimestamp(entry.acceptedAt, 'rearmHistory.acceptedAt');
+    if (
+      epochActivatedAt !== entry.evidence.executionEpoch.activatedAt
+      || admittedAt !== entry.evidence.admittedAt
+      || acceptedAt !== entry.acceptedAt
+    ) {
+      throw new AnalyzeRunJournalCorruptError(
+        `Ambiguous rearm history contains non-canonical timestamps: ${file}`,
+      );
+    }
+    const evidence: AnalyzeRunAmbiguousRearmEvidence = {
+      runId: validateRunId(entry.evidence.runId),
+      runRevision: entry.evidence.runRevision as number,
+      executionEpoch: {
+        kind: entry.evidence.executionEpoch.kind,
+        attemptNumber: entry.evidence.executionEpoch.attemptNumber as number,
+        activatedAt: epochActivatedAt,
+      },
+      admittedAt,
+      pendingWorkCount: entry.evidence.pendingWorkCount as number,
+    };
+    if (
+      Date.parse(evidence.admittedAt) < Date.parse(evidence.executionEpoch.activatedAt)
+      || Date.parse(acceptedAt) < Date.parse(evidence.admittedAt)
+    ) {
+      throw new AnalyzeRunJournalCorruptError(`Impossible ambiguous rearm chronology: ${file}`);
+    }
+    return {
+      evidence,
+      acceptedAt,
+      acceptedRisk: 'repeat-up-to-pending-provider-calls',
+      acceptedMaxRepeatProviderCalls: entry.acceptedMaxRepeatProviderCalls as number,
+      executionPin: parseStoredResumeExecutionPin(entry.executionPin, file),
+    };
+  });
+}
+
+function validateStoredAmbiguousRearmHistory(input: Readonly<{
+  history: readonly AnalyzeRunAmbiguousRearmRecord[];
+  runId: unknown;
+  startedAt: string;
+  plan: StoredAnalyzeRun['plan'];
+  executionAttempt: AnalyzeRunExecutionAttempt;
+}>): boolean {
+  const { history, plan, executionAttempt } = input;
+  if (history.length === 0) {
+    return executionAttempt.resume?.activation !== 'ambiguous-rearm';
+  }
+  if (plan.state !== 'sealed') return false;
+  let previousAttempt = 0;
+  let previousAcceptedAt = Number.NEGATIVE_INFINITY;
+  let previousCheckpointCount = 0;
+  for (const [index, record] of history.entries()) {
+    const epoch = record.evidence.executionEpoch;
+    const checkpointCountAtAcceptance = plan.work.length - record.evidence.pendingWorkCount;
+    const currentCheckpointCount = plan.work.filter(
+      (work) => work.state === 'succeeded-checkpointed',
+    ).length;
+    const expectedRevision = 1
+      + (3 * (epoch.attemptNumber - 1))
+      - index
+      + checkpointCountAtAcceptance
+      + 1;
+    if (
+      record.evidence.runId !== input.runId
+      || epoch.attemptNumber >= executionAttempt.number
+      || record.acceptedMaxRepeatProviderCalls !== record.evidence.pendingWorkCount
+      || record.evidence.pendingWorkCount > plan.work.length
+      || checkpointCountAtAcceptance > currentCheckpointCount
+      || checkpointCountAtAcceptance < previousCheckpointCount
+      || (epoch.kind === 'initial') !== (epoch.attemptNumber === 1)
+      || (epoch.kind === 'initial' && epoch.activatedAt !== input.startedAt)
+      || (
+        epoch.kind === 'resume'
+        && Date.parse(epoch.activatedAt) < Date.parse(plan.sealedAt)
+      )
+      || Date.parse(record.evidence.admittedAt) < Date.parse(plan.sealedAt)
+      || Date.parse(record.acceptedAt) > Date.parse(executionAttempt.activatedAt)
+      || epoch.attemptNumber <= previousAttempt
+      || Date.parse(epoch.activatedAt) < previousAcceptedAt
+      || Date.parse(record.acceptedAt) < previousAcceptedAt
+      || record.evidence.runRevision !== expectedRevision
+      || plan.execution === null
+      || record.executionPin.provider !== plan.execution.provider
+      || record.executionPin.requestedModel !== plan.execution.requestedModel
+    ) return false;
+    previousAttempt = epoch.attemptNumber;
+    previousAcceptedAt = Date.parse(record.acceptedAt);
+    previousCheckpointCount = checkpointCountAtAcceptance;
+  }
+  if (executionAttempt.resume?.activation !== 'ambiguous-rearm') return true;
+  const last = history.at(-1)!;
+  return last.evidence.executionEpoch.attemptNumber === executionAttempt.number - 1
+    && last.acceptedAt === executionAttempt.activatedAt
+    && isDeepStrictEqual(last.executionPin, executionAttempt.resume.executionPin);
+}
+
 function parseStoredInitialAdmission(
   value: unknown,
   file: string,
@@ -3368,6 +3987,7 @@ function parseStoredSchemaV7ExecutionAttempt(
     activatedAt,
     initialAdmission: null,
     resume: {
+      activation: 'provider-session-limit',
       admission: value.resume.admission,
       admittedAt,
       resumedFrom: {
@@ -3534,6 +4154,7 @@ function parseStoredPlan(
         && schemaVersion !== RESUME_ADMISSION_SCHEMA_VERSION
         && schemaVersion !== REQUESTED_MODEL_PIN_SCHEMA_VERSION
         && schemaVersion !== SEALED_EXECUTION_SCHEMA_VERSION
+        && schemaVersion !== INITIAL_ADMISSION_SCHEMA_VERSION
         && schemaVersion !== SCHEMA_VERSION
       ) {
         throw new AnalyzeRunJournalCorruptError(
@@ -3554,6 +4175,7 @@ function parseStoredPlan(
     state: 'sealed',
     sealedAt: validateTimestamp(value.sealedAt, 'sealedAt'),
     execution: schemaVersion === SCHEMA_VERSION
+      || schemaVersion === INITIAL_ADMISSION_SCHEMA_VERSION
       || schemaVersion === SEALED_EXECUTION_SCHEMA_VERSION
       ? parseStoredExecutionIntentOrLegacyNull(value, file)
       : null,

@@ -573,9 +573,11 @@ export function certifyAnalyzeLlmRun(
     if (!candidate.isLatestAttempt) return incompatibleInspection('not-latest-attempt');
     const recoveringActivated = candidate.state === 'running'
       && candidate.executionAttempt.number > 1
+      && candidate.executionAttempt.resume?.activation === 'provider-session-limit'
       && candidate.executionAttempt.resume?.admission === 'activated';
     const recoveringCompletedExecution = candidate.state === 'running'
       && candidate.executionAttempt.number > 1
+      && candidate.executionAttempt.resume?.activation === 'provider-session-limit'
       && candidate.executionAttempt.resume?.admission === 'executing'
       && candidate.plan !== 'unsealed'
       && candidate.plan.work.every((work) => work.state === 'succeeded-checkpointed');
@@ -774,7 +776,8 @@ export function certifyAnalyzeLlmRun(
       return incompatibleInspection('completed-baseline-changed');
     }
     const resetHint = candidate.blocked?.resetHint
-      ?? candidate.executionAttempt.resume!.resumedFrom.resetHint;
+      ?? candidate.executionAttempt.resume?.resumedFrom?.resetHint;
+    if (resetHint === undefined) return incompatibleInspection('run-not-blocked');
     const compatibility = Object.freeze({
       compatible: true,
       requiresActivationRevalidation: true,

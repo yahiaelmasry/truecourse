@@ -119,7 +119,7 @@ describe('durable analyze-run work checkpoints', () => {
     await expect(execution).rejects.toBe(stopAfterCheckpoint);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       revision: 3,
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
@@ -195,7 +195,7 @@ describe('durable analyze-run work checkpoints', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, { runId: 'checkpoint-run' })).resolves.toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
     });
     await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).resolves.toMatchObject({
       plan: { execution: null },
@@ -226,7 +226,7 @@ describe('durable analyze-run work checkpoints', () => {
       plan: { execution: unknown };
     };
     expect(migrated).toMatchObject({
-      schemaVersion: 8,
+      schemaVersion: 9,
       plan: { execution: { state: 'legacy-unbound' } },
     });
     resetAnalyzeRunStorage();

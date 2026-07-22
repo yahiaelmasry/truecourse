@@ -186,7 +186,7 @@ function state(
 ): AnalyzeRunAmbiguousRearmState {
   return {
     isLatestAttempt: true,
-    admissionEvidence: 'current-schema',
+    admissionEvidence: 'explicit-admission-schema',
     runId: 'run-1',
     runRevision: 4,
     state: 'running',

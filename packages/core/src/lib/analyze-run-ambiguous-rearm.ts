@@ -58,7 +58,7 @@ export type AnalyzeRunAmbiguousRearmExecutionEpochState =
 
 export interface AnalyzeRunAmbiguousRearmState {
   readonly isLatestAttempt: boolean;
-  readonly admissionEvidence: 'current-schema' | 'legacy-schema';
+  readonly admissionEvidence: 'explicit-admission-schema' | 'legacy-schema';
   readonly runId: string;
   readonly runRevision: number;
   readonly state: 'running' | 'blocked' | 'failed' | 'finalizing' | 'completed';
@@ -83,7 +83,7 @@ export function buildAnalyzeRunAmbiguousRearmOffer(
 ): AnalyzeRunAmbiguousRearmOffer | null {
   if (
     !state.isLatestAttempt
-    || state.admissionEvidence !== 'current-schema'
+    || state.admissionEvidence !== 'explicit-admission-schema'
     || state.state !== 'running'
     || state.finalizationPresent
     || state.plan.state !== 'sealed'
