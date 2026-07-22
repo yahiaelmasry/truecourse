@@ -213,7 +213,7 @@ async function prepareRun(
       inputFingerprint,
     })),
   });
-  const execution = await certified.execute(activation);
+  const execution = await certified.execute(activation, '2026-07-19T10:00:01.250Z');
   await beginFinalizeAnalyzeRun(repoPath, {
     runId,
     finalizingAt: '2026-07-19T10:00:02.000Z',

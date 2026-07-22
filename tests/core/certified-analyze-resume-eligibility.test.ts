@@ -610,6 +610,7 @@ describe('certified analyze resume eligibility', () => {
     const stored = readStoredRun();
     stored.schemaVersion = 6;
     delete stored.plan.execution;
+    delete stored.executionAttempt.initialAdmission;
     writeStoredRun(stored);
     resetAnalyzeRunStorage();
     const { rebuilt, calls } = rebuiltRun();
@@ -1305,7 +1306,10 @@ async function createBlockedArchitectureRun(analysisInputFingerprint: string): P
       inputFingerprint,
     })),
   });
-  await expect(certified.execute(activation)).rejects.toBe(sessionLimit);
+  await expect(certified.execute(
+    activation,
+    '2026-07-19T02:00:01.500Z',
+  )).rejects.toBe(sessionLimit);
   await dispatchAnalyzeRun(repoPath, {
     kind: 'block',
     runId,
@@ -1340,7 +1344,10 @@ async function createZeroCheckpointBlockedRun(): Promise<void> {
       inputFingerprint,
     })),
   });
-  await expect(certified.execute(activation)).rejects.toBe(sessionLimit);
+  await expect(certified.execute(
+    activation,
+    '2026-07-19T02:00:01.500Z',
+  )).rejects.toBe(sessionLimit);
   await dispatchAnalyzeRun(repoPath, {
     kind: 'block',
     runId,
@@ -1382,11 +1389,17 @@ async function createBlockedRun(
     })),
   });
   if (options.databaseSucceeds) {
-    await expect(certified.execute(activation)).resolves.toMatchObject({
+    await expect(certified.execute(
+      activation,
+      '2026-07-19T02:00:01.500Z',
+    )).resolves.toMatchObject({
       results: expect.any(Array),
     });
   } else {
-    await expect(certified.execute(activation)).rejects.toBe(sessionLimit);
+    await expect(certified.execute(
+      activation,
+      '2026-07-19T02:00:01.500Z',
+    )).rejects.toBe(sessionLimit);
   }
   await dispatchAnalyzeRun(repoPath, {
     kind: 'block',

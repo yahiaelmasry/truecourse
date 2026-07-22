@@ -24,6 +24,7 @@ import {
   type StoredAnalyzeRun,
   beginFinalizeAnalyzeRun,
   dispatchAnalyzeRun,
+  readAnalyzeRun,
   resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
   setAnalyzeRunStorage,
@@ -227,6 +228,44 @@ async function activate(
 }
 
 describe('certified analyze LLM run', () => {
+  it('records explicit initial execution admission before the provider callback', async () => {
+    const providerFailure = new Error('provider callback stopped');
+    let observedDuringProvider: Awaited<ReturnType<typeof readAnalyzeRun>> = null;
+    const certified = certifyAnalyzeLlmRun({
+      runId: 'initial-admission-order',
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [{ domain: 'bugs', context: codeContext }],
+    }, {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute() {
+        observedDuringProvider = await readAnalyzeRun(
+          journalRepository,
+          { runId: 'initial-admission-order' },
+        );
+        throw providerFailure;
+      },
+    });
+    const activation = await activate(certified, 'initial-admission-order');
+
+    await expect(certified.execute(activation)).rejects.toBe(providerFailure);
+    expect(observedDuringProvider).toMatchObject({
+      schemaVersion: 8,
+      revision: 2,
+      state: 'running',
+      executionAttempt: {
+        number: 1,
+        initialAdmission: {
+          admission: 'executing',
+          admittedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+          evidence: 'explicit',
+        },
+      },
+      counts: { pending: 1, succeeded: 0 },
+      resume: { available: false, reason: 'resume-execution-ambiguous' },
+    });
+  });
+
   it('spends no provider calls when a later work family cannot be certified', () => {
     const adapter = new RecordingAdapter();
 

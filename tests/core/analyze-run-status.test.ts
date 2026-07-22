@@ -13,9 +13,11 @@ import {
   writeLatest,
 } from '../../packages/core/src/lib/analysis-store.js';
 import {
+  admitAnalyzeRunPlanExecution,
   dispatchAnalyzeRun,
   resetAnalyzeRunStorage,
   sealAnalyzeRunPlan,
+  type AnalyzeRunPlanActivation,
 } from '../../packages/core/src/lib/analyze-run-journal.js';
 import type { LatestSnapshot } from '../../packages/core/src/types/snapshot.js';
 
@@ -49,7 +51,7 @@ describe('analyze run status', () => {
       commitHash: 'def456',
       completedBaselineId: completed.analysis.id,
     });
-    await sealAnalyzeRunPlan(repoPath, {
+    const activation = await sealAnalyzeRunPlan(repoPath, {
       kind: 'seal-plan',
       runId: 'latest-attempt-1',
       sealedAt: '2026-07-19T10:00:01.000Z',
@@ -64,6 +66,15 @@ describe('analyze run status', () => {
         { workId: 'analyze:v1:module', inputFingerprint: `sha256:${'b'.repeat(64)}` },
       ],
     });
+    await admitInitialExecutionForTest(
+      activation,
+      'latest-attempt-1',
+      [
+        { workId: 'analyze:v1:service', inputFingerprint: `sha256:${'a'.repeat(64)}` },
+        { workId: 'analyze:v1:module', inputFingerprint: `sha256:${'b'.repeat(64)}` },
+      ],
+      '2026-07-19T10:00:01.500Z',
+    );
     await dispatchAnalyzeRun(repoPath, {
       kind: 'block',
       runId: 'latest-attempt-1',
@@ -175,7 +186,7 @@ describe('analyze run status', () => {
     })).resolves.toMatchObject({
       latestAttempt: {
         runId: 'waited-attempt-1',
-        revision: 2,
+        revision: 3,
         lastProviderLimit: { resetAt: '2026-07-20T17:00:00.000Z' },
       },
       activeCompletedAnalysis: { analysisId: 'completed-analysis-1' },
@@ -319,7 +330,7 @@ async function createWaitableStatus(resetHint: string): Promise<Awaited<ReturnTy
     commitHash: 'def456',
     completedBaselineId: completed.analysis.id,
   });
-  await sealAnalyzeRunPlan(repoPath, {
+  const activation = await sealAnalyzeRunPlan(repoPath, {
     kind: 'seal-plan',
     runId: 'waited-attempt-1',
     sealedAt: '2026-07-19T10:00:01.000Z',
@@ -333,6 +344,12 @@ async function createWaitableStatus(resetHint: string): Promise<Awaited<ReturnTy
       { workId: 'analyze:v1:service', inputFingerprint: `sha256:${'a'.repeat(64)}` },
     ],
   });
+  await admitInitialExecutionForTest(
+    activation,
+    'waited-attempt-1',
+    [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'a'.repeat(64)}` }],
+    '2026-07-19T10:00:01.500Z',
+  );
   await dispatchAnalyzeRun(repoPath, {
     kind: 'block',
     runId: 'waited-attempt-1',
@@ -340,6 +357,26 @@ async function createWaitableStatus(resetHint: string): Promise<Awaited<ReturnTy
     resetHint,
   });
   return readAnalyzeRunStatus(repoPath);
+}
+
+async function admitInitialExecutionForTest(
+  activation: AnalyzeRunPlanActivation,
+  runId: string,
+  work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
+  admittedAt: string,
+): Promise<void> {
+  const stopped = new Error('stop after initial admission');
+  const admission = await admitAnalyzeRunPlanExecution(
+    activation,
+    repoPath,
+    runId,
+    work,
+    admittedAt,
+    () => undefined,
+    async () => { throw stopped; },
+  );
+  if (!admission.admitted) throw new Error('expected initial execution admission');
+  await expect(admission.execution).rejects.toBe(stopped);
 }
 
 function completedLatest(): LatestSnapshot {

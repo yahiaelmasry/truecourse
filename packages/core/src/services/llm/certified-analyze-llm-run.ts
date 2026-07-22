@@ -147,6 +147,11 @@ export interface CertifiedAnalyzeLlmRun {
     activation: AnalyzeRunPlanActivation,
     observer?: AnalyzeLlmWorkProgressObserver,
   ): Promise<CertifiedAnalyzeLlmExecution>;
+  execute(
+    activation: AnalyzeRunPlanActivation,
+    admittedAt: string,
+    observer?: AnalyzeLlmWorkProgressObserver,
+  ): Promise<CertifiedAnalyzeLlmExecution>;
 }
 
 export interface AnalyzeLlmResumeIdentity {
@@ -519,16 +524,24 @@ export function certifyAnalyzeLlmRun(
     },
     async execute(
       activation: AnalyzeRunPlanActivation,
-      observer?: AnalyzeLlmWorkProgressObserver,
+      admittedAtOrObserver?: string | AnalyzeLlmWorkProgressObserver,
+      requestedObserver?: AnalyzeLlmWorkProgressObserver,
     ) {
       if (executed) {
         throw new AnalyzeLlmPlanError('already-executed', 'Certified analyze LLM run already executed');
       }
+      const admittedAt = typeof admittedAtOrObserver === 'string'
+        ? admittedAtOrObserver
+        : new Date().toISOString();
+      const observer = typeof admittedAtOrObserver === 'string'
+        ? requestedObserver
+        : admittedAtOrObserver;
       const admission = await admitAnalyzeRunPlanExecution(
         activation,
         journalKey,
         runId,
         manifest.work,
+        admittedAt,
         () => {
           assertExecutionMatches(execution, adapter.execution);
         },

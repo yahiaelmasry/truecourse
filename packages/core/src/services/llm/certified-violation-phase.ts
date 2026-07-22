@@ -116,7 +116,11 @@ export async function executeCertifiedViolationPhase(
         inputFingerprint,
       })),
     });
-    const execution = await certified.execute(activation, input.observer);
+    const execution = await certified.execute(
+      activation,
+      timestampAtOrAfter(sealedAt),
+      input.observer,
+    );
     const results = materializeViolationPhaseResults(
       execution.results,
       input.analysisTimestamp,

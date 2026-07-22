@@ -92,6 +92,7 @@ async function admit<T>(
     repoPath,
     'checkpoint-run',
     work,
+    '2026-07-19T04:00:01.500Z',
     () => {},
     execute,
   );
@@ -118,11 +119,11 @@ describe('durable analyze-run work checkpoints', () => {
     await expect(execution).rejects.toBe(stopAfterCheckpoint);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 3,
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
-      resume: { available: false, reason: 'run-not-resumable' },
+      resume: { available: false, reason: 'resume-execution-ambiguous' },
     });
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8'));
     expect(stored.plan.work[0]).toMatchObject({
@@ -184,15 +185,17 @@ describe('durable analyze-run work checkpoints', () => {
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
       schemaVersion: number;
       plan: { execution?: unknown };
+      executionAttempt: { initialAdmission?: unknown };
     };
     stored.schemaVersion = 6;
     delete stored.plan.execution;
+    delete stored.executionAttempt.initialAdmission;
     fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
     const before = fs.readFileSync(runFile());
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, { runId: 'checkpoint-run' })).resolves.toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
     });
     await expect(readAnalyzeRunResumeCandidate(repoPath, 'checkpoint-run')).resolves.toMatchObject({
       plan: { execution: null },
@@ -204,9 +207,11 @@ describe('durable analyze-run work checkpoints', () => {
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
       schemaVersion: number;
       plan: { execution?: unknown };
+      executionAttempt: { initialAdmission?: unknown };
     };
     stored.schemaVersion = 6;
     delete stored.plan.execution;
+    delete stored.executionAttempt.initialAdmission;
     fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
 
     await dispatchAnalyzeRun(repoPath, {
@@ -221,7 +226,7 @@ describe('durable analyze-run work checkpoints', () => {
       plan: { execution: unknown };
     };
     expect(migrated).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       plan: { execution: { state: 'legacy-unbound' } },
     });
     resetAnalyzeRunStorage();
@@ -235,8 +240,12 @@ describe('durable analyze-run work checkpoints', () => {
     ['sets null for', null],
   ])('rejects a schema-v7 sealed plan that %s its execution intent', async (_case, execution) => {
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8')) as {
+      schemaVersion: number;
       plan: { execution?: unknown };
+      executionAttempt: { initialAdmission?: unknown };
     };
+    stored.schemaVersion = 7;
+    delete stored.executionAttempt.initialAdmission;
     if (execution === undefined) delete stored.plan.execution;
     else stored.plan.execution = execution;
     fs.writeFileSync(runFile(), `${JSON.stringify(stored, null, 2)}\n`);
@@ -282,6 +291,7 @@ describe('durable analyze-run work checkpoints', () => {
       repoPath,
       'checkpoint-run',
       work,
+      '2026-07-19T04:00:01.500Z',
       () => undefined,
       async () => {
         providerCalls += 1;

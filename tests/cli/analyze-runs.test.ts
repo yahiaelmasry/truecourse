@@ -919,7 +919,7 @@ describe('analyze run CLI status', () => {
 function blockedStatus(): AnalyzeRunStatus {
   return {
     latestAttempt: {
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 3,
       runId: 'run-interrupted',
       candidateAnalysisId: 'analysis-incomplete',
@@ -930,7 +930,16 @@ function blockedStatus(): AnalyzeRunStatus {
       branch: 'main',
       commitHash: 'def456789',
       completedBaselineId: 'analysis-completed',
-      executionAttempt: { number: 1, activatedAt: '2026-07-19T10:00:00.000Z', resume: null },
+      executionAttempt: {
+        number: 1,
+        activatedAt: '2026-07-19T10:00:00.000Z',
+        initialAdmission: {
+          admission: 'executing',
+          admittedAt: '2026-07-19T10:00:01.000Z',
+          evidence: 'explicit',
+        },
+        resume: null,
+      },
       plan: 'sealed',
       counts: { total: 2, pending: 1, running: 0, succeeded: 1, failed: 0 },
       blocked: {

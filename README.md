@@ -79,9 +79,10 @@ files are local and gitignored: a running, blocked, or failed attempt never
 replaces the completed findings in `LATEST.json`. If a crash loses the pointer
 update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
-`packages/core/src/lib/analyze-run-journal.ts`. Schema v7 binds the sealed work
-plan to its provider and originally requested model so a later process can
-reconstruct the same execution choice. Schema v6 records the explicit
+`packages/core/src/lib/analyze-run-journal.ts`. Schema v8 distinguishes initial
+plan activation from provider execution and records explicit `executing`
+evidence before the provider callback starts. Schema v7 binds the sealed work
+plan to its provider and originally requested model. Schema v6 records the explicit
 execution-attempt number and activation time and reserves the durable
 `activated`/`executing` resume-admission states. Resume attempts that reuse a
 checkpoint carry an exact provider/resolved-model pin. A zero-checkpoint attempt
@@ -156,12 +157,14 @@ Resume accounting is derived once from the complete durable checkpoint ledger,
 deduplicated by provider attempt ID, and preserves each call's original
 checkpoint timestamp while discarding the provider's overlapping transient
 usage buffer.
-Schema-v1 through schema-v6 journals remain readable. A current lifecycle write
-normalizes a sealed legacy plan to schema v7 with an explicit
-`legacy-unbound` execution marker; it remains inspectable but is not resumable
-under an unproven provider/model choice. Historical schema-v3 runs from before durable execution admission
-are normalized to the admitted revision lineage without rewriting the journal
-during a read-only status or compatibility inspection.
+Schema-v1 through schema-v7 journals remain readable without a read-only
+rewrite. Their initial execution evidence is inferred conservatively from the
+schema and durable revision; uncertain states remain execution-ambiguous rather
+than becoming resumable. A current lifecycle write normalizes a sealed schema-v1
+through schema-v6 plan to schema v8 with an explicit `legacy-unbound` execution
+marker, so it remains inspectable without claiming a provider/model identity.
+Historical schema-v3 revision lineages are normalized in memory before a later
+lifecycle write persists schema v8.
 
 The first production-wiring slice journals full analyses only when their LLM
 plan contains certified aggregate architecture work and no code-batch or

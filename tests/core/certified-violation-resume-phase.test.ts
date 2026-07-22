@@ -439,7 +439,10 @@ async function createBlockedAttempt(
     sealedAt: '2026-07-19T04:00:01.000Z',
     work: certified.manifest.work,
   });
-  await expect(certified.execute(activation)).rejects.toMatchObject({
+  await expect(certified.execute(
+    activation,
+    '2026-07-19T04:00:01.500Z',
+  )).rejects.toMatchObject({
     code: 'LLM_SESSION_LIMIT',
   });
   await dispatchAnalyzeRun(repoPath, {
@@ -485,7 +488,10 @@ async function createZeroCheckpointBlockedAttempt(
     sealedAt: '2026-07-19T04:00:01.000Z',
     work: certified.manifest.work,
   });
-  await expect(certified.execute(activation)).rejects.toMatchObject({
+  await expect(certified.execute(
+    activation,
+    '2026-07-19T04:00:01.500Z',
+  )).rejects.toMatchObject({
     code: 'LLM_SESSION_LIMIT',
   });
   await dispatchAnalyzeRun(repoPath, {

@@ -39,7 +39,7 @@ describe('analyze start policy', () => {
     }
   });
 
-  it('fails closed for ambiguous execution before considering supersession', () => {
+  it('fails closed for an admitted initial execution before considering supersession', () => {
     const current = status(
       run({ state: 'running', resumeReason: 'resume-execution-ambiguous', completedBaselineId: 'older' }),
       'newer',
@@ -119,7 +119,7 @@ function run(options: {
   prepared?: boolean;
 }): NonNullable<AnalyzeRunStatus['latestAttempt']> {
   return {
-    schemaVersion: 7,
+    schemaVersion: 8,
     revision: 1,
     runId: 'run-1',
     candidateAnalysisId: 'candidate-1',
@@ -132,7 +132,16 @@ function run(options: {
     completedBaselineId: options.completedBaselineId === undefined
       ? 'baseline-1'
       : options.completedBaselineId,
-    executionAttempt: { number: 1, activatedAt: '2026-07-22T08:00:00.000Z', resume: null },
+    executionAttempt: {
+      number: 1,
+      activatedAt: '2026-07-22T08:00:00.000Z',
+      initialAdmission: {
+        admission: 'executing',
+        admittedAt: '2026-07-22T08:00:01.000Z',
+        evidence: 'explicit',
+      },
+      resume: null,
+    },
     plan: 'sealed',
     counts: { total: 2, pending: 1, running: 0, succeeded: 1, failed: 0 },
     blocked: options.state === 'blocked'

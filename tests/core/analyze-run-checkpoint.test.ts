@@ -131,7 +131,10 @@ afterEach(() => {
 });
 
 async function executePartialRun(): Promise<void> {
-  await expect(certified.execute(activation)).rejects.toBe(providerFailure);
+  await expect(certified.execute(
+    activation,
+    '2026-07-19T04:00:01.500Z',
+  )).rejects.toBe(providerFailure);
 }
 
 function runFile(): string {
@@ -145,7 +148,7 @@ describe('analyze run successful-result checkpoints', () => {
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
-      resume: { available: false, reason: 'run-not-resumable' },
+      resume: { available: false, reason: 'resume-execution-ambiguous' },
     });
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8'));
     expect(stored.plan.work.find((item: { state: string }) => item.state === 'succeeded-checkpointed'))
@@ -171,6 +174,7 @@ describe('analyze run successful-result checkpoints', () => {
       repoPath,
       'checkpoint-run',
       certified.manifest.work,
+      '2026-07-19T04:00:01.500Z',
       () => {},
       async (writer) => {
         try {
@@ -193,7 +197,7 @@ describe('analyze run successful-result checkpoints', () => {
 
   it('preserves concurrent certified checkpoints for every successful work item', async () => {
     adapter.failDomain = null;
-    await certified.execute(activation);
+    await certified.execute(activation, '2026-07-19T04:00:01.500Z');
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
       counts: { total: 2, pending: 0, succeeded: 2 },
@@ -239,7 +243,10 @@ describe('analyze run successful-result checkpoints', () => {
     adapter.failDomain = null;
     adapter.completionForDomain.set('bugs', '2026-07-19T04:00:00.500Z');
     adapter.completionForDomain.set('security', '2026-07-19T04:00:00.500Z');
-    await expect(certified.execute(activation)).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
+    await expect(certified.execute(
+      activation,
+      '2026-07-19T04:00:01.500Z',
+    )).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
       revision: 2,

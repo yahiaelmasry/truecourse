@@ -11,6 +11,7 @@ import {
   AnalyzeRunLatestAttemptConflictError,
   AnalyzeRunRevisionConflictError,
   InvalidAnalyzeRunTransitionError,
+  admitAnalyzeRunPlanExecution,
   activateAnalyzeRunResume,
   beginFinalizeAnalyzeRun,
   beginPreparedAnalyzeRunFinalization,
@@ -70,7 +71,6 @@ async function certifySuccessfulExecution(
   sealedAt = '2026-07-19T01:30:01.000Z',
 ): Promise<CertifiedAnalyzeLlmExecution> {
   let providerCalls = 0;
-  const completedAt = new Date(Date.parse(sealedAt) + 1).toISOString();
   const adapter: AnalyzeLlmExecutionAdapter = {
     execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
     async execute(work: CertifiedAnalyzeLlmWork): Promise<AnalyzeLlmExecutionOutcome> {
@@ -84,7 +84,7 @@ async function certifySuccessfulExecution(
         resultContractId: work.planned.request.resultContractId,
         result: { violations: [] },
         attemptId: `test:${work.workId}`,
-        completedAt,
+        completedAt: new Date(Date.parse(sealedAt) + 1_000).toISOString(),
         usage: null,
       };
     },
@@ -105,11 +105,34 @@ async function certifySuccessfulExecution(
       inputFingerprint,
     })),
   });
-  const execution = await certified.execute(activation);
+  const execution = await certified.execute(
+    activation,
+    new Date(Date.parse(sealedAt) + 500).toISOString(),
+  );
   if (providerCalls !== 1) {
     throw new Error(`Expected one certified provider call, got ${providerCalls}`);
   }
   return execution;
+}
+
+async function admitInitialExecutionForTest(
+  activation: AnalyzeRunPlanActivation,
+  runId: string,
+  work: readonly { readonly workId: string; readonly inputFingerprint: string }[],
+  admittedAt: string,
+): Promise<void> {
+  const stopped = new Error('stop after initial admission');
+  const admission = await admitAnalyzeRunPlanExecution(
+    activation,
+    repoPath,
+    runId,
+    work,
+    admittedAt,
+    () => undefined,
+    async () => { throw stopped; },
+  );
+  if (!admission.admitted) throw new Error('expected initial execution admission');
+  await expect(admission.execution).rejects.toBe(stopped);
 }
 
 function finalizationPayload(candidateAnalysisId: string) {
@@ -350,7 +373,7 @@ describe('analyze run journal', () => {
     });
 
     expect(begun).toEqual({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 0,
       runId: 'run-2026-07-19',
       candidateAnalysisId: 'analysis-2026-07-19',
@@ -364,6 +387,11 @@ describe('analyze run journal', () => {
       executionAttempt: {
         number: 1,
         activatedAt: '2026-07-19T00:00:00.000Z',
+        initialAdmission: {
+          admission: 'activated',
+          admittedAt: null,
+          evidence: 'explicit',
+        },
         resume: null,
       },
       plan: 'unsealed',
@@ -432,7 +460,7 @@ describe('analyze run journal', () => {
       'run-with-plan.json',
     ), 'utf8'));
     expect(stored).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       plan: {
         state: 'sealed',
         execution: { provider: 'claude-code', requestedModel: 'sonnet' },
@@ -477,7 +505,7 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'offset-timestamp-run' }))
       .resolves.toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: 8,
         updatedAt: '2026-07-19T02:00:01+02:00',
         executionAttempt: { number: 1, activatedAt: '2026-07-19T02:00:00+02:00', resume: null },
       });
@@ -625,7 +653,7 @@ describe('analyze run journal', () => {
       ...payload,
     });
     expect(prepared).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 5,
       state: 'finalizing',
       finalization: {
@@ -1008,6 +1036,7 @@ describe('analyze run journal', () => {
       ...item,
       state: 'succeeded-uncheckpointed',
     }));
+    delete legacy.executionAttempt;
     delete legacy.finalizationIntent;
     fs.writeFileSync(runFile, JSON.stringify(legacy), 'utf8');
     fs.writeFileSync(pointerFile, JSON.stringify({
@@ -1017,13 +1046,13 @@ describe('analyze run journal', () => {
     resetAnalyzeRunStorage();
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 3,
       state: 'finalizing',
       finalization: { persistence: 'unprepared', preparedAt: null },
     });
     expect(JSON.parse(fs.readFileSync(pointerFile, 'utf8'))).toEqual({
-      schemaVersion: 7,
+      schemaVersion: 8,
       runId: 'legacy-finalizing-run',
     });
     await expect(prepareAnalyzeRunFinalization(repoPath, {
@@ -1031,12 +1060,12 @@ describe('analyze run journal', () => {
       preparedAt: '2026-07-19T01:35:03.000Z',
       ...finalizationPayload('legacy-finalizing-analysis'),
     })).resolves.toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 4,
       finalization: { persistence: 'prepared' },
     });
     expect(JSON.parse(fs.readFileSync(runFile, 'utf8'))).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 4,
       finalizationIntent: { preparedAt: '2026-07-19T01:35:03.000Z' },
     });
@@ -1058,7 +1087,7 @@ describe('analyze run journal', () => {
       .resolves.toMatchObject({ revision: 5, state: 'completed' });
   });
 
-  it('migrates a schema-v1 finalizing failure to a readable schema-v7 revision', async () => {
+  it('migrates a schema-v1 finalizing failure to a readable schema-v8 revision', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'legacy-finalizing-failure',
@@ -1093,6 +1122,7 @@ describe('analyze run journal', () => {
       ...item,
       state: 'succeeded-uncheckpointed',
     }));
+    delete legacy.executionAttempt;
     delete legacy.finalizationIntent;
     fs.writeFileSync(runFile, JSON.stringify(legacy), 'utf8');
     resetAnalyzeRunStorage();
@@ -1102,10 +1132,10 @@ describe('analyze run journal', () => {
       runId: 'legacy-finalizing-failure',
       failedAt: '2026-07-19T01:36:03.000Z',
       error: { code: 'FINALIZE_FAILED', message: 'Legacy finalization failed.' },
-    })).resolves.toMatchObject({ schemaVersion: 7, revision: 4, state: 'failed' });
+    })).resolves.toMatchObject({ schemaVersion: 8, revision: 4, state: 'failed' });
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, { runId: 'legacy-finalizing-failure' }))
-      .resolves.toMatchObject({ schemaVersion: 7, revision: 4, state: 'failed' });
+      .resolves.toMatchObject({ schemaVersion: 8, revision: 4, state: 'failed' });
   });
 
   it.each([[1, 2], [2, 2], [3, 3]] as const)(
@@ -1128,12 +1158,6 @@ describe('analyze run journal', () => {
         sealedAt: '2026-07-19T01:36:01.000Z',
         work: [{ workId: 'analyze:v1:legacy', inputFingerprint: `sha256:${'d'.repeat(64)}` }],
       });
-      await dispatchAnalyzeRun(repoPath, {
-        kind: 'block',
-        runId: 'legacy-blocked-attempt',
-        blockedAt: '2026-07-19T01:36:02.000Z',
-        resetHint: '7pm',
-      });
       const file = path.join(
         repoPath,
         '.truecourse',
@@ -1141,8 +1165,16 @@ describe('analyze run journal', () => {
         'runs',
         'legacy-blocked-attempt.json',
       );
-      const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+      const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
       legacy.schemaVersion = schemaVersion;
+      legacy.revision = 2;
+      legacy.updatedAt = '2026-07-19T01:36:02.000Z';
+      legacy.status = {
+        state: 'blocked',
+        reason: 'provider-session-limit',
+        resetHint: '7pm',
+        blockedAt: '2026-07-19T01:36:02.000Z',
+      };
       delete legacy.executionAttempt;
       if (schemaVersion === 1) delete legacy.finalizationIntent;
       fs.writeFileSync(file, JSON.stringify(legacy));
@@ -1151,7 +1183,7 @@ describe('analyze run journal', () => {
 
       await expect(readAnalyzeRun(repoPath, { runId: 'legacy-blocked-attempt' }))
         .resolves.toMatchObject({
-          schemaVersion: 7,
+          schemaVersion: 8,
           revision: normalizedRevision,
           state: 'blocked',
           executionAttempt: {
@@ -1170,7 +1202,7 @@ describe('analyze run journal', () => {
     ['prepared', 4, 5],
     ['completed', 5, 6],
   ] as const)(
-    'normalizes the pre-admission schema-v3 %s lineage to the admitted schema-v7 revision',
+    'normalizes the pre-admission schema-v3 %s lineage to the admitted schema-v8 revision',
     async (state, legacyRevision, normalizedRevision) => {
       const candidateAnalysisId = `schema-v3-${state}-analysis`;
       const runId = `schema-v3-${state}`;
@@ -1230,7 +1262,7 @@ describe('analyze run journal', () => {
       resetAnalyzeRunStorage();
 
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: 8,
         revision: normalizedRevision,
         state: state === 'prepared' ? 'finalizing' : state,
         executionAttempt: { number: 1, activatedAt: startedAt, resume: null },
@@ -1239,7 +1271,7 @@ describe('analyze run journal', () => {
     },
   );
 
-  it('normalizes a schema-v4 execution attempt to schema v7 without rewriting it', async () => {
+  it('normalizes a schema-v4 execution attempt to schema v8 without rewriting it', async () => {
     await dispatchAnalyzeRun(repoPath, {
       kind: 'begin',
       runId: 'schema-v4-attempt',
@@ -1259,6 +1291,7 @@ describe('analyze run journal', () => {
     );
     const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
     stored.schemaVersion = 4;
+    delete stored.executionAttempt.initialAdmission;
     delete stored.executionAttempt.resume;
     fs.writeFileSync(file, JSON.stringify(stored));
     const bytesBefore = fs.readFileSync(file);
@@ -1266,7 +1299,7 @@ describe('analyze run journal', () => {
 
     await expect(readAnalyzeRun(repoPath, { runId: 'schema-v4-attempt' }))
       .resolves.toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: 8,
         executionAttempt: {
           number: 1,
           activatedAt: '2026-07-19T01:36:30.000Z',
@@ -1274,6 +1307,256 @@ describe('analyze run journal', () => {
         },
       });
     expect(fs.readFileSync(file)).toEqual(bytesBefore);
+  });
+
+  it.each([
+    [1, 'ambiguous', 'legacy-ambiguous', 'resume-execution-ambiguous'],
+    [2, 'activated', 'legacy-inferred', 'checkpoint-execution-unbound'],
+    [3, 'ambiguous', 'legacy-ambiguous', 'resume-execution-ambiguous'],
+    [4, 'activated', 'legacy-inferred', 'checkpoint-execution-unbound'],
+    [5, 'activated', 'legacy-inferred', 'checkpoint-execution-unbound'],
+    [6, 'activated', 'legacy-inferred', 'checkpoint-execution-unbound'],
+    [7, 'activated', 'legacy-inferred', 'run-not-resumable'],
+  ] as const)(
+    'classifies schema-v%s revision-one initial admission without rewriting it',
+    async (schemaVersion, admission, evidence, reason) => {
+      const runId = `legacy-initial-${schemaVersion}`;
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId,
+        candidateAnalysisId: `${runId}-analysis`,
+        startedAt: '2026-07-19T01:36:40.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: `legacy-${schemaVersion}`,
+        completedBaselineId: null,
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
+        runId,
+        sealedAt: '2026-07-19T01:36:41.000Z',
+        work: [{ workId: 'analyze:v1:legacy-initial', inputFingerprint: `sha256:${'a'.repeat(64)}` }],
+      });
+      const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+      const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+      stored.schemaVersion = schemaVersion;
+      if (schemaVersion <= 3) {
+        delete stored.executionAttempt;
+      } else {
+        delete stored.executionAttempt.initialAdmission;
+        if (schemaVersion === 4) delete stored.executionAttempt.resume;
+      }
+      if (schemaVersion === 1) delete stored.finalizationIntent;
+      fs.writeFileSync(file, JSON.stringify(stored));
+      const bytesBefore = fs.readFileSync(file);
+      resetAnalyzeRunStorage();
+
+      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+        schemaVersion: 8,
+        revision: 1,
+        executionAttempt: {
+          number: 1,
+          initialAdmission: { admission, admittedAt: null, evidence },
+        },
+        resume: { available: false, reason },
+      });
+      expect(fs.readFileSync(file)).toEqual(bytesBefore);
+    },
+  );
+
+  it.each([4, 5, 6, 7] as const)(
+    'fails closed for a schema-v%s initial attempt whose admission revision was persisted',
+    async (schemaVersion) => {
+      const runId = `legacy-admitted-${schemaVersion}`;
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId,
+        candidateAnalysisId: `${runId}-analysis`,
+        startedAt: '2026-07-19T01:36:50.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: `legacy-admitted-${schemaVersion}`,
+        completedBaselineId: null,
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
+        runId,
+        sealedAt: '2026-07-19T01:36:51.000Z',
+        work: [{ workId: 'analyze:v1:legacy-admitted', inputFingerprint: `sha256:${'b'.repeat(64)}` }],
+      });
+      const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+      const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+      stored.schemaVersion = schemaVersion;
+      stored.revision = 2;
+      delete stored.executionAttempt.initialAdmission;
+      if (schemaVersion === 4) delete stored.executionAttempt.resume;
+      fs.writeFileSync(file, JSON.stringify(stored));
+      const bytesBefore = fs.readFileSync(file);
+      resetAnalyzeRunStorage();
+
+      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+        schemaVersion: 8,
+        executionAttempt: {
+          initialAdmission: {
+            admission: 'executing',
+            admittedAt: null,
+            evidence: 'legacy-inferred',
+          },
+        },
+        resume: { available: false, reason: 'resume-execution-ambiguous' },
+      });
+      expect(fs.readFileSync(file)).toEqual(bytesBefore);
+    },
+  );
+
+  it.each([
+    ['unsealed revision zero', false, 0, {
+      admission: 'executing',
+      admittedAt: '2026-07-19T01:36:54.000Z',
+      evidence: 'explicit',
+    }],
+    ['sealed revision one', true, 1, {
+      admission: 'executing',
+      admittedAt: '2026-07-19T01:36:55.000Z',
+      evidence: 'explicit',
+    }],
+    ['sealed revision two with activated evidence', true, 2, {
+      admission: 'activated',
+      admittedAt: null,
+      evidence: 'explicit',
+    }],
+    ['sealed revision two with legacy ambiguity', true, 2, {
+      admission: 'ambiguous',
+      admittedAt: null,
+      evidence: 'legacy-ambiguous',
+    }],
+  ] as const)(
+    'rejects impossible schema-v8 initial admission at %s',
+    async (_case, sealed, revision, initialAdmission) => {
+      const runId = `impossible-v8-initial-${revision}-${initialAdmission.admission}`;
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId,
+        candidateAnalysisId: `${runId}-analysis`,
+        startedAt: '2026-07-19T01:36:54.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: `impossible-${revision}-${initialAdmission.admission}`,
+        completedBaselineId: null,
+      });
+      if (sealed) {
+        await dispatchAnalyzeRun(repoPath, {
+          kind: 'seal-plan',
+          execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
+          runId,
+          sealedAt: '2026-07-19T01:36:55.000Z',
+          work: [{
+            workId: 'analyze:v1:impossible-admission',
+            inputFingerprint: `sha256:${'c'.repeat(64)}`,
+          }],
+        });
+      }
+      const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+      const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+      stored.revision = revision;
+      stored.executionAttempt.initialAdmission = initialAdmission;
+      if (initialAdmission.admittedAt !== null) stored.updatedAt = initialAdmission.admittedAt;
+      fs.writeFileSync(file, JSON.stringify(stored));
+      resetAnalyzeRunStorage();
+
+      await expect(readAnalyzeRun(repoPath, { runId }))
+        .rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
+    },
+  );
+
+  it.each([
+    [{ admission: 'activated', admittedAt: null, evidence: 'explicit' }],
+    [{ admission: 'ambiguous', admittedAt: null, evidence: 'legacy-ambiguous' }],
+  ] as const)(
+    'rejects a schema-v8 failed run that checkpoints work under %s initial admission',
+    async (initialAdmission) => {
+      const runId = `impossible-v8-checkpoint-${initialAdmission.admission}`;
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'begin',
+        runId,
+        candidateAnalysisId: `${runId}-analysis`,
+        startedAt: '2026-07-19T01:36:54.000Z',
+        source: 'cli',
+        branch: 'main',
+        commitHash: `impossible-checkpoint-${initialAdmission.admission}`,
+        completedBaselineId: null,
+      });
+      await dispatchAnalyzeRun(repoPath, {
+        kind: 'seal-plan',
+        execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
+        runId,
+        sealedAt: '2026-07-19T01:36:55.000Z',
+        work: [{
+          workId: 'analyze:v1:impossible-checkpoint',
+          inputFingerprint: `sha256:${'d'.repeat(64)}`,
+        }],
+      });
+      const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+      const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+      const result = { violations: [] };
+      stored.revision = 2;
+      stored.updatedAt = '2026-07-19T01:36:57.000Z';
+      stored.status = {
+        state: 'failed',
+        code: 'PROVIDER_FAILED',
+        message: 'Provider stopped after an impossible checkpoint.',
+        failedAt: '2026-07-19T01:36:57.000Z',
+        finalizingAt: null,
+      };
+      stored.executionAttempt.initialAdmission = initialAdmission;
+      stored.plan.work[0] = {
+        ...stored.plan.work[0],
+        state: 'succeeded-checkpointed',
+        checkpoint: {
+          checkpointedAt: '2026-07-19T01:36:56.000Z',
+          attemptId: 'impossible-attempt',
+          resultContractId: 'analyze.code@1',
+          resultFingerprint: fingerprint(result),
+          result,
+          usage: null,
+        },
+      };
+      fs.writeFileSync(file, JSON.stringify(stored));
+      resetAnalyzeRunStorage();
+
+      await expect(readAnalyzeRun(repoPath, { runId }))
+        .rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
+    },
+  );
+
+  it('does not classify a fully checkpointed initial execution as ambiguous', async () => {
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'checkpointed-initial-admission',
+      candidateAnalysisId: 'checkpointed-initial-analysis',
+      startedAt: '2026-07-19T01:36:55.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'checkpointed-initial',
+      completedBaselineId: null,
+    });
+    await certifySuccessfulExecution(
+      repoPath,
+      'checkpointed-initial-admission',
+      '2026-07-19T01:36:56.000Z',
+    );
+
+    await expect(readAnalyzeRun(repoPath, { runId: 'checkpointed-initial-admission' }))
+      .resolves.toMatchObject({
+        state: 'running',
+        counts: { pending: 0, succeeded: 1 },
+        executionAttempt: {
+          initialAdmission: { admission: 'executing', evidence: 'explicit' },
+        },
+        resume: { available: false, reason: 'run-not-resumable' },
+      });
   });
 
   it('atomically activates the exact latest blocked partition without touching completed truth', async () => {
@@ -1296,7 +1579,7 @@ describe('analyze run journal', () => {
       { workId: 'analyze:v1:pending', inputFingerprint: `sha256:${'a'.repeat(64)}` },
       { workId: 'analyze:v1:reused', inputFingerprint: `sha256:${'b'.repeat(64)}` },
     ];
-    await dispatchAnalyzeRun(repoPath, {
+    await sealAnalyzeRunPlan(repoPath, {
       kind: 'seal-plan',
       execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'activate-partial-run',
@@ -1325,6 +1608,11 @@ describe('analyze run journal', () => {
         usage: null,
       },
     });
+    stored.executionAttempt.initialAdmission = {
+      admission: 'executing',
+      admittedAt: '2026-07-19T01:38:01.500Z',
+      evidence: 'explicit',
+    };
     stored.revision = 4;
     stored.updatedAt = '2026-07-19T01:38:03.000Z';
     stored.status = {
@@ -1373,7 +1661,7 @@ describe('analyze run journal', () => {
     }));
 
     expect(activated.view).toMatchObject({
-      schemaVersion: 7,
+      schemaVersion: 8,
       revision: 5,
       state: 'running',
       updatedAt: '2026-07-19T01:38:04.000Z',
@@ -1434,13 +1722,19 @@ describe('analyze run journal', () => {
       completedBaselineId: null,
     });
     const work = [{ workId: 'analyze:v1:stale', inputFingerprint: `sha256:${'d'.repeat(64)}` }];
-    await dispatchAnalyzeRun(repoPath, {
+    const activation = await sealAnalyzeRunPlan(repoPath, {
       kind: 'seal-plan',
       execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'stale-activation-run',
       sealedAt: '2026-07-19T01:39:01.000Z',
       work,
     });
+    await admitInitialExecutionForTest(
+      activation,
+      'stale-activation-run',
+      work,
+      '2026-07-19T01:39:01.500Z',
+    );
     await dispatchAnalyzeRun(repoPath, {
       kind: 'block',
       runId: 'stale-activation-run',
@@ -1467,7 +1761,7 @@ describe('analyze run journal', () => {
         resolvedModel: 'claude-opus-4-8',
       },
       observed: {
-        runRevision: 2,
+        runRevision: 3,
         attemptSequence: 1,
         latestAttemptSequence: 1,
         completedBaselineFingerprint: null,
@@ -1487,7 +1781,7 @@ describe('analyze run journal', () => {
     await expect(activateAnalyzeRunResume(repoPath, certification))
       .rejects.toBeInstanceOf(AnalyzeRunLatestAttemptConflictError);
     await expect(readAnalyzeRun(repoPath, { runId: 'stale-activation-run' }))
-      .resolves.toMatchObject({ state: 'blocked', revision: 2 });
+      .resolves.toMatchObject({ state: 'blocked', revision: 3 });
   });
 
   it.each([[1, 2], [2, 2], [3, 3]] as const)(
@@ -1515,12 +1809,6 @@ describe('analyze run journal', () => {
         sealedAt: '2026-07-19T01:39:11.000Z',
         work,
       });
-      await dispatchAnalyzeRun(repoPath, {
-        kind: 'block',
-        runId,
-        blockedAt: '2026-07-19T01:39:12.000Z',
-        resetHint: 'later',
-      });
       const file = path.join(
         repoPath,
         '.truecourse',
@@ -1530,6 +1818,14 @@ describe('analyze run journal', () => {
       );
       const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
       stored.schemaVersion = schemaVersion;
+      stored.revision = observedRevision;
+      stored.updatedAt = '2026-07-19T01:39:12.000Z';
+      stored.status = {
+        state: 'blocked',
+        reason: 'provider-session-limit',
+        resetHint: 'later',
+        blockedAt: '2026-07-19T01:39:12.000Z',
+      };
       delete stored.executionAttempt;
       if (schemaVersion === 1) delete stored.finalizationIntent;
       fs.writeFileSync(file, JSON.stringify(stored));
@@ -1564,7 +1860,7 @@ describe('analyze run journal', () => {
       }))).rejects.toBeInstanceOf(InvalidAnalyzeRunTransitionError);
       expect(fs.readFileSync(file)).toEqual(before);
       await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: 8,
         revision: observedRevision,
         state: 'blocked',
       });
@@ -1633,7 +1929,7 @@ describe('analyze run journal', () => {
 
     await expect(readAnalyzeRun(repoPath, { runId: `reserved-${admission}` }))
       .resolves.toMatchObject({
-        schemaVersion: 7,
+        schemaVersion: 8,
         revision,
         state: 'running',
         executionAttempt: {
@@ -1677,6 +1973,7 @@ describe('analyze run journal', () => {
       'unreachable-attempt.json',
     );
     const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    stored.schemaVersion = 7;
     stored.executionAttempt = {
       number: 2,
       activatedAt: '2026-07-19T01:37:02.000Z',
@@ -1933,7 +2230,7 @@ describe('analyze run journal', () => {
       commitHash: 'fedcba',
       completedBaselineId: 'completed-analysis-2',
     });
-    await dispatchAnalyzeRun(repoPath, {
+    const activation = await sealAnalyzeRunPlan(repoPath, {
       kind: 'seal-plan',
       execution: { provider: 'claude-code', requestedModel: 'opus[1m]' },
       runId: 'blocked-run',
@@ -1942,6 +2239,12 @@ describe('analyze run journal', () => {
         { workId: 'analyze:v1:service', inputFingerprint: `sha256:${'c'.repeat(64)}` },
       ],
     });
+    await admitInitialExecutionForTest(
+      activation,
+      'blocked-run',
+      [{ workId: 'analyze:v1:service', inputFingerprint: `sha256:${'c'.repeat(64)}` }],
+      '2026-07-19T02:00:01.500Z',
+    );
 
     const blocked = await dispatchAnalyzeRun(repoPath, {
       kind: 'block',
@@ -1951,7 +2254,7 @@ describe('analyze run journal', () => {
     });
 
     expect(blocked).toMatchObject({
-      revision: 2,
+      revision: 3,
       state: 'blocked',
       updatedAt: '2026-07-19T02:00:02.000Z',
       plan: 'sealed',
@@ -2043,10 +2346,12 @@ describe('analyze run journal', () => {
     const legacy = JSON.parse(fs.readFileSync(file, 'utf8')) as {
       schemaVersion: number;
       status: Record<string, unknown>;
+      executionAttempt?: unknown;
       finalizationIntent?: unknown;
     };
     legacy.schemaVersion = 1;
     delete legacy.status.finalizingAt;
+    delete legacy.executionAttempt;
     delete legacy.finalizationIntent;
     fs.writeFileSync(file, JSON.stringify(legacy));
     resetAnalyzeRunStorage();
@@ -2123,15 +2428,30 @@ describe('analyze run journal', () => {
       work: [{ workId: 'analyze:v1:reserved', inputFingerprint: `sha256:${'a'.repeat(64)}` }],
     });
     const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
-    const sealed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
-    const plan = sealed.plan as { state: string; sealedAt: string; work: Array<Record<string, unknown>> };
+    const sealed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+    const plan = sealed.plan as {
+      state: string;
+      sealedAt: string;
+      work: Array<Record<string, unknown>>;
+    };
     const finalizingAt = '2026-07-19T02:50:02.000Z';
     const finalizing = {
       ...sealed,
       revision: 3,
       updatedAt: finalizingAt,
       status: { state: 'finalizing', finalizingAt },
-      plan: { ...plan, work: plan.work.map((item) => ({ ...item, state: 'succeeded-uncheckpointed' })) },
+      executionAttempt: {
+        ...sealed.executionAttempt,
+        initialAdmission: {
+          admission: 'executing',
+          admittedAt: '2026-07-19T02:50:01.500Z',
+          evidence: 'explicit',
+        },
+      },
+      plan: {
+        ...plan,
+        work: plan.work.map((item) => ({ ...item, state: 'succeeded-uncheckpointed' })),
+      },
     };
     fs.writeFileSync(file, JSON.stringify(finalizing));
     resetAnalyzeRunStorage();
@@ -2482,7 +2802,7 @@ describe('analyze run journal', () => {
 
     await expect(dispatchAnalyzeRun(repoPath, command)).resolves.toEqual(begun);
     expect(JSON.parse(fs.readFileSync(latestAttemptPath, 'utf8'))).toEqual({
-      schemaVersion: 7,
+      schemaVersion: 8,
       runId: command.runId,
     });
   });
@@ -2508,7 +2828,7 @@ describe('analyze run journal', () => {
     })).rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
     expect(fs.existsSync(path.join(runsPath, 'must-not-mask-third-run.json'))).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(runsPath, 'LATEST_ATTEMPT.json'), 'utf8'))).toEqual({
-      schemaVersion: 7,
+      schemaVersion: 8,
       runId: 'missing-second-run',
     });
   });
@@ -2574,7 +2894,7 @@ describe('analyze run journal', () => {
       'runs',
       'LATEST_ATTEMPT.json',
     ), 'utf8'))).toEqual({
-      schemaVersion: 7,
+      schemaVersion: 8,
       runId: second.runId,
     });
 
