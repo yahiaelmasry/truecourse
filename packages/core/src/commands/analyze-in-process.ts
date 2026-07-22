@@ -13,7 +13,15 @@ import type { RegistryEntry } from '../config/registry.js';
 import type { LLMProvider } from '../services/llm/provider.js';
 import type { LlmTransport } from '@truecourse/shared/llm';
 import type { StepTracker } from '../progress.js';
-import { analyzeCoreAndFinalize, type AnalyzeCoreResult, type LlmEstimate } from './analyze-core.js';
+import {
+  analyzeCoreAndFinalize,
+  type AnalyzeCoreResult,
+  type LlmEstimate,
+} from './analyze-core.js';
+import {
+  createAnalyzeCoreRearmAuthorization,
+  type AnalyzeCoreRearmAuthorization,
+} from '../lib/analyze-core-rearm-authorization.js';
 import {
   buildFullAnalysisFinalizationPlan,
   persistFullAnalysis,
@@ -46,8 +54,14 @@ import {
   readAnalyzeRunStatus,
   type AnalyzeRunStatus,
 } from './analyze-run-status.js';
+import type { AnalyzeRunAmbiguousRearmConsent } from '../lib/analyze-run-ambiguous-rearm.js';
 
 export type { LlmEstimate };
+export type {
+  AnalyzeRunAmbiguousRearmConsent,
+  AnalyzeRunAmbiguousRearmEvidence,
+  AnalyzeRunAmbiguousRearmOffer,
+} from '../lib/analyze-run-ambiguous-rearm.js';
 
 export type LatestAttemptExpectation =
   | Readonly<{ kind: 'none-incomplete' }>
@@ -193,10 +207,15 @@ export interface AnalyzeInProcessOptions {
 
 export interface ResumeAnalyzeInProcessOptions extends Pick<
   AnalyzeInProcessOptions,
-  'tracker' | 'onProgress' | 'provider' | 'transport' | 'signal'
+  'codeDir' | 'tracker' | 'onProgress' | 'provider' | 'transport' | 'signal'
 > {
   /** Exact durable attempted run selected by the user. */
   runId: string;
+}
+
+export interface RearmAnalyzeInProcessOptions extends ResumeAnalyzeInProcessOptions {
+  /** Exact bounded repeat-call consent; omit only to recover already-durable consent. */
+  consent?: AnalyzeRunAmbiguousRearmConsent | undefined;
 }
 
 export type AnalysisResumeUnavailableReason =
@@ -212,6 +231,18 @@ export class AnalysisResumeUnavailableError extends Error {
   ) {
     super(`Analyze Resume is unavailable: ${reason}`, options);
     this.name = 'AnalysisResumeUnavailableError';
+  }
+}
+
+export type AnalysisRearmUnavailableReason = AnalysisResumeUnavailableReason;
+
+export class AnalysisRearmUnavailableError extends Error {
+  constructor(
+    readonly reason: AnalysisRearmUnavailableReason,
+    options?: ErrorOptions,
+  ) {
+    super(`Analyze Rearm is unavailable: ${reason}`, options);
+    this.name = 'AnalysisRearmUnavailableError';
   }
 }
 
@@ -310,20 +341,51 @@ export async function resumeAnalyzeInProcess(
   project: RegistryEntry,
   options: ResumeAnalyzeInProcessOptions,
 ): Promise<AnalyzeInProcessResult> {
-  const { runId, tracker, onProgress, provider, transport, signal } = options;
+  return recoverAnalyzeInProcess(project, options, {
+    kind: 'resume',
+    runId: options.runId,
+  }, 'resume');
+}
+
+/** Rearm one explicitly selected ambiguous full-analysis attempt. */
+export async function rearmAnalyzeInProcess(
+  project: RegistryEntry,
+  options: RearmAnalyzeInProcessOptions,
+): Promise<AnalyzeInProcessResult> {
+  return recoverAnalyzeInProcess(project, options, {
+    kind: 'rearm',
+    authorization: createAnalyzeCoreRearmAuthorization({
+      runId: options.runId,
+      consent: options.consent,
+    }),
+  }, 'rearm');
+}
+
+type AnalyzeRecoverySelection =
+  | Readonly<{ kind: 'resume'; runId: string }>
+  | Readonly<{ kind: 'rearm'; authorization: AnalyzeCoreRearmAuthorization }>;
+
+async function recoverAnalyzeInProcess(
+  project: RegistryEntry,
+  options: ResumeAnalyzeInProcessOptions,
+  selection: AnalyzeRecoverySelection,
+  recoveryKind: 'resume' | 'rearm',
+): Promise<AnalyzeInProcessResult> {
+  const { runId, codeDir, tracker, onProgress, provider, transport, signal } = options;
   const startedAt = Date.now();
   try {
     return await analyzeCoreAndFinalize(
       project,
       {
         skipStash: true,
+        codeDir,
         tracker,
         onProgress,
         provider,
         transport,
         signal,
         mode: 'full',
-        resumeFullRunId: runId,
+        resumeFullRunId: selection.kind === 'resume' ? selection.runId : undefined,
         enableLlmRulesOverride: true,
       },
       async (computed) => {
@@ -334,11 +396,17 @@ export async function resumeAnalyzeInProcess(
         return finalized;
       },
       () => recoverPreparedAnalyzeRun(project, runId, startedAt),
+      selection.kind === 'rearm' ? selection.authorization : undefined,
     );
   } catch (error) {
     if (isLlmSessionLimitError(error)) throw new AnalysisSessionLimitError(error);
+    if (recoveryKind === 'rearm' && error instanceof AnalysisResumeUnavailableError) {
+      throw new AnalysisRearmUnavailableError(error.reason, { cause: error });
+    }
     if (error instanceof CertifiedViolationResumeUnavailableError) {
-      throw new AnalysisResumeUnavailableError(error.reason, { cause: error });
+      throw recoveryKind === 'rearm'
+        ? new AnalysisRearmUnavailableError(error.reason, { cause: error })
+        : new AnalysisResumeUnavailableError(error.reason, { cause: error });
     }
     throw error;
   }

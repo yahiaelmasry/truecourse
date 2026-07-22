@@ -36,6 +36,11 @@ import {
   type AnalyzeRunSource,
 } from '../lib/analyze-run-journal.js';
 import { readAnalyzeRunResumeCandidate } from '../lib/analyze-run-resume-candidate.js';
+import {
+  claimAnalyzeCoreRearmAuthorization,
+  type AnalyzeCoreRearmAuthorization,
+  type AnalyzeCoreRearmSelection,
+} from '../lib/analyze-core-rearm-authorization.js';
 import { CertifiedViolationResumeUnavailableError } from '../services/llm/certified-violation-phase.js';
 import type { Graph, LatestSnapshot, UsageRecord, ViolationRecord } from '../types/snapshot.js';
 import type { StepTracker } from '../progress.js';
@@ -174,10 +179,17 @@ export interface AnalyzeCoreResult {
   analysisResult: AnalysisResult;
 }
 
+function rejectDirectRearmOption(options: AnalyzeCoreOptions): void {
+  if ('rearmFullRun' in options) {
+    throw new Error('Ambiguous rearm requires rearmAnalyzeInProcess atomic finalization');
+  }
+}
+
 export async function analyzeCore(
   project: RegistryEntry,
   options: AnalyzeCoreOptions,
 ): Promise<AnalyzeCoreResult> {
+  rejectDirectRearmOption(options);
   return analyzeCoreAndFinalize(project, options, async (core) => core);
 }
 
@@ -195,11 +207,14 @@ export async function analyzeCoreAndFinalize<T>(
     | Readonly<{ handled: true; result: T }>
     | Readonly<{ handled: false }>
   >,
+  rearmAuthorization?: AnalyzeCoreRearmAuthorization,
 ): Promise<T> {
+  rejectDirectRearmOption(options);
   return withAnalyzeLifecycleLock(project.path, async () => {
+    const rearmSelection = claimAnalyzeCoreRearmAuthorization(rearmAuthorization);
     const early = await beforeCompute?.();
     if (early?.handled) return early.result;
-    const core = await computeAnalyzeCore(project, options);
+    const core = await computeAnalyzeCore(project, options, rearmSelection);
     return finalize(core);
   });
 }
@@ -207,6 +222,7 @@ export async function analyzeCoreAndFinalize<T>(
 async function computeAnalyzeCore(
   project: RegistryEntry,
   options: AnalyzeCoreOptions,
+  rearmSelection: Readonly<AnalyzeCoreRearmSelection> | null = null,
 ): Promise<AnalyzeCoreResult> {
   // Code lives at `codeDir` (the repo, or a clone in EE); storage keys off
   // `project.path` (a path in OSS, an opaque identity in EE).
@@ -214,23 +230,27 @@ async function computeAnalyzeCore(
 
   const { mode, signal } = options;
   const isDiff = mode === 'diff';
-  if (options.resumeFullRunId && (isDiff || options.journalFullRun)) {
-    throw new Error('Certified Resume is available only for one existing full analyze run');
+  if (options.resumeFullRunId && rearmSelection) {
+    throw new Error('Analyze cannot resume and rearm one certified LLM run together');
   }
-  const resumeCandidate = options.resumeFullRunId
-    ? await readAnalyzeRunResumeCandidate(project.path, options.resumeFullRunId)
+  const recoveryRunId = options.resumeFullRunId ?? rearmSelection?.runId;
+  if (recoveryRunId && (isDiff || options.journalFullRun)) {
+    throw new Error('Certified recovery is available only for one existing full analyze run');
+  }
+  const recoveryCandidate = recoveryRunId
+    ? await readAnalyzeRunResumeCandidate(project.path, recoveryRunId)
     : null;
-  if (options.resumeFullRunId && !resumeCandidate) {
+  if (recoveryRunId && !recoveryCandidate) {
     throw new CertifiedViolationResumeUnavailableError('run-not-found');
   }
-  const resumeExecution = resumeCandidate && resumeCandidate.plan !== 'unsealed'
-    ? resumeCandidate.plan.execution
+  const resumeExecution = recoveryCandidate && recoveryCandidate.plan !== 'unsealed'
+    ? recoveryCandidate.plan.execution
     : null;
-  if (resumeCandidate && !resumeExecution) {
+  if (recoveryCandidate && !resumeExecution) {
     throw new CertifiedViolationResumeUnavailableError('checkpoint-execution-changed');
   }
   const skipGit = !isDiff && !!options.skipGit;
-  if (resumeCandidate && (!options.skipStash || skipGit)) {
+  if (recoveryCandidate && (!options.skipStash || skipGit)) {
     throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
   }
   const projectConfig = await readProjectConfig(project.path);
@@ -257,7 +277,7 @@ async function computeAnalyzeCore(
         commitHash = null;
       }
     }
-  } else if (resumeCandidate && !skipGit) {
+  } else if (recoveryCandidate && !skipGit) {
     const git = await getGit(codeDir);
     branch = (await git.branch()).current || null;
     commitHash = (await git.revparse(['HEAD'])).trim();
@@ -267,7 +287,7 @@ async function computeAnalyzeCore(
     if (commitHash === null) commitHash = (await git.revparse(['HEAD'])).trim();
   }
 
-  if (resumeCandidate && options.skipStash && !skipGit) {
+  if (recoveryCandidate && options.skipStash && !skipGit) {
     const git = await getGit(codeDir);
     const status = await git.status();
     const hasUserChanges = status.files.some(({ path: changedPath }) =>
@@ -277,8 +297,8 @@ async function computeAnalyzeCore(
     }
   }
 
-  const analysisId = resumeCandidate?.candidateAnalysisId ?? randomUUID();
-  const now = resumeCandidate?.startedAt ?? new Date().toISOString();
+  const analysisId = recoveryCandidate?.candidateAnalysisId ?? randomUUID();
+  const now = recoveryCandidate?.startedAt ?? new Date().toISOString();
   const start = Date.now();
 
   const effectiveCategories = options.enabledCategoriesOverride?.length
@@ -322,7 +342,7 @@ async function computeAnalyzeCore(
       log.warn(
         `[Analyzer] Failed to stash changes, analyzing current state: ${error instanceof Error ? error.message : String(error)}`,
       );
-      if (resumeCandidate) {
+      if (recoveryCandidate) {
         throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
       }
     }
@@ -482,27 +502,45 @@ async function computeAnalyzeCore(
             completedBaselineId: latestBaseline?.analysis.id ?? null,
           }
         : undefined,
-      certifiedLlmResume: resumeCandidate
+      certifiedLlmResume: recoveryCandidate && options.resumeFullRunId
         ? {
             run: {
               repositoryKey: project.path,
               repositoryRoot: codeDir,
-              runId: resumeCandidate.runId,
-              candidateAnalysisId: resumeCandidate.candidateAnalysisId,
-              startedAt: resumeCandidate.startedAt,
-              source: resumeCandidate.source,
+              runId: recoveryCandidate.runId,
+              candidateAnalysisId: recoveryCandidate.candidateAnalysisId,
+              startedAt: recoveryCandidate.startedAt,
+              source: recoveryCandidate.source,
               branch,
               commitHash,
               completedBaselineId: latestBaseline?.analysis.id ?? null,
             },
             activatedAt: timestampAtOrAfter(
-              resumeCandidate.blocked?.blockedAt
-                ?? resumeCandidate.executionAttempt.activatedAt,
+              recoveryCandidate.blocked?.blockedAt
+                ?? recoveryCandidate.executionAttempt.activatedAt,
             ),
             admittedAt: timestampAtOrAfter(
-              resumeCandidate.blocked?.blockedAt
-                ?? resumeCandidate.executionAttempt.activatedAt,
+              recoveryCandidate.blocked?.blockedAt
+                ?? recoveryCandidate.executionAttempt.activatedAt,
             ),
+          }
+        : undefined,
+      certifiedLlmRearm: recoveryCandidate && rearmSelection
+        ? {
+            run: {
+              repositoryKey: project.path,
+              repositoryRoot: codeDir,
+              runId: recoveryCandidate.runId,
+              candidateAnalysisId: recoveryCandidate.candidateAnalysisId,
+              startedAt: recoveryCandidate.startedAt,
+              source: recoveryCandidate.source,
+              branch,
+              commitHash,
+              completedBaselineId: latestBaseline?.analysis.id ?? null,
+            },
+            consent: rearmSelection.consent,
+            activatedAt: timestampAtOrAfter(recoveryCandidate.updatedAt),
+            admittedAt: timestampAtOrAfter(recoveryCandidate.updatedAt),
           }
         : undefined,
       onLlmEstimate: options.onLlmEstimate

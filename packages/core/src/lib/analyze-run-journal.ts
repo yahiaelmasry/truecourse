@@ -768,6 +768,7 @@ installAnalyzeRunResumeCandidateReader(async (repoKey, runId) => {
     attemptSequence: current.attemptSequence,
     latestAttemptSequence: latest?.attemptSequence ?? 0,
     revision: current.revision,
+    updatedAt: current.updatedAt,
     runId: current.runId,
     candidateAnalysisId: current.candidateAnalysisId,
     state: current.status.state,

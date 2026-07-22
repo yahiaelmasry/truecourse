@@ -5,13 +5,21 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ARCHITECTURE_LLM_RULES } from '../../packages/analyzer/src/index.js';
-import { analyzeCore } from '../../packages/core/src/commands/analyze-core.js';
+import {
+  analyzeCore,
+  analyzeCoreAndFinalize,
+  type AnalyzeCoreOptions,
+} from '../../packages/core/src/commands/analyze-core.js';
 import {
   AnalysisStartBlockedError,
+  AnalysisRearmUnavailableError,
   AnalysisResumeUnavailableError,
   analyzeInProcess,
+  rearmAnalyzeInProcess,
   resumeAnalyzeInProcess,
+  type AnalyzeRunAmbiguousRearmConsent,
 } from '../../packages/core/src/commands/analyze-in-process.js';
+import type { AnalyzeRunAmbiguousRearmOffer } from '../../packages/core/src/commands/analyze-run-status.js';
 import {
   registerProject,
   resetRegistryStore,
@@ -296,6 +304,66 @@ describe('certified full analyze production path', () => {
     if (originalHome === undefined) delete process.env.TRUECOURSE_HOME;
     else process.env.TRUECOURSE_HOME = originalHome;
   });
+
+  async function createAmbiguousArchitectureAttempt(
+    selectedProject = project,
+    codeDir?: string,
+  ) {
+    const location = codeDir === undefined ? {} : { codeDir };
+    const baseline = await analyzeInProcess(selectedProject, {
+      ...location,
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+    await expect(analyzeInProcess(selectedProject, {
+      ...location,
+      source: 'cli',
+      provider: new PartiallyLimitedDirectClaudeProvider(),
+      enabledCategoriesOverride: ['architecture'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const repositoryKey = selectedProject.path;
+    const blocked = await readAnalyzeRun(repositoryKey, 'latest-attempt');
+    if (blocked === null) throw new Error('expected blocked attempted run');
+    const runPath = path.join(
+      repositoryKey,
+      '.truecourse',
+      'analyses',
+      'runs',
+      `${blocked.runId}.json`,
+    );
+    const stored = JSON.parse(fs.readFileSync(runPath, 'utf8'));
+    const checkpointedAt = stored.plan.work
+      .filter((item: Record<string, unknown>) => item.state === 'succeeded-checkpointed')
+      .map((item: Record<string, any>) => item.checkpoint.checkpointedAt)
+      .sort()
+      .at(-1);
+    stored.revision -= 1;
+    stored.updatedAt = checkpointedAt;
+    stored.status = { state: 'running' };
+    fs.writeFileSync(runPath, `${JSON.stringify(stored, null, 2)}\n`);
+    resetAnalyzeRunStorage();
+    const attempt = await readAnalyzeRun(repositoryKey, 'latest-attempt');
+    if (attempt?.rearm === null || attempt?.rearm === undefined) {
+      throw new Error('expected exact ambiguous rearm offer');
+    }
+    await expect(readLatest(repositoryKey)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId, status: 'completed' },
+    });
+    return { baseline, attempt, offer: attempt.rearm };
+  }
+
+  function exactAmbiguousConsent(
+    offer: AnalyzeRunAmbiguousRearmOffer,
+  ): AnalyzeRunAmbiguousRearmConsent {
+    return {
+      evidence: offer.evidence,
+      acceptedRisk: 'repeat-up-to-pending-provider-calls' as const,
+      acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls,
+    };
+  }
 
   it('completes a direct-CLI architecture-only attempt after promoting its completed analysis', async () => {
     const result = await analyzeInProcess(project, {
@@ -765,6 +833,177 @@ describe('certified full analyze production path', () => {
         expect.objectContaining({ totalTokens: 120 }),
         expect.objectContaining({ totalTokens: 120 }),
       ],
+    });
+  }, 30_000);
+
+  it('rearms exact ambiguous production work and atomically promotes the candidate', async () => {
+    const { baseline, attempt, offer } = await createAmbiguousArchitectureAttempt();
+    const provider = new ResumingDirectClaudeProvider();
+
+    const rearmed = await rearmAnalyzeInProcess(project, {
+      runId: attempt.runId,
+      consent: exactAmbiguousConsent(offer),
+      provider,
+    });
+
+    expect(rearmed.analysisId).toBe(attempt.candidateAnalysisId);
+    expect(rearmed.analysisId).not.toBe(baseline.analysisId);
+    expect(provider.stages).toEqual(['analyze.module']);
+    expect(provider.modelOverrides).toEqual(['claude-sonnet-4-5-20250929']);
+    await expect(readAnalyzeRun(workDir, { runId: attempt.runId })).resolves.toMatchObject({
+      state: 'completed',
+      executionAttempt: {
+        number: 2,
+        resume: { activation: 'ambiguous-rearm', admission: 'executing' },
+      },
+      counts: { total: 2, succeeded: 2, pending: 0 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: rearmed.analysisId, status: 'completed' },
+    });
+  }, 30_000);
+
+  it('rejects broader ambiguous consent before provider work or completed-baseline mutation', async () => {
+    const { baseline, attempt, offer } = await createAmbiguousArchitectureAttempt();
+    const provider = new NeverCallDirectClaudeProvider();
+
+    const failure = await rearmAnalyzeInProcess(project, {
+      runId: attempt.runId,
+      consent: {
+        ...exactAmbiguousConsent(offer),
+        acceptedMaxRepeatProviderCalls: offer.maxRepeatProviderCalls + 1,
+      },
+      provider,
+    }).then(() => null, (error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AnalysisRearmUnavailableError);
+    expect(failure).toMatchObject({ reason: 'ambiguous-rearm-risk-not-accepted' });
+    expect(failure instanceof Error ? failure.message : '').toMatch(/Analyze Rearm is unavailable/);
+    expect(provider.calls).toBe(0);
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId, status: 'completed' },
+    });
+    await expect(readAnalyzeRun(workDir, { runId: attempt.runId })).resolves.toMatchObject({
+      revision: attempt.revision,
+      state: 'running',
+      counts: { succeeded: 1, pending: 1 },
+    });
+  }, 30_000);
+
+  it('rejects direct compute-only rearm before activation or provider work', async () => {
+    const { baseline, attempt, offer } = await createAmbiguousArchitectureAttempt();
+    const provider = new NeverCallDirectClaudeProvider();
+    const unsafeOptions: AnalyzeCoreOptions & {
+      rearmFullRun: {
+        runId: string;
+        consent: AnalyzeRunAmbiguousRearmConsent;
+      };
+    } = {
+      mode: 'full',
+      rearmFullRun: {
+        runId: attempt.runId,
+        consent: exactAmbiguousConsent(offer),
+      },
+      provider,
+      skipStash: true,
+      enableLlmRulesOverride: true,
+    };
+
+    await expect(analyzeCore(project, unsafeOptions))
+      .rejects.toThrow(/requires rearmAnalyzeInProcess atomic finalization/);
+
+    await expect(analyzeCoreAndFinalize(
+      project,
+      unsafeOptions,
+      async (computed) => computed,
+    )).rejects.toThrow(/requires rearmAnalyzeInProcess atomic finalization/);
+
+    await expect(analyzeCoreAndFinalize(
+      project,
+      {
+        mode: 'full',
+        provider,
+        skipStash: true,
+        enableLlmRulesOverride: true,
+      },
+      async (computed) => computed,
+      undefined,
+      {} as never,
+    )).rejects.toThrow(/rearm is not authorized for atomic finalization/);
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: attempt.runId })).resolves.toMatchObject({
+      revision: attempt.revision,
+      state: 'running',
+      executionAttempt: { number: 1 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId, status: 'completed' },
+    });
+  }, 30_000);
+
+  it('reads hosted rearm code from codeDir while locking and storing by project path', async () => {
+    const keyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tc-hosted-rearm-key-'));
+    const hostedProject = await registerProject(keyDir, 'hosted-rearm');
+    await writeProjectConfig(keyDir, { enabledCategories: ['architecture'] });
+    try {
+      const { attempt, offer } = await createAmbiguousArchitectureAttempt(hostedProject, workDir);
+      const provider = new ResumingDirectClaudeProvider();
+
+      const rearmed = await rearmAnalyzeInProcess(hostedProject, {
+        runId: attempt.runId,
+        consent: exactAmbiguousConsent(offer),
+        codeDir: workDir,
+        provider,
+      });
+
+      expect(provider.stages).toEqual(['analyze.module']);
+      await expect(readAnalyzeRun(keyDir, { runId: attempt.runId })).resolves.toMatchObject({
+        state: 'completed',
+        counts: { succeeded: 2, pending: 0 },
+      });
+      await expect(readLatest(keyDir)).resolves.toMatchObject({
+        analysis: { id: rearmed.analysisId, status: 'completed' },
+      });
+      await expect(readLatest(workDir)).resolves.toBeNull();
+    } finally {
+      await unregisterProject(hostedProject.slug);
+      fs.rmSync(keyDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('finalizes fully checkpointed ambiguous recovery without consent or another provider call', async () => {
+    const { baseline, attempt, offer } = await createAmbiguousArchitectureAttempt();
+    await expect(rearmAnalyzeInProcess(project, {
+      runId: attempt.runId,
+      consent: exactAmbiguousConsent(offer),
+      provider: new CleanupFailingResumingProvider(),
+    })).rejects.toThrow('injected provider cleanup failure');
+    await expect(readAnalyzeRun(workDir, { runId: attempt.runId })).resolves.toMatchObject({
+      state: 'running',
+      executionAttempt: {
+        resume: { activation: 'ambiguous-rearm', admission: 'executing' },
+      },
+      counts: { succeeded: 2, pending: 0 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: baseline.analysisId },
+    });
+    resetAnalyzeRunStorage();
+    const provider = new NeverCallDirectClaudeProvider();
+
+    const recovered = await rearmAnalyzeInProcess(project, {
+      runId: attempt.runId,
+      provider,
+    });
+
+    expect(provider.calls).toBe(0);
+    await expect(readAnalyzeRun(workDir, { runId: attempt.runId })).resolves.toMatchObject({
+      state: 'completed',
+      counts: { succeeded: 2, pending: 0 },
+    });
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: recovered.analysisId, status: 'completed' },
     });
   }, 30_000);
 

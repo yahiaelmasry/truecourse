@@ -120,7 +120,15 @@ journaled architecture runs therefore preserve paid successes. The
 production `resumeAnalyzeInProcess` command can reconstruct one explicitly
 selected blocked run, atomically revalidate it, replay its checkpoints, execute
 only pending work, and promote the candidate after complete finalization. The
-read-only `truecourse analyze status` command shows the latest attempted run,
+separate production `rearmAnalyzeInProcess` command applies the same
+repository-lifecycle lock and atomic finalization to an execution-ambiguous
+attempt. Fresh rearm requires the exact durable evidence and accepted maximum
+repeat-call count; already-activated or fully checkpointed response-loss
+recovery does not ask for consent again. An activated recovery executes only
+its pending work; a fully checkpointed recovery makes no provider call. CLI
+and dashboard adapters will expose that bounded consent in separate
+contributions.
+The read-only `truecourse analyze status` command shows the latest attempted run,
 durable progress, and advisory provider reset hint separately from the active
 completed analysis. A complete timezone-qualified Claude reset hint is also
 shown as a verified UTC reset time when it can be derived unambiguously from

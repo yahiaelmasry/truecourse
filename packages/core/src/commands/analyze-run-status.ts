@@ -5,6 +5,10 @@ export type {
   AnalyzeRunResumeAvailability,
   AnalyzeRunResumeUnavailableReason,
 } from '../lib/analyze-run-journal.js';
+export type {
+  AnalyzeRunAmbiguousRearmEvidence,
+  AnalyzeRunAmbiguousRearmOffer,
+} from '../lib/analyze-run-ambiguous-rearm.js';
 
 export interface ActiveCompletedAnalysisStatus {
   analysisId: string;

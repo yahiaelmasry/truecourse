@@ -29,6 +29,7 @@ export interface AnalyzeRunResumeCandidate {
   readonly attemptSequence: number;
   readonly latestAttemptSequence: number;
   readonly revision: number;
+  readonly updatedAt: string;
   readonly runId: string;
   readonly candidateAnalysisId: string;
   readonly state: 'running' | 'blocked' | 'failed' | 'finalizing' | 'completed';

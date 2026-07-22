@@ -34,12 +34,14 @@ import type { ResolvedViolationRef, UsageRecord, ViolationRecord } from '../type
 import { isLlmSessionLimitError } from '@truecourse/shared/llm';
 import {
   executeCertifiedViolationPhase,
+  rearmCertifiedViolationPhase,
   resumeCertifiedViolationPhase,
   type CertifiedViolationPhaseResult,
   type CertifiedViolationPhaseRun,
   type CertifiedViolationResumePhaseResult,
   CertifiedViolationResumeUnavailableError,
 } from './llm/certified-violation-phase.js';
+import type { AnalyzeRunAmbiguousRearmConsent } from '../lib/analyze-run-ambiguous-rearm.js';
 import type { AnalyzeLlmExecutionAdapter } from './llm/certified-analyze-llm-run.js';
 import { dispatchAnalyzeRun, readAnalyzeRun } from '../lib/analyze-run-journal.js';
 import {
@@ -217,6 +219,13 @@ export interface ViolationPipelineInput {
     activatedAt: string;
     admittedAt: string;
   };
+  /** Exact ambiguous attempted run, chronology, and bounded repeat-call consent. */
+  certifiedLlmRearm?: {
+    run: CertifiedViolationPhaseRun;
+    consent: AnalyzeRunAmbiguousRearmConsent | undefined;
+    activatedAt: string;
+    admittedAt: string;
+  };
 }
 
 export interface ViolationPipelineResult {
@@ -232,7 +241,7 @@ export interface ViolationPipelineResult {
   resolvedRefs: ResolvedViolationRef[];
   /** Present only when every provider call belonged to one certified durable plan. */
   certifiedLlmExecution?: Pick<CertifiedViolationPhaseResult, 'runId' | 'completion'> & {
-    /** Present only for Resume, where durable checkpoints are the accounting authority. */
+    /** Present only for Resume/rearm, where durable checkpoints are the accounting authority. */
     usage?: readonly UsageRecord[];
   };
 }
@@ -410,8 +419,12 @@ export async function runViolationPipeline(
 async function runViolationPipelineInternal(
   input: ViolationPipelineInput,
 ): Promise<ViolationPipelineResult> {
-  if (input.certifiedLlmRun && input.certifiedLlmResume) {
-    throw new Error('Analyze cannot start and resume a certified LLM run together');
+  if (input.certifiedLlmResume && input.certifiedLlmRearm) {
+    throw new Error('Analyze cannot resume and rearm a certified LLM run together');
+  }
+  const certifiedRecovery = input.certifiedLlmResume ?? input.certifiedLlmRearm;
+  if (input.certifiedLlmRun && certifiedRecovery) {
+    throw new Error('Analyze cannot start and recover a certified LLM run together');
   }
   // Ensure tree-sitter WASM parsers are loaded before any parseFile/checkCodeRules
   // call below. Idempotent — returns the cached promise on subsequent calls.
@@ -429,7 +442,7 @@ async function runViolationPipelineInternal(
     signal,
   } = input;
   const disabledRuleSet = new Set<string>(disabledRules ?? []);
-  const certifiedRun = input.certifiedLlmRun ?? input.certifiedLlmResume?.run;
+  const certifiedRun = input.certifiedLlmRun ?? certifiedRecovery?.run;
 
   const added: ViolationRecord[] = [];
   const unchanged: ViolationRecord[] = [];
@@ -1340,7 +1353,7 @@ async function runViolationPipelineInternal(
     && isCertifiedExecutionAdapter(provider)
     && provider.execution.provider !== 'transport:unverified',
   );
-  if (input.certifiedLlmResume && !certifiedArchitectureOnly) {
+  if (certifiedRecovery && !certifiedArchitectureOnly) {
     throw new CertifiedViolationResumeUnavailableError('work-plan-changed');
   }
   let certifiedLlmExecution: ViolationPipelineResult['certifiedLlmExecution'];
@@ -1592,6 +1605,18 @@ async function runViolationPipelineInternal(
               admittedAt: input.certifiedLlmResume.admittedAt,
               observer,
             })
+          : input.certifiedLlmRearm
+            ? await rearmCertifiedViolationPhase({
+                run: input.certifiedLlmRearm.run,
+                adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
+                code: [],
+                service: certifiedArchitectureContexts!.service,
+                module: certifiedArchitectureContexts!.module,
+                consent: input.certifiedLlmRearm.consent,
+                activatedAt: input.certifiedLlmRearm.activatedAt,
+                admittedAt: input.certifiedLlmRearm.admittedAt,
+                observer,
+              })
           : await executeCertifiedViolationPhase({
               run: input.certifiedLlmRun!,
               analysisTimestamp: now,
