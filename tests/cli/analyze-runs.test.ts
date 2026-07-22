@@ -22,6 +22,7 @@ describe('analyze run CLI status', () => {
       'Provider reported reset: tomorrow 8pm (Africa/Cairo) (advisory)',
       'Verified reset time: 2026-07-20T17:00:00.000Z',
       'Resume: truecourse analyze resume run-interrupted after the provider reset (repository, baseline, rules, configuration, prompts/schemas, provider, and model will be revalidated)',
+      'Wait for reset: truecourse analyze resume run-interrupted --wait-for-reset (cancellable; Claude is not contacted before the certified reset time)',
       'Active completed analysis: analysis-completed · 2026-07-19T09:00:00.000Z · main@abc1234',
     ]);
   });
@@ -83,6 +84,7 @@ describe('analyze run CLI status', () => {
 
     expect(output).toContain('Usage: truecourse analyze resume [options] <run-id>');
     expect(output).toContain('Resume one exact latest attempted run');
+    expect(output).toContain('--wait-for-reset');
   });
 
   it('rejects every explicit parent full-analysis option for Resume', () => {
@@ -158,6 +160,164 @@ describe('analyze run CLI status', () => {
         'Resume complete: analysis-incomplete is now the active completed analysis.',
       );
       expect(lines).toContain('Revalidated and reused 1 successful LLM checkpoint.');
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('waits read-only for the certified reset before registration or Resume execution', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-wait-'));
+    let wake!: () => void;
+    const waitForResetAction = vi.fn((_repositoryKey, _runId, options) => (
+      new Promise<AnalyzeRunStatus>((resolve) => {
+        options.onWait?.({
+          runId: 'run-interrupted',
+          resetAt: '2026-07-20T17:00:00.000Z',
+          completed: 1,
+          pending: 1,
+          activeCompletedAnalysisId: 'analysis-completed',
+        });
+        wake = () => resolve(blockedStatus());
+      })
+    ));
+    const readStatus = vi.fn(async () => blockedStatus());
+    const registerProject = vi.fn(async () => ({ path: repoPath }) as never);
+    const listenersBefore = new Set(process.listeners('SIGINT'));
+    let waitHandlerPresentDuringResume = true;
+    const resume = vi.fn(async () => {
+      waitHandlerPresentDuringResume = process.listeners('SIGINT')
+        .some((listener) => !listenersBefore.has(listener));
+      return {
+        analysisId: 'analysis-incomplete',
+        filename: 'analysis-incomplete.json',
+        serviceCount: 1,
+        fileCount: 1,
+        architecture: 'monolith',
+        durationMs: 100,
+        violationsSummary: { total: 0, bySeverity: {} },
+      };
+    });
+    const lines: string[] = [];
+
+    try {
+      const running = runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        waitForReset: true,
+        waitForResetAction,
+        readStatus,
+        registerProject,
+        resume,
+        writeLine: (line) => lines.push(line),
+      });
+      await vi.waitFor(() => expect(waitForResetAction).toHaveBeenCalledOnce());
+
+      expect(waitForResetAction).toHaveBeenCalledWith(
+        repoPath,
+        'run-interrupted',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+      expect(readStatus).not.toHaveBeenCalled();
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+      expect(process.listeners('SIGINT').some((listener) => !listenersBefore.has(listener)))
+        .toBe(true);
+      expect(lines).toContain(
+        'Waiting to resume exact run run-interrupted until certified provider reset 2026-07-20T17:00:00.000Z. Saved run contains 1 durable successful LLM checkpoint; 1 pending check remains. Active completed analysis analysis-completed stays canonical. Claude will not be contacted before reset. Press Ctrl+C to cancel this process-bound wait.',
+      );
+
+      wake();
+      await running;
+
+      expect(readStatus).not.toHaveBeenCalled();
+      expect(registerProject).toHaveBeenCalledOnce();
+      expect(resume).toHaveBeenCalledOnce();
+      expect(waitHandlerPresentDuringResume).toBe(false);
+      expect(lines).toContain(
+        'Certified provider reset reached. Exact run identity, journal revision, and reset evidence were unchanged; continuing with normal Resume revalidation.',
+      );
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('continues zero-pending recovery without announcing or arming a wait', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-no-wait-'));
+    const status = blockedStatus();
+    status.latestAttempt!.state = 'finalizing';
+    status.latestAttempt!.blocked = null;
+    status.latestAttempt!.lastProviderLimit = null;
+    status.latestAttempt!.counts = {
+      total: 2,
+      pending: 0,
+      running: 0,
+      succeeded: 2,
+      failed: 0,
+    };
+    status.latestAttempt!.finalization = {
+      finalizingAt: '2026-07-19T10:00:03.000Z',
+      persistence: 'prepared',
+      preparedAt: '2026-07-19T10:00:04.000Z',
+    };
+    status.activeCompletedAnalysis!.analysisId = status.latestAttempt!.candidateAnalysisId;
+    const waitForResetAction = vi.fn(async () => status);
+    const resume = vi.fn(async () => ({
+      analysisId: 'analysis-incomplete',
+      filename: 'analysis-incomplete.json',
+      serviceCount: 1,
+      fileCount: 1,
+      architecture: 'monolith',
+      durationMs: 100,
+      violationsSummary: { total: 0, bySeverity: {} },
+    }));
+    const lines: string[] = [];
+
+    try {
+      await runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        waitForReset: true,
+        waitForResetAction,
+        registerProject: async () => ({ path: repoPath }) as never,
+        resume,
+        writeLine: (line) => lines.push(line),
+      });
+
+      expect(waitForResetAction).toHaveBeenCalledOnce();
+      expect(resume).toHaveBeenCalledOnce();
+      expect(lines.join('\n')).not.toContain('Waiting to resume');
+      expect(lines).toContain(
+        'No provider calls are pending; recovering durable execution/finalization state.',
+      );
+    } finally {
+      fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts the process-bound wait before registration or Resume execution', async () => {
+    const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-resume-cancel-wait-'));
+    const controller = new AbortController();
+    const registerProject = vi.fn();
+    const resume = vi.fn();
+    const waitForResetAction = vi.fn((_repositoryKey, _runId, options) => (
+      new Promise<never>((_resolve, reject) => {
+        options.signal!.addEventListener('abort', () => reject(options.signal!.reason), { once: true });
+      })
+    ));
+
+    try {
+      const waiting = runAnalyzeResume('run-interrupted', {
+        cwd: repoPath,
+        waitForReset: true,
+        signal: controller.signal,
+        waitForResetAction,
+        registerProject,
+        resume,
+      });
+      await vi.waitFor(() => expect(waitForResetAction).toHaveBeenCalledOnce());
+      controller.abort();
+
+      await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+      expect(registerProject).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(repoPath, { recursive: true, force: true });
     }

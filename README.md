@@ -110,14 +110,23 @@ durable progress, and advisory provider reset hint separately from the active
 completed analysis. A complete timezone-qualified Claude reset hint is also
 shown as a verified UTC reset time when it can be derived unambiguously from
 the durable block timestamp; unknown wording, invalid zones, and DST ambiguity
-remain advisory only. Automatic waiting is not enabled. The manual CLI Resume
-action accepts one exact latest run ID,
+remain advisory only and are never turned into timers. The manual
+`truecourse analyze resume <run-id> --wait-for-reset` action can keep the current
+process open until a certified reset time. The process-bound wait is cancellable
+with Ctrl+C and performs no Claude contact, provider construction, Resume
+admission, or analysis-state write before wake. It then rereads the exact latest
+run ID, journal revision, and reset evidence before normal Resume revalidation;
+changed or missing evidence fails closed. The timer itself is not durable, while
+the saved run remains durable and can recreate the wait later. A run with no
+pending provider work bypasses the timer and continues recovery immediately.
+The manual CLI Resume action accepts one exact latest run ID,
 revalidates every durable input before reusing saved successful checkpoints,
 executes only pending checks, and promotes the candidate only after complete
 finalization.
-It deliberately installs no graceful SIGINT cancellation handler: an abrupt
-interruption remains durably recoverable or execution-ambiguous instead of
-being mislabeled as a safe retryable failure. The local dashboard exposes the
+After the wait, it deliberately installs no graceful SIGINT cancellation
+handler while provider work is active: an abrupt interruption remains durably
+recoverable or execution-ambiguous instead of being mislabeled as a safe
+retryable failure. The local dashboard exposes the
 latest attempted run and its durable progress separately from the active
 completed analysis. Its exact-run Resume action revalidates saved inputs before
 checkpoint reuse, reports progress and provider reset failures, and protects
@@ -140,7 +149,7 @@ internal admission boundary durably records `executing` and revalidates the
 exact provider/model pin before and after that write, before allowing pending
 work to start. The certified runner can recover with zero calls after the final
 checkpoint, and a prepared finalization can be replayed without provider work;
-automatic reset waiting remains a later dependency. A
+the CLI's optional reset wait does not schedule or durably rearm a run. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
 Resume accounting is derived once from the complete durable checkpoint ledger,

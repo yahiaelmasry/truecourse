@@ -1,8 +1,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { readAnalyzeRunStatus } from '../../packages/core/src/commands/analyze-run-status.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  readAnalyzeRunStatus,
+  waitForAnalyzeRunReset,
+} from '../../packages/core/src/commands/analyze-run-status.js';
 import {
   buildAnalysisFilename,
   clearLatestCache,
@@ -158,7 +161,186 @@ describe('analyze run status', () => {
       if (pointerBefore !== null) expect(fs.readFileSync(pointerPath)).toEqual(pointerBefore);
     },
   );
+
+  it('waits for the certified provider reset and returns the unchanged exact attempt', async () => {
+    const status = await createWaitableStatus('tomorrow 8pm (Africa/Cairo)');
+    const clock = { waitUntil: vi.fn(async () => undefined) };
+    const inspectStatus = vi.fn(async () => structuredClone(status));
+    const onWait = vi.fn();
+
+    await expect(waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      clock,
+      inspectStatus,
+      onWait,
+    })).resolves.toMatchObject({
+      latestAttempt: {
+        runId: 'waited-attempt-1',
+        revision: 2,
+        lastProviderLimit: { resetAt: '2026-07-20T17:00:00.000Z' },
+      },
+      activeCompletedAnalysis: { analysisId: 'completed-analysis-1' },
+    });
+    expect(clock.waitUntil).toHaveBeenCalledWith(
+      1_784_566_800_000,
+      expect.any(AbortSignal),
+    );
+    expect(inspectStatus).toHaveBeenCalledTimes(2);
+    expect(onWait).toHaveBeenCalledWith({
+      runId: 'waited-attempt-1',
+      resetAt: '2026-07-20T17:00:00.000Z',
+      completed: 0,
+      pending: 1,
+      activeCompletedAnalysisId: 'completed-analysis-1',
+    });
+  });
+
+  it('does not invent a timer from an uncertified provider reset hint', async () => {
+    const status = await createWaitableStatus('6:40pm');
+    const clock = { waitUntil: vi.fn(async () => undefined) };
+
+    await expect(waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      clock,
+      inspectStatus: async () => structuredClone(status),
+    })).rejects.toMatchObject({ reason: 'reset-time-uncertified' });
+    expect(clock.waitUntil).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the certified reset evidence changes while waiting', async () => {
+    const status = await createWaitableStatus('tomorrow 8pm (Africa/Cairo)');
+    const changed = structuredClone(status);
+    changed.latestAttempt!.lastProviderLimit!.resetHint = 'tomorrow 9pm (Africa/Cairo)';
+    const inspectStatus = vi.fn()
+      .mockResolvedValueOnce(status)
+      .mockResolvedValueOnce(changed);
+
+    await expect(waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      clock: { waitUntil: async () => undefined },
+      inspectStatus,
+    })).rejects.toMatchObject({ reason: 'attempt-changed' });
+    expect(inspectStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels a process-bound wait without a post-wake status read', async () => {
+    const status = await createWaitableStatus('tomorrow 8pm (Africa/Cairo)');
+    status.latestAttempt!.lastProviderLimit!.resetAt = '2099-07-20T17:00:00.000Z';
+    const inspectStatus = vi.fn(async () => structuredClone(status));
+    const controller = new AbortController();
+
+    const waiting = waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      signal: controller.signal,
+      inspectStatus,
+    });
+    controller.abort();
+
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+    expect(inspectStatus).toHaveBeenCalledOnce();
+  });
+
+  it('does not return zero-pending recovery after cancellation during the initial status read', async () => {
+    const status = await createWaitableStatus('tomorrow 8pm (Africa/Cairo)');
+    status.latestAttempt!.counts = {
+      total: 1,
+      pending: 0,
+      running: 0,
+      succeeded: 1,
+      failed: 0,
+    };
+    const controller = new AbortController();
+    let resolveStatus!: (value: typeof status) => void;
+    const inspectStatus = vi.fn(() => new Promise<typeof status>((resolve) => {
+      resolveStatus = resolve;
+    }));
+
+    const waiting = waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      signal: controller.signal,
+      inspectStatus,
+    });
+    await vi.waitFor(() => expect(inspectStatus).toHaveBeenCalledOnce());
+    controller.abort();
+    resolveStatus(status);
+
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('does not continue after cancellation during the authoritative post-wake reread', async () => {
+    const status = await createWaitableStatus('tomorrow 8pm (Africa/Cairo)');
+    const controller = new AbortController();
+    let resolveRefreshed!: (value: typeof status) => void;
+    const inspectStatus = vi.fn()
+      .mockResolvedValueOnce(status)
+      .mockImplementationOnce(() => new Promise<typeof status>((resolve) => {
+        resolveRefreshed = resolve;
+      }));
+
+    const waiting = waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      signal: controller.signal,
+      clock: { waitUntil: async () => undefined },
+      inspectStatus,
+    });
+    await vi.waitFor(() => expect(inspectStatus).toHaveBeenCalledTimes(2));
+    controller.abort();
+    resolveRefreshed(status);
+
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('returns zero-pending recovery immediately without reset evidence or a timer', async () => {
+    const status = await createWaitableStatus('tomorrow 8pm (Africa/Cairo)');
+    status.latestAttempt!.counts = {
+      total: 1,
+      pending: 0,
+      running: 0,
+      succeeded: 1,
+      failed: 0,
+    };
+    status.latestAttempt!.lastProviderLimit = null;
+    const clock = { waitUntil: vi.fn(async () => undefined) };
+    const inspectStatus = vi.fn(async () => structuredClone(status));
+
+    await expect(waitForAnalyzeRunReset(repoPath, 'waited-attempt-1', {
+      clock,
+      inspectStatus,
+    })).resolves.toEqual(status);
+    expect(clock.waitUntil).not.toHaveBeenCalled();
+    expect(inspectStatus).toHaveBeenCalledOnce();
+  });
 });
+
+async function createWaitableStatus(resetHint: string): Promise<Awaited<ReturnType<typeof readAnalyzeRunStatus>>> {
+  const completed = completedLatest();
+  await writeLatest(repoPath, completed);
+  await dispatchAnalyzeRun(repoPath, {
+    kind: 'begin',
+    runId: 'waited-attempt-1',
+    candidateAnalysisId: 'incomplete-analysis-2',
+    startedAt: '2026-07-19T10:00:00.000Z',
+    source: 'cli',
+    branch: 'main',
+    commitHash: 'def456',
+    completedBaselineId: completed.analysis.id,
+  });
+  await sealAnalyzeRunPlan(repoPath, {
+    kind: 'seal-plan',
+    runId: 'waited-attempt-1',
+    sealedAt: '2026-07-19T10:00:01.000Z',
+    execution: {
+      provider: 'claude-cli',
+      requestedModel: 'sonnet',
+      promptSchemaVersion: 'test-prompt-v1',
+      outputSchemaVersion: 'test-output-v1',
+    },
+    work: [
+      { workId: 'analyze:v1:service', inputFingerprint: `sha256:${'a'.repeat(64)}` },
+    ],
+  });
+  await dispatchAnalyzeRun(repoPath, {
+    kind: 'block',
+    runId: 'waited-attempt-1',
+    blockedAt: '2026-07-19T10:00:02.000Z',
+    resetHint,
+  });
+  return readAnalyzeRunStatus(repoPath);
+}
 
 function completedLatest(): LatestSnapshot {
   return {

@@ -192,7 +192,8 @@ analyzeCmd
 analyzeCmd
   .command("resume <run-id>")
   .description("Resume one exact latest attempted run")
-  .action(async (runId: string, _options, command: Command) => {
+  .option("--wait-for-reset", "Wait for the certified provider reset before resuming")
+  .action(async (runId: string, options: { waitForReset?: boolean }, command: Command) => {
     const parentOptions = command.parent ? explicitAnalyzeOptions(command.parent) : [];
     if (parentOptions.length > 0) {
       p.log.error(
@@ -203,10 +204,14 @@ analyzeCmd
     }
     p.intro("Resuming analysis");
     try {
-      await runAnalyzeResume(runId);
+      await runAnalyzeResume(runId, { waitForReset: options.waitForReset === true });
       p.outro("Analysis Resume complete");
     } catch (error) {
-      if (error instanceof AnalysisSessionLimitError) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        p.outro("Analysis Resume wait cancelled; the saved run remains resumable");
+        process.exitCode = 130;
+        return;
+      } else if (error instanceof AnalysisSessionLimitError) {
         p.log.error(
           `${error.message} Resume paused again. Inspect truecourse analyze status and retry the exact run after the provider reset. The active completed analysis remains canonical.`,
         );

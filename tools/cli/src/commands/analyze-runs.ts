@@ -1,6 +1,8 @@
 import path from 'node:path';
 import {
+  AnalyzeRunResetWaitUnavailableError,
   readAnalyzeRunStatus,
+  waitForAnalyzeRunReset,
   type AnalyzeRunStatus,
   type AnalyzeRunResumeUnavailableReason,
 } from '@truecourse/core/commands/analyze-run-status';
@@ -31,6 +33,10 @@ export interface AnalyzeStartExpectationOptions {
 }
 
 export interface AnalyzeResumeOptions extends AnalyzeStatusOptions {
+  /** Keep this CLI process open until the journal-certified provider reset. */
+  waitForReset?: boolean;
+  signal?: AbortSignal;
+  waitForResetAction?: typeof waitForAnalyzeRunReset;
   readStatus?: typeof readAnalyzeRunStatus;
   registerProject?: (repoPath: string) => Promise<RegistryEntry>;
   configureDiagnostics?: typeof configureLogger;
@@ -85,7 +91,23 @@ export async function runAnalyzeResume(
   }
   try {
     const readStatus = options.readStatus ?? readAnalyzeRunStatus;
-    const status = await readStatus(repositoryKey);
+    let waited = false;
+    const status = options.waitForReset
+      ? await waitForResetBeforeResume(repositoryKey, runId, options, (notice) => {
+          waited = true;
+          const baseline = notice.activeCompletedAnalysisId ?? 'none';
+          const completed = notice.completed;
+          const pending = notice.pending;
+          (options.writeLine ?? console.log)(
+            `Waiting to resume exact run ${runId} until certified provider reset ${notice.resetAt}. Saved run contains ${completed} durable successful LLM ${plural(completed, 'checkpoint')}; ${pending} pending ${plural(pending, 'check')} ${pending === 1 ? 'remains' : 'remain'}. Active completed analysis ${baseline} stays canonical. Claude will not be contacted before reset. Press Ctrl+C to cancel this process-bound wait.`,
+          );
+        })
+      : await readStatus(repositoryKey);
+    if (waited) {
+      (options.writeLine ?? console.log)(
+        'Certified provider reset reached. Exact run identity, journal revision, and reset evidence were unchanged; continuing with normal Resume revalidation.',
+      );
+    }
     const run = selectAnalyzeResumeRun(status, runId);
     const writeLine = options.writeLine ?? console.log;
     const completed = run.counts!.succeeded;
@@ -131,6 +153,8 @@ export async function runAnalyzeResume(
       error instanceof AnalyzeResumeCliError
       || error instanceof AnalysisResumeUnavailableError
       || error instanceof AnalysisSessionLimitError
+      || error instanceof AnalyzeRunResetWaitUnavailableError
+      || isAbortError(error)
     ) {
       throw error;
     }
@@ -148,6 +172,28 @@ export async function runAnalyzeResume(
         // Closing diagnostics must not replace the Resume result or failure.
       }
     }
+  }
+}
+
+async function waitForResetBeforeResume(
+  repositoryKey: string,
+  runId: string,
+  options: AnalyzeResumeOptions,
+  onWait: NonNullable<Parameters<typeof waitForAnalyzeRunReset>[2]>['onWait'],
+): Promise<AnalyzeRunStatus> {
+  const controller = options.signal ? null : new AbortController();
+  const signal = options.signal ?? controller!.signal;
+  const onSigint = () => {
+    controller!.abort(new DOMException('Analysis Resume wait cancelled', 'AbortError'));
+  };
+  if (controller) process.once('SIGINT', onSigint);
+  try {
+    return await (options.waitForResetAction ?? waitForAnalyzeRunReset)(repositoryKey, runId, {
+      signal,
+      onWait,
+    });
+  } finally {
+    if (controller) process.removeListener('SIGINT', onSigint);
   }
 }
 
@@ -207,6 +253,11 @@ export function formatAnalyzeRunStatus(status: AnalyzeRunStatus): string[] {
       lines.push(
         `Resume: truecourse analyze resume ${run.runId}${timing} (repository, baseline, rules, configuration, prompts/schemas, provider, and model will be revalidated)`,
       );
+      if (run.lastProviderLimit?.resetAt && (run.counts?.pending ?? 0) > 0) {
+        lines.push(
+          `Wait for reset: truecourse analyze resume ${run.runId} --wait-for-reset (cancellable; Claude is not contacted before the certified reset time)`,
+        );
+      }
     } else {
       lines.push(`Resume: unavailable — ${resumeUnavailableMessage(run.resume.reason)}`);
     }
@@ -299,6 +350,10 @@ function localFailureDiagnostic(error: unknown): string {
   } catch {
     return 'failure could not be formatted';
   }
+}
+
+function isAbortError(error: unknown): error is DOMException {
+  return error instanceof DOMException && error.name === 'AbortError';
 }
 
 function resumeUnavailableMessage(reason: AnalyzeRunResumeUnavailableReason): string {
