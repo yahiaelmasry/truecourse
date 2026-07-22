@@ -12,6 +12,7 @@ import {
   type AnalyzeRunExecutionCompletion,
   type AnalyzeRunCheckpointWriter,
   type AnalyzeRunPlanActivation,
+  type AnalyzeRunResumeExecutionPin,
   type AnalyzeRunResumePlanActivation,
 } from '../../lib/analyze-run-journal.js';
 import { activeCompletedBaselineId, getAnalysisStore } from '../../lib/analysis-store.js';
@@ -194,7 +195,8 @@ export type AnalyzeLlmResumeCompatibility =
         attemptSequence: number;
         latestAttemptSequence: number;
         completedBaselineFingerprint: string | null;
-        resolvedModel: string;
+        modelSelection: 'requested' | 'resolved';
+        resolvedModel: string | null;
       }>;
     }>;
 
@@ -213,6 +215,7 @@ export type AnalyzeLlmResumeActivationResult =
 interface AnalyzeLlmResumeInspection {
   readonly compatibility: AnalyzeLlmResumeCompatibility;
   readonly durableActivatedAt: string | null;
+  readonly executionAdapter: AnalyzeLlmExecutionAdapter | null;
   readonly reused: readonly Readonly<{
     work: CertifiedAnalyzeLlmWork;
     result: unknown;
@@ -389,7 +392,8 @@ export function certifyAnalyzeLlmRun(
   const resumeExecutions = new WeakMap<object, Readonly<{
     reused: AnalyzeLlmResumeInspection['reused'];
     pending: AnalyzeLlmResumeInspection['pending'];
-    resolvedModel: string;
+    executionPin: AnalyzeRunResumeExecutionPin;
+    executionAdapter: AnalyzeLlmExecutionAdapter;
   }>>();
 
   return Object.freeze({
@@ -402,7 +406,11 @@ export function certifyAnalyzeLlmRun(
       if (!compatibility.compatible) {
         return Object.freeze({ activated: false as const, reason: compatibility.reason });
       }
-      if (!resumeExecutionMatches(adapter, execution, compatibility.observed.resolvedModel)) {
+      const executionPin = resumeExecutionPin(execution, compatibility.observed);
+      if (
+        !inspection.executionAdapter
+        || !resumeExecutionPinMatches(inspection.executionAdapter, execution, executionPin)
+      ) {
         return Object.freeze({
           activated: false as const,
           reason: 'activated-execution-changed' as const,
@@ -419,12 +427,7 @@ export function certifyAnalyzeLlmRun(
         })),
         reusedWorkIds: compatibility.reusedWorkIds,
         pendingWorkIds: compatibility.pendingWorkIds,
-        executionPin: {
-          provider: execution.provider,
-          requestedModel: execution.requestedModel,
-          modelSelection: 'resolved',
-          resolvedModel: compatibility.observed.resolvedModel,
-        },
+        executionPin,
         observed: {
           runRevision: compatibility.observed.runRevision,
           attemptSequence: compatibility.observed.attemptSequence,
@@ -435,7 +438,8 @@ export function certifyAnalyzeLlmRun(
       resumeExecutions.set(activated.activation, Object.freeze({
         reused: inspection.reused,
         pending: inspection.pending,
-        resolvedModel: compatibility.observed.resolvedModel,
+        executionPin,
+        executionAdapter: inspection.executionAdapter,
       }));
       return Object.freeze({
         activated: true as const,
@@ -459,15 +463,9 @@ export function certifyAnalyzeLlmRun(
           'Certified analyze resume was not activated by this plan',
         );
       }
-      const executionPin = Object.freeze({
-        provider: execution.provider,
-        requestedModel: execution.requestedModel,
-        modelSelection: 'resolved' as const,
-        resolvedModel: planned.resolvedModel,
-      });
       const validate = () => {
         assertExecutionMatches(execution, adapter.execution);
-        assertResumeExecutionMatches(adapter, execution, planned.resolvedModel);
+        assertResumeExecutionPinMatches(planned.executionAdapter, execution, planned.executionPin);
       };
       const admission = await admitAnalyzeRunResumeExecution(
         activation,
@@ -475,17 +473,22 @@ export function certifyAnalyzeLlmRun(
         runId,
         manifest.work,
         planned.pending.map((item) => item.workId),
-        executionPin,
+        planned.executionPin,
         admittedAt,
         validate,
         (checkpointWriter) => {
           executed = true;
-          return executeCertifiedWork(
-            planned.pending,
-            observer,
-            checkpointWriter,
-            planned.resolvedModel,
-          );
+          return planned.executionPin.modelSelection === 'requested'
+            ? planned.pending.length === 0
+              ? Promise.resolve(Object.freeze([]))
+              : executeZeroCheckpointRestart(planned.pending, observer, checkpointWriter)
+            : executeCertifiedWork(
+                planned.pending,
+                planned.executionAdapter,
+                observer,
+                checkpointWriter,
+                planned.executionPin.resolvedModel,
+              );
         },
       );
       if (!admission.admitted) {
@@ -531,7 +534,7 @@ export function certifyAnalyzeLlmRun(
         },
         (checkpointWriter) => {
           executed = true;
-          return executeCertifiedWork(certifiedWork, observer, checkpointWriter);
+          return executeCertifiedWork(certifiedWork, adapter, observer, checkpointWriter);
         },
       );
       if (!admission.admitted) {
@@ -612,31 +615,6 @@ export function certifyAnalyzeLlmRun(
     ) {
       return incompatibleInspection('checkpoint-execution-changed');
     }
-    const resumeExecution = adapter.resumeExecution;
-    if (
-      !resumeExecution
-      || resumeExecution.modelSelection !== 'pinned'
-      || resumeExecution.provider !== execution.provider
-      || resumeExecution.requestedModel !== execution.requestedModel
-      || typeof resumeExecution.resolvedModel !== 'string'
-      || resumeExecution.resolvedModel.trim().length === 0
-      || resumeExecution.resolvedModel.trim() !== resumeExecution.resolvedModel
-    ) {
-      return incompatibleInspection('checkpoint-model-unverified');
-    }
-    const resolvedModel = resumeExecution.resolvedModel;
-    if (
-      (recoveringActivated || recoveringCompletedExecution)
-      && !isDeepStrictEqual(candidate.executionAttempt.resume?.executionPin, {
-        provider: execution.provider,
-        requestedModel: execution.requestedModel,
-        modelSelection: 'resolved',
-        resolvedModel,
-      })
-    ) {
-      return incompatibleInspection('activated-execution-changed');
-    }
-
     const currentManifest = manifest.work.map(({ workId, inputFingerprint }) => ({
       workId,
       inputFingerprint,
@@ -652,6 +630,7 @@ export function certifyAnalyzeLlmRun(
     const attempts = new Set<string>();
     const reused: { work: CertifiedAnalyzeLlmWork; result: unknown }[] = [];
     const pending: CertifiedAnalyzeLlmWork[] = [];
+    let checkpointResolvedModel: string | null = null;
     for (let index = 0; index < certifiedWork.length; index += 1) {
       const item = certifiedWork[index]!;
       const stored = candidate.plan.work[index]!;
@@ -686,10 +665,12 @@ export function certifyAnalyzeLlmRun(
       if (
         usage.resolvedModel === null
         || usage.resolvedModel.trim().length === 0
-        || usage.resolvedModel !== resolvedModel
+        || usage.resolvedModel.trim() !== usage.resolvedModel
+        || (checkpointResolvedModel !== null && usage.resolvedModel !== checkpointResolvedModel)
       ) {
         return incompatibleInspection('checkpoint-model-unverified');
       }
+      checkpointResolvedModel = usage.resolvedModel;
       let result: unknown;
       try {
         result = item.planned.request.parse(checkpoint.result);
@@ -697,6 +678,50 @@ export function certifyAnalyzeLlmRun(
         return incompatibleInspection('checkpoint-result-invalid');
       }
       reused.push(Object.freeze({ work: item, result }));
+    }
+
+    let executionPin: AnalyzeRunResumeExecutionPin;
+    let resumeAdapter = adapter;
+    const durablePin = candidate.executionAttempt.resume?.executionPin;
+    if (
+      recoveringCompletedExecution
+      && durablePin?.modelSelection === 'requested'
+      && pending.length === 0
+    ) {
+      executionPin = durablePin;
+    } else if (checkpointResolvedModel !== null) {
+      const candidateAdapter = pinnedResumeExecutionMatches(adapter, execution, checkpointResolvedModel)
+        ? adapter
+        : adapter.createPinnedResumeAdapter?.(checkpointResolvedModel);
+      if (
+        !candidateAdapter
+        || !pinnedResumeExecutionMatches(candidateAdapter, execution, checkpointResolvedModel)
+      ) {
+        return incompatibleInspection('checkpoint-model-unverified');
+      }
+      resumeAdapter = candidateAdapter;
+      executionPin = Object.freeze({
+        provider: execution.provider,
+        requestedModel: execution.requestedModel,
+        modelSelection: 'resolved' as const,
+        resolvedModel: checkpointResolvedModel,
+      });
+    } else {
+      if (typeof adapter.createPinnedResumeAdapter !== 'function') {
+        return incompatibleInspection('checkpoint-model-unverified');
+      }
+      executionPin = Object.freeze({
+        provider: execution.provider,
+        requestedModel: execution.requestedModel,
+        modelSelection: 'requested' as const,
+        resolvedModel: null,
+      });
+    }
+    if (
+      (recoveringActivated || recoveringCompletedExecution)
+      && !isDeepStrictEqual(durablePin, executionPin)
+    ) {
+      return incompatibleInspection('activated-execution-changed');
     }
 
     const candidateAfter = await readAnalyzeRunResumeCandidate(journalKey, runId);
@@ -747,7 +772,8 @@ export function certifyAnalyzeLlmRun(
         attemptSequence: candidate.attemptSequence,
         latestAttemptSequence: candidate.latestAttemptSequence,
         completedBaselineFingerprint,
-        resolvedModel,
+        modelSelection: executionPin.modelSelection,
+        resolvedModel: executionPin.resolvedModel,
       }),
     });
     return Object.freeze({
@@ -755,6 +781,7 @@ export function certifyAnalyzeLlmRun(
       durableActivatedAt: recoveringActivated || recoveringCompletedExecution
         ? candidate.executionAttempt.activatedAt
         : null,
+      executionAdapter: resumeAdapter,
       reused: Object.freeze(reused),
       pending: Object.freeze(pending),
     });
@@ -762,19 +789,22 @@ export function certifyAnalyzeLlmRun(
 
   async function executeCertifiedWork(
     items: readonly CertifiedAnalyzeLlmWork[],
+    executionAdapter: AnalyzeLlmExecutionAdapter,
     observer?: AnalyzeLlmWorkProgressObserver,
     checkpointWriter?: AnalyzeRunCheckpointWriter,
     expectedResolvedModel?: string,
+    requireResolvedModel = false,
   ): Promise<readonly {
     readonly work: CertifiedAnalyzeLlmWork;
     readonly result: unknown;
+    readonly usage: Readonly<AnalyzeLlmExecutionUsage> | null;
   }[]> {
     const settled = await Promise.allSettled(items.map(async (item) => {
       let started = false;
       let ok = false;
       let startNotification = Promise.resolve();
       try {
-        const outcome = await adapter.execute(item, {
+        const outcome = await executionAdapter.execute(item, {
           onStart: () => {
             if (started) return;
             started = true;
@@ -790,6 +820,7 @@ export function certifyAnalyzeLlmRun(
           outcome,
           execution,
           expectedResolvedModel,
+          requireResolvedModel,
         );
         if (!checkpointWriter) {
           throw new AnalyzeLlmPlanError('plan-not-activated', 'Analyze checkpoint writer is missing');
@@ -804,7 +835,7 @@ export function certifyAnalyzeLlmRun(
           usage: certified.usage,
         }));
         ok = true;
-        return { work: item, result: certified.result };
+        return { work: item, result: certified.result, usage: certified.usage };
       } finally {
         await startNotification;
         await notifyProgressObserver('done', item, () =>
@@ -822,7 +853,51 @@ export function certifyAnalyzeLlmRun(
       (result as PromiseFulfilledResult<{
         work: CertifiedAnalyzeLlmWork;
         result: unknown;
+        usage: Readonly<AnalyzeLlmExecutionUsage> | null;
       }>).value);
+  }
+
+  async function executeZeroCheckpointRestart(
+    items: readonly CertifiedAnalyzeLlmWork[],
+    observer: AnalyzeLlmWorkProgressObserver | undefined,
+    checkpointWriter: AnalyzeRunCheckpointWriter,
+  ): Promise<readonly {
+    readonly work: CertifiedAnalyzeLlmWork;
+    readonly result: unknown;
+    readonly usage: Readonly<AnalyzeLlmExecutionUsage> | null;
+  }[]> {
+    const firstItem = items[0];
+    if (!firstItem) {
+      throw new AnalyzeLlmPlanError(
+        'plan-not-activated',
+        'Zero-checkpoint resume contains no pending work',
+      );
+    }
+    const first = await executeCertifiedWork(
+      [firstItem],
+      adapter,
+      observer,
+      checkpointWriter,
+      undefined,
+      true,
+    );
+    const resolvedModel = first[0]!.usage!.resolvedModel!;
+    const pinnedAdapter = adapter.createPinnedResumeAdapter?.(resolvedModel);
+    if (!pinnedAdapter) {
+      throw new AnalyzeLlmPlanError(
+        'provider-not-certifiable',
+        'Analyze LLM provider cannot pin the model established by the restarted call',
+      );
+    }
+    assertResumeExecutionMatches(pinnedAdapter, execution, resolvedModel);
+    const remaining = await executeCertifiedWork(
+      items.slice(1),
+      pinnedAdapter,
+      observer,
+      checkpointWriter,
+      resolvedModel,
+    );
+    return Object.freeze([...first, ...remaining]);
   }
 }
 
@@ -878,6 +953,7 @@ function incompatibleInspection(
   return Object.freeze({
     compatibility: incompatible(reason),
     durableActivatedAt: null,
+    executionAdapter: null,
     reused: Object.freeze([]),
     pending: Object.freeze([]),
   });
@@ -897,10 +973,79 @@ function resumeExecutionMatches(
   const resume = adapter.resumeExecution;
   return current.provider === expected.provider
     && current.requestedModel === expected.requestedModel
-    && resume?.modelSelection === 'pinned'
+    && pinnedResumeExecutionMatches(adapter, expected, resolvedModel);
+}
+
+function pinnedResumeExecutionMatches(
+  adapter: AnalyzeLlmExecutionAdapter,
+  expected: Readonly<LlmWorkExecutionIntent>,
+  resolvedModel: string,
+): boolean {
+  const resume = adapter.resumeExecution;
+  return resume?.modelSelection === 'pinned'
     && resume.provider === expected.provider
     && resume.requestedModel === expected.requestedModel
     && resume.resolvedModel === resolvedModel;
+}
+
+function resumeExecutionPin(
+  execution: Readonly<LlmWorkExecutionIntent>,
+  observed: Readonly<{
+    modelSelection: 'requested' | 'resolved';
+    resolvedModel: string | null;
+  }>,
+): AnalyzeRunResumeExecutionPin {
+  if (observed.modelSelection === 'requested') {
+    if (observed.resolvedModel !== null) {
+      throw new AnalyzeLlmPlanError('provider-not-certifiable', 'Invalid requested-model resume pin');
+    }
+    return Object.freeze({
+        provider: execution.provider,
+        requestedModel: execution.requestedModel,
+        modelSelection: 'requested' as const,
+        resolvedModel: null,
+      });
+  }
+  if (
+    typeof observed.resolvedModel !== 'string'
+    || observed.resolvedModel.trim().length === 0
+    || observed.resolvedModel.trim() !== observed.resolvedModel
+  ) {
+    throw new AnalyzeLlmPlanError('provider-not-certifiable', 'Invalid resolved-model resume pin');
+  }
+  return Object.freeze({
+    provider: execution.provider,
+    requestedModel: execution.requestedModel,
+    modelSelection: 'resolved' as const,
+    resolvedModel: observed.resolvedModel,
+  });
+}
+
+function resumeExecutionPinMatches(
+  adapter: AnalyzeLlmExecutionAdapter,
+  execution: Readonly<LlmWorkExecutionIntent>,
+  pin: Readonly<AnalyzeRunResumeExecutionPin>,
+): boolean {
+  if (pin.provider !== execution.provider || pin.requestedModel !== execution.requestedModel) {
+    return false;
+  }
+  return pin.modelSelection === 'requested'
+    ? typeof adapter.createPinnedResumeAdapter === 'function'
+      && executionMatches(adapter.execution, execution)
+    : resumeExecutionMatches(adapter, execution, pin.resolvedModel);
+}
+
+function executionMatches(
+  current: Readonly<LlmWorkExecutionIntent>,
+  expected: Readonly<LlmWorkExecutionIntent>,
+): boolean {
+  try {
+    const validated = validateExecution(current);
+    return validated.provider === expected.provider
+      && validated.requestedModel === expected.requestedModel;
+  } catch {
+    return false;
+  }
 }
 
 function sameResumeIdentity(
@@ -950,6 +1095,7 @@ function certifyExecutionOutcome(
   outcome: AnalyzeLlmExecutionOutcome,
   execution: Readonly<LlmWorkExecutionIntent>,
   expectedResolvedModel?: string,
+  requireResolvedModel = false,
 ): AnalyzeLlmExecutionOutcome {
   const matches = (
     outcome !== null &&
@@ -986,6 +1132,22 @@ function certifyExecutionOutcome(
     throw new AnalyzeLlmPlanError(
       'result-not-certified',
       `Analyze ${work.family} result does not prove the activated resume model`,
+      work.family,
+      work.domain,
+    );
+  }
+  if (
+    requireResolvedModel
+    && (
+      usage?.resolvedModel === null
+      || usage?.resolvedModel === undefined
+      || usage.resolvedModel.trim().length === 0
+      || usage.resolvedModel.trim() !== usage.resolvedModel
+    )
+  ) {
+    throw new AnalyzeLlmPlanError(
+      'result-not-certified',
+      `Analyze ${work.family} result does not establish a concrete resume model`,
       work.family,
       work.domain,
     );
@@ -1158,6 +1320,19 @@ function assertResumeExecutionMatches(
     throw new AnalyzeLlmPlanError(
       'provider-not-certifiable',
       'Analyze LLM resume model pin changed after activation',
+    );
+  }
+}
+
+function assertResumeExecutionPinMatches(
+  adapter: AnalyzeLlmExecutionAdapter,
+  execution: Readonly<LlmWorkExecutionIntent>,
+  pin: Readonly<AnalyzeRunResumeExecutionPin>,
+): void {
+  if (!resumeExecutionPinMatches(adapter, execution, pin)) {
+    throw new AnalyzeLlmPlanError(
+      'provider-not-certifiable',
+      'Analyze LLM resume execution changed after activation',
     );
   }
 }

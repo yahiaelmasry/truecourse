@@ -164,6 +164,7 @@ describe('certified analyze resume eligibility', () => {
         attemptSequence: 1,
         latestAttemptSequence: 1,
         completedBaselineFingerprint: fingerprint(latest('completed-baseline')),
+        modelSelection: 'resolved',
         resolvedModel,
       },
     });
@@ -365,6 +366,282 @@ describe('certified analyze resume eligibility', () => {
       () => undefined,
       async () => [],
     )).resolves.toEqual({ admitted: false });
+  });
+
+  it('restarts a zero-checkpoint run once, then pins the concrete model for remaining work', async () => {
+    await createZeroCheckpointBlockedRun();
+    const requestedCalls: string[] = [];
+    const pinnedCalls: string[] = [];
+    const pinnedModels: string[] = [];
+    const execution = Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' });
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution,
+      createPinnedResumeAdapter(model) {
+        pinnedModels.push(model);
+        return {
+          execution,
+          resumeExecution: pinnedResumeExecution(model),
+          async execute(work) {
+            pinnedCalls.push(work.workId);
+            return {
+              ...successfulOutcome(work),
+              completedAt: '2026-07-19T02:00:07.000Z',
+            };
+          },
+        };
+      },
+      async execute(work) {
+        requestedCalls.push(work.workId);
+        return {
+          ...successfulOutcome(work),
+          completedAt: '2026-07-19T02:00:06.000Z',
+        };
+      },
+    };
+    const rebuilt = certifyAnalyzeLlmRun(planInput(), adapter);
+
+    await expect(rebuilt.inspectResumeCompatibility(identity)).resolves.toMatchObject({
+      compatible: true,
+      counts: { total: 2, reused: 0, pending: 2 },
+      observed: { modelSelection: 'requested', resolvedModel: null },
+    });
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    expect(activated).toMatchObject({
+      activated: true,
+      view: {
+        executionAttempt: {
+          resume: {
+            executionPin: { modelSelection: 'requested', resolvedModel: null },
+          },
+        },
+      },
+    });
+    if (!activated.activated) throw new Error('Expected zero-checkpoint activation');
+
+    const completed = await rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    );
+
+    expect(requestedCalls).toHaveLength(1);
+    expect(pinnedCalls).toHaveLength(1);
+    expect(pinnedModels).toEqual([resolvedModel]);
+    expect(new Set([...requestedCalls, ...pinnedCalls])).toEqual(
+      new Set(rebuilt.manifest.work.map((work) => work.workId)),
+    );
+    expect(completed.results).toHaveLength(2);
+    expect(completed.usageLedger).toHaveLength(2);
+    expect(completed.usageLedger.every((entry) => entry.usage.resolvedModel === resolvedModel))
+      .toBe(true);
+
+    resetAnalyzeRunStorage();
+    let recoveryCalls = 0;
+    const recovered = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      createPinnedResumeAdapter(model) {
+        return {
+          execution,
+          resumeExecution: pinnedResumeExecution(model),
+          async execute(work) {
+            recoveryCalls += 1;
+            return successfulOutcome(work);
+          },
+        };
+      },
+      async execute(work) {
+        recoveryCalls += 1;
+        return successfulOutcome(work);
+      },
+    });
+    await expect(recovered.inspectResumeCompatibility(identity)).resolves.toMatchObject({
+      compatible: true,
+      counts: { total: 2, reused: 2, pending: 0 },
+      observed: { modelSelection: 'requested', resolvedModel: null },
+    });
+    const recoveryActivation = await recovered.activateResume(
+      identity,
+      '2026-07-19T02:00:04.000Z',
+    );
+    if (!recoveryActivation.activated) throw new Error('Expected final-checkpoint recovery');
+    await expect(recovered.executeResume(
+      recoveryActivation.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).resolves.toMatchObject({ results: expect.any(Array), usageLedger: expect.any(Array) });
+    expect(recoveryCalls).toBe(0);
+  });
+
+  it('does not checkpoint a zero-checkpoint bootstrap result without concrete model evidence', async () => {
+    await createZeroCheckpointBlockedRun();
+    const execution = Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' });
+    const rebuilt = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      createPinnedResumeAdapter() {
+        throw new Error('must not pin an unproven model');
+      },
+      async execute(work) {
+        const outcome = successfulOutcome(work);
+        return {
+          ...outcome,
+          completedAt: '2026-07-19T02:00:06.000Z',
+          usage: { ...outcome.usage!, resolvedModel: null },
+        };
+      },
+    });
+    const activated = await rebuilt.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected zero-checkpoint activation');
+
+    await expect(rebuilt.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).rejects.toThrow(/does not establish a concrete resume model/);
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      counts: { total: 2, pending: 2, succeeded: 0 },
+    });
+  });
+
+  it('can block and retry when the zero-checkpoint bootstrap hits the session limit again', async () => {
+    await createZeroCheckpointBlockedRun();
+    const execution = Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' });
+    const sessionLimit = new LlmSessionLimitError('8pm');
+    const limited = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      createPinnedResumeAdapter: () => { throw new Error('no model was established'); },
+      async execute() { throw sessionLimit; },
+    });
+    const activated = await limited.activateResume(identity, '2026-07-19T02:00:04.000Z');
+    if (!activated.activated) throw new Error('Expected zero-checkpoint activation');
+    await expect(limited.executeResume(
+      activated.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).rejects.toBe(sessionLimit);
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'block',
+      runId,
+      blockedAt: '2026-07-19T02:00:06.000Z',
+      resetHint: '8pm',
+    });
+
+    resetAnalyzeRunStorage();
+    let calls = 0;
+    const retry = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      createPinnedResumeAdapter(model) {
+        return {
+          execution,
+          resumeExecution: pinnedResumeExecution(model),
+          async execute(work) {
+            calls += 1;
+            return successfulOutcome(work);
+          },
+        };
+      },
+      async execute(work) {
+        calls += 1;
+        return successfulOutcome(work);
+      },
+    });
+    await expect(retry.inspectResumeCompatibility(identity)).resolves.toMatchObject({
+      compatible: true,
+      resetHint: '8pm',
+      counts: { reused: 0, pending: 2 },
+      observed: { modelSelection: 'requested', resolvedModel: null },
+    });
+    expect(calls).toBe(0);
+  });
+
+  it('resumes with the derived exact pin when a later bootstrap call hits the limit', async () => {
+    await createZeroCheckpointBlockedRun();
+    const execution = Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' });
+    const laterLimit = new LlmSessionLimitError('8pm');
+    const firstAttempt = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      createPinnedResumeAdapter(model) {
+        return {
+          execution,
+          resumeExecution: pinnedResumeExecution(model),
+          async execute() { throw laterLimit; },
+        };
+      },
+      async execute(work) {
+        return {
+          ...successfulOutcome(work),
+          completedAt: '2026-07-19T02:00:06.000Z',
+        };
+      },
+    });
+    const firstActivation = await firstAttempt.activateResume(
+      identity,
+      '2026-07-19T02:00:04.000Z',
+    );
+    if (!firstActivation.activated) throw new Error('Expected zero-checkpoint activation');
+    await expect(firstAttempt.executeResume(
+      firstActivation.activation,
+      '2026-07-19T02:00:05.000Z',
+    )).rejects.toBe(laterLimit);
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'block',
+      runId,
+      blockedAt: '2026-07-19T02:00:07.000Z',
+      resetHint: '8pm',
+    });
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      counts: { total: 2, succeeded: 1, pending: 1 },
+      executionAttempt: {
+        resume: { executionPin: { modelSelection: 'requested', resolvedModel: null } },
+      },
+    });
+
+    resetAnalyzeRunStorage();
+    let requestedCalls = 0;
+    let pinnedCalls = 0;
+    const factoryModels: string[] = [];
+    const retry = certifyAnalyzeLlmRun(planInput(), {
+      execution,
+      createPinnedResumeAdapter(model) {
+        factoryModels.push(model);
+        return {
+          execution,
+          resumeExecution: pinnedResumeExecution(model),
+          async execute(work) {
+            pinnedCalls += 1;
+            return {
+              ...successfulOutcome(work),
+              completedAt: '2026-07-19T02:00:10.000Z',
+            };
+          },
+        };
+      },
+      async execute(work) {
+        requestedCalls += 1;
+        return successfulOutcome(work);
+      },
+    });
+    await expect(retry.inspectResumeCompatibility(identity)).resolves.toMatchObject({
+      compatible: true,
+      counts: { total: 2, reused: 1, pending: 1 },
+      observed: { modelSelection: 'resolved', resolvedModel },
+    });
+    const retryActivation = await retry.activateResume(identity, '2026-07-19T02:00:08.000Z');
+    expect(retryActivation).toMatchObject({
+      activated: true,
+      view: {
+        executionAttempt: {
+          number: 3,
+          resume: { executionPin: { modelSelection: 'resolved', resolvedModel } },
+        },
+      },
+    });
+    if (!retryActivation.activated) throw new Error('Expected exact-pin retry activation');
+    await expect(retry.executeResume(
+      retryActivation.activation,
+      '2026-07-19T02:00:09.000Z',
+    )).resolves.toMatchObject({
+      results: expect.any(Array),
+      usageLedger: expect.any(Array),
+    });
+    expect(factoryModels).toEqual([resolvedModel, resolvedModel]);
+    expect(requestedCalls).toBe(0);
+    expect(pinnedCalls).toBe(1);
   });
 
   it('executes only pending work and returns checkpointed results in certified plan order', async () => {
@@ -852,6 +1129,40 @@ function architecturePlanInput(analysisInputFingerprint: string) {
 async function createBlockedArchitectureRun(analysisInputFingerprint: string): Promise<void> {
   const sessionLimit = new LlmSessionLimitError('7pm');
   const certified = certifyAnalyzeLlmRun(architecturePlanInput(analysisInputFingerprint), {
+    execution: Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' }),
+    async execute() { throw sessionLimit; },
+  });
+  await dispatchAnalyzeRun(repoPath, {
+    kind: 'begin',
+    runId,
+    candidateAnalysisId: identity.candidateAnalysisId,
+    startedAt: identity.startedAt,
+    source: identity.source,
+    branch: identity.branch,
+    commitHash: identity.commitHash,
+    completedBaselineId: identity.completedBaselineId,
+  });
+  const activation = await sealAnalyzeRunPlan(repoPath, {
+    kind: 'seal-plan',
+    runId,
+    sealedAt: '2026-07-19T02:00:01.000Z',
+    work: certified.manifest.work.map(({ workId, inputFingerprint }) => ({
+      workId,
+      inputFingerprint,
+    })),
+  });
+  await expect(certified.execute(activation)).rejects.toBe(sessionLimit);
+  await dispatchAnalyzeRun(repoPath, {
+    kind: 'block',
+    runId,
+    blockedAt: '2026-07-19T02:00:03.000Z',
+    resetHint: '7pm',
+  });
+}
+
+async function createZeroCheckpointBlockedRun(): Promise<void> {
+  const sessionLimit = new LlmSessionLimitError('7pm');
+  const certified = certifyAnalyzeLlmRun(planInput(), {
     execution: Object.freeze({ provider: 'claude-code', requestedModel: 'sonnet' }),
     async execute() { throw sessionLimit; },
   });

@@ -81,10 +81,11 @@ update after the run file is written, TrueCourse repairs it from the journals'
 durable attempt sequence. The versioned run-journal schema is owned by
 `packages/core/src/lib/analyze-run-journal.ts`. Schema v6 records the explicit
 execution-attempt number and activation time and reserves the durable
-`activated`/`executing` resume-admission states. It distinguishes an exact
-provider/resolved-model pin from a requested-model bootstrap pin reserved for a
-later zero-checkpoint restart dependency; current checkpoint reuse still uses
-only the exact resolved-model form.
+`activated`/`executing` resume-admission states. Resume attempts that reuse a
+checkpoint carry an exact provider/resolved-model pin. A zero-checkpoint attempt
+instead records a requested-model bootstrap: its first successful call must
+prove a concrete model before that result is checkpointed, then every remaining
+call is pinned to that concrete model.
 It also records pending work,
 reset/failure information, durable execution admission, authenticated
 successful-work checkpoints, and an exact prepared finalization intent
