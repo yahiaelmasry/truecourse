@@ -102,13 +102,16 @@ the attempted-run journal before reporting that work item successful. Eligible
 journaled architecture runs therefore preserve paid successes. The
 production `resumeAnalyzeInProcess` command can reconstruct one explicitly
 selected blocked run, atomically revalidate it, replay its checkpoints, execute
-only pending work, and promote the candidate after complete finalization. CLI
-and dashboard Resume actions are not wired yet. The journal's internal
+only pending work, and promote the candidate after complete finalization. The
+read-only `truecourse analyze status` command shows the latest attempted run,
+durable progress, and advisory provider reset hint separately from the active
+completed analysis. Manual CLI and dashboard Resume actions remain later #791
+dependencies. The journal's internal
 admission boundary durably records `executing` and revalidates the exact
 provider/model pin before and after that write, before allowing pending work to
 start. The certified runner can recover with zero calls after the final
 checkpoint, and a prepared finalization can be replayed without provider work;
-CLI/dashboard wiring remains a later dependency. A
+CLI/dashboard Resume wiring remains a later dependency. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
 Resume accounting is derived once from the complete durable checkpoint ledger,
@@ -191,6 +194,7 @@ truecourse analyze                    # Analyze current repo (prompts before sta
 truecourse analyze --stash            # Pre-approve stashing pending changes (CI-friendly)
 truecourse analyze --no-stash         # Analyze working tree as-is, no stash
 truecourse analyze --diff             # New/resolved violations from your uncommitted changes
+truecourse analyze status             # Show latest attempted run + active completed analysis
 truecourse list                       # Show violations from latest analysis
 truecourse list --all                 # Show all violations (no pagination)
 truecourse list --diff                # Show diff check results

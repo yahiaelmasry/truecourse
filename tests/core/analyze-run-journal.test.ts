@@ -368,11 +368,13 @@ describe('analyze run journal', () => {
       plan: 'unsealed',
       counts: null,
       blocked: null,
+      lastProviderLimit: null,
       failure: null,
       finalization: null,
       resume: {
         available: false,
-        reason: 'successful-results-not-checkpointed',
+        scope: 'structural',
+        reason: 'run-not-resumable',
       },
     });
 
@@ -512,7 +514,7 @@ describe('analyze run journal', () => {
       finalization: {
         finalizingAt: '2026-07-19T01:30:02.000Z',
       },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: false, reason: 'finalization-unprepared' },
     });
     const journalPath = path.join(
       repoPath,
@@ -1338,6 +1340,11 @@ describe('analyze run journal', () => {
           executionPin: { resolvedModel: 'claude-opus-4-8' },
         },
       },
+      lastProviderLimit: {
+        resetHint: 'resets at 3am',
+        blockedAt: '2026-07-19T01:38:03.000Z',
+      },
+      resume: { available: true, mode: 'resume', requiresRevalidation: true },
     });
     expect(fs.readFileSync(latestPath)).toEqual(completedBefore);
     expect(fs.readFileSync(latestAttemptPath)).toEqual(attemptedBefore);
@@ -1814,7 +1821,7 @@ describe('analyze run journal', () => {
         failedAt: '2026-07-19T01:55:03.000Z',
       },
       finalization: { finalizingAt: '2026-07-19T01:55:02.000Z' },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: false, reason: 'run-failed' },
     });
   });
 
@@ -1906,10 +1913,11 @@ describe('analyze run journal', () => {
         resetHint: '7pm (Africa/Cairo)',
         blockedAt: '2026-07-19T02:00:02.000Z',
       },
-      resume: {
-        available: false,
-        reason: 'successful-results-not-checkpointed',
+      lastProviderLimit: {
+        resetHint: '7pm (Africa/Cairo)',
+        blockedAt: '2026-07-19T02:00:02.000Z',
       },
+      resume: { available: true, mode: 'resume', requiresRevalidation: true },
     });
 
     resetAnalyzeRunStorage();
@@ -1948,10 +1956,7 @@ describe('analyze run journal', () => {
         message: 'Project-aware C# analysis requires a restored solution.',
         failedAt: '2026-07-19T02:30:01.000Z',
       },
-      resume: {
-        available: false,
-        reason: 'successful-results-not-checkpointed',
-      },
+      resume: { available: false, reason: 'run-failed' },
     });
     resetAnalyzeRunStorage();
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toEqual(failed);
@@ -2040,7 +2045,7 @@ describe('analyze run journal', () => {
       state: 'failed',
       plan: 'sealed',
       counts: { total: 1, pending: 1, succeeded: 0, failed: 0 },
-      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+      resume: { available: false, reason: 'run-failed' },
     });
   });
 

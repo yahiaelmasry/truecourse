@@ -70,6 +70,33 @@ function isSupportedSchemaVersion(
 
 export type AnalyzeRunSource = 'cli' | 'dashboard' | 'hosted';
 
+export type AnalyzeRunResumeUnavailableReason =
+  | 'successful-results-not-checkpointed'
+  | 'checkpoint-execution-unbound'
+  | 'resume-execution-ambiguous'
+  | 'finalization-unprepared'
+  | 'run-failed'
+  | 'run-not-resumable'
+  | 'run-completed';
+
+export type AnalyzeRunResumeAvailability =
+  | Readonly<{
+      /**
+       * Structurally eligible only. The caller must also prove this is the exact latest
+       * attempt; production then revalidates every durable input before admission.
+       */
+      available: true;
+      scope: 'structural';
+      mode: 'resume';
+      requiresLatestAttempt: true;
+      requiresRevalidation: true;
+    }>
+  | Readonly<{
+      available: false;
+      scope: 'structural';
+      reason: AnalyzeRunResumeUnavailableReason;
+    }>;
+
 export interface BeginAnalyzeRunCommand {
   kind: 'begin';
   runId: string;
@@ -312,6 +339,12 @@ export interface AnalyzeRunView {
     resetHint: string;
     blockedAt: string;
   };
+  /** Most recent durable provider-limit report, retained after Resume activation. */
+  lastProviderLimit: null | {
+    reason: 'provider-session-limit';
+    resetHint: string;
+    blockedAt: string;
+  };
   failure: null | {
     code: string;
     message: string;
@@ -322,10 +355,7 @@ export interface AnalyzeRunView {
     persistence: 'unprepared' | 'prepared';
     preparedAt: string | null;
   };
-  resume: {
-    available: false;
-    reason: 'successful-results-not-checkpointed' | 'checkpoint-reuse-not-enabled' | 'run-completed';
-  };
+  resume: AnalyzeRunResumeAvailability;
 }
 
 export type StoredAnalyzeRunWork = {
@@ -1610,6 +1640,12 @@ export async function readAnalyzeRun(
   return stored ? toView(stored) : null;
 }
 
+/** Inspect the newest durable attempt without repairing or rewriting its pointer. */
+export async function inspectLatestAnalyzeRun(repoKey: string): Promise<AnalyzeRunView | null> {
+  const stored = await activeStorage.inspectLatest(repoKey);
+  return stored ? toView(stored) : null;
+}
+
 /** Persist one schema-validated provider success before the run may become terminal. */
 export async function checkpointAnalyzeRunWork(
   certification: AnalyzeRunWorkCheckpointCertification,
@@ -1724,6 +1760,28 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
         failed: 0,
       }
     : null;
+  const hasSafeSealedPlan = run.plan.state === 'sealed'
+    && run.plan.execution !== null
+    && !run.plan.work.some((work) => work.state === 'succeeded-uncheckpointed');
+  const recoveringActivated = run.status.state === 'running'
+    && run.executionAttempt.number > 1
+    && run.executionAttempt.resume?.admission === 'activated'
+    && hasSafeSealedPlan;
+  const recoveringCompletedExecution = run.status.state === 'running'
+    && run.executionAttempt.number > 1
+    && run.executionAttempt.resume?.admission === 'executing'
+    && run.plan.state === 'sealed'
+    && run.plan.execution !== null
+    && !run.plan.work.some((work) => work.state === 'succeeded-uncheckpointed')
+    && run.plan.work.every((work) => work.state === 'succeeded-checkpointed');
+  const recoveringPreparedFinalization = run.status.state === 'finalizing'
+    && run.finalizationIntent !== null;
+  const canAttemptResume = (
+    (run.status.state === 'blocked' && hasSafeSealedPlan)
+    || recoveringActivated
+    || recoveringCompletedExecution
+    || recoveringPreparedFinalization
+  );
   return {
     schemaVersion: run.schemaVersion,
     revision: run.revision,
@@ -1746,6 +1804,15 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
           blockedAt: run.status.blockedAt,
         }
       : null,
+    lastProviderLimit: run.status.state === 'blocked'
+      ? {
+          reason: run.status.reason,
+          resetHint: run.status.resetHint,
+          blockedAt: run.status.blockedAt,
+        }
+      : run.executionAttempt.resume === null
+        ? null
+        : structuredClone(run.executionAttempt.resume.resumedFrom),
     failure: run.status.state === 'failed'
       ? {
           code: run.status.code,
@@ -1766,16 +1833,44 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
             preparedAt: run.finalizationIntent?.preparedAt ?? null,
           }
         : null,
-    resume: {
-      available: false,
-      reason: run.status.state === 'completed'
-        ? 'run-completed'
-        : run.plan.state === 'sealed'
-          && run.plan.work.some((work) => work.state === 'succeeded-checkpointed')
-          ? 'checkpoint-reuse-not-enabled'
-          : 'successful-results-not-checkpointed',
-    },
+    resume: canAttemptResume
+      ? {
+          available: true,
+          scope: 'structural',
+          mode: 'resume',
+          requiresLatestAttempt: true,
+          requiresRevalidation: true,
+        }
+      : {
+          available: false,
+          scope: 'structural',
+          reason: resumeUnavailableReason(run),
+        },
   };
+}
+
+function resumeUnavailableReason(run: StoredAnalyzeRun): AnalyzeRunResumeUnavailableReason {
+  if (run.status.state === 'completed') return 'run-completed';
+  if (run.status.state === 'failed') return 'run-failed';
+  if (run.status.state === 'finalizing') return 'finalization-unprepared';
+  if (
+    run.status.state === 'running'
+    && run.executionAttempt.resume?.admission === 'executing'
+    && run.plan.state === 'sealed'
+    && run.plan.work.some((work) => work.state !== 'succeeded-checkpointed')
+  ) {
+    return 'resume-execution-ambiguous';
+  }
+  if (run.plan.state === 'sealed' && run.plan.execution === null) {
+    return 'checkpoint-execution-unbound';
+  }
+  if (
+    run.plan.state === 'sealed'
+    && run.plan.work.some((work) => work.state === 'succeeded-uncheckpointed')
+  ) {
+    return 'successful-results-not-checkpointed';
+  }
+  return 'run-not-resumable';
 }
 
 export async function beginFinalizeAnalyzeRun(

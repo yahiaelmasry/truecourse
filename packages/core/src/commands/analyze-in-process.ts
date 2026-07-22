@@ -109,11 +109,14 @@ export class AnalysisResumeUnavailableError extends Error {
 export type AnalyzeInProcessResult = PersistFullResult;
 
 export class AnalysisSessionLimitError extends LlmSessionLimitError {
+  readonly runId: string | null;
+
   constructor(error: LlmSessionLimitError) {
     super(error.resetHint);
     this.name = 'AnalysisSessionLimitError';
+    this.runId = error instanceof JournaledAnalyzeSessionLimitError ? error.runId : null;
     this.message = error instanceof JournaledAnalyzeSessionLimitError
-      ? `${this.message} The interrupted run was saved as the latest attempted run and any successful LLM results were checkpointed, but LATEST.json was not updated and the previous completed analysis remains unchanged. Core API callers can resume this attempted run after the provider limit resets to continue pending work and reuse any verified checkpoints. CLI/dashboard Resume actions are not wired yet; starting a new run may repeat those calls.`
+      ? `${this.message} The interrupted run was saved as the latest attempted run and any successful LLM results were checkpointed, but LATEST.json was not updated and the previous completed analysis remains unchanged. Inspect it with truecourse analyze status. Core API callers can attempt Resume after the provider limit resets; CLI/dashboard Resume actions remain later #791 dependencies, and starting a new run may repeat paid calls.`
       : `${this.message} The interrupted run was not saved, so LATEST.json was not updated and any previous completed analysis remains unchanged. Successful LLM calls from this interrupted run cannot be resumed yet and may be repeated when you rerun.`;
   }
 }

@@ -145,7 +145,7 @@ describe('analyze run successful-result checkpoints', () => {
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: false, reason: 'run-not-resumable' },
     });
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8'));
     expect(stored.plan.work.find((item: { state: string }) => item.state === 'succeeded-checkpointed'))
@@ -197,7 +197,7 @@ describe('analyze run successful-result checkpoints', () => {
 
     await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
       counts: { total: 2, pending: 0, succeeded: 2 },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: false, reason: 'run-not-resumable' },
     });
   });
 
@@ -214,7 +214,7 @@ describe('analyze run successful-result checkpoints', () => {
       state: 'blocked',
       counts: { total: 2, pending: 1, succeeded: 1 },
       blocked: { resetHint: '7pm (Africa/Cairo)' },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: true, mode: 'resume', requiresRevalidation: true },
     });
   });
 

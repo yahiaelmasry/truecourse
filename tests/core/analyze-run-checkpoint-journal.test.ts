@@ -122,7 +122,7 @@ describe('durable analyze-run work checkpoints', () => {
       revision: 3,
       state: 'running',
       counts: { total: 2, pending: 1, succeeded: 1 },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: false, reason: 'run-not-resumable' },
     });
     const stored = JSON.parse(fs.readFileSync(runFile(), 'utf8'));
     expect(stored.plan.work[0]).toMatchObject({

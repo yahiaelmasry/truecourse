@@ -128,7 +128,7 @@ describe('certified violation phase', () => {
       .resolves.toMatchObject({
         state: 'running',
         counts: { pending: 0, succeeded: 1 },
-        resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+        resume: { available: false, reason: 'run-not-resumable' },
       });
   });
 

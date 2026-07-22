@@ -4,6 +4,7 @@ import { Command } from "commander";
 import * as p from "@clack/prompts";
 import { runAdd } from "./commands/add.js";
 import { runAnalyze, runAnalyzeDiff } from "./commands/analyze.js";
+import { runAnalyzeStatus } from "./commands/analyze-runs.js";
 import {
   runDashboard,
   runDashboardStop,
@@ -115,7 +116,7 @@ function resolveInstallSkills(
   return undefined;
 }
 
-program
+const analyzeCmd = program
   .command("analyze")
   .description("Analyze the current repository")
   .option("--diff", "Run diff check against latest analysis")
@@ -140,6 +141,13 @@ program
     } else {
       await runAnalyze(common);
     }
+  });
+
+analyzeCmd
+  .command("status")
+  .description("Show the latest attempted run and active completed analysis")
+  .action(async () => {
+    await runAnalyzeStatus();
   });
 
 program

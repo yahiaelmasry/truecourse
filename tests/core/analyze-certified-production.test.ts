@@ -348,16 +348,20 @@ describe('certified full analyze production path', () => {
 
     expect(outcome).toMatchObject({
       ok: false,
-      error: { code: 'LLM_SESSION_LIMIT', resetHint: '7pm (Africa/Cairo)' },
+      error: {
+        code: 'LLM_SESSION_LIMIT',
+        resetHint: '7pm (Africa/Cairo)',
+        runId: expect.any(String),
+      },
     });
     expect(outcome.error instanceof Error ? outcome.error.message : '').toMatch(
-      /successful LLM results were checkpointed.*LATEST\.json was not updated.*starting a new run may repeat/is,
+      /successful LLM results were checkpointed.*LATEST\.json was not updated.*truecourse analyze status.*starting a new run may repeat paid calls/is,
     );
     await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
       state: 'blocked',
       blocked: { reason: 'provider-session-limit', resetHint: '7pm (Africa/Cairo)' },
       counts: { pending: expect.any(Number), succeeded: 0 },
-      resume: { available: false, reason: 'successful-results-not-checkpointed' },
+      resume: { available: true, mode: 'resume', requiresRevalidation: true },
     });
     expect(digest(latestPath)).toBe(latestBefore);
     expect(digest(historyPath)).toBe(historyBefore);
@@ -386,7 +390,7 @@ describe('certified full analyze production path', () => {
     await expect(readAnalyzeRun(workDir, 'latest-attempt')).resolves.toMatchObject({
       state: 'blocked',
       counts: { total: 2, pending: 1, succeeded: 1 },
-      resume: { available: false, reason: 'checkpoint-reuse-not-enabled' },
+      resume: { available: true, mode: 'resume', requiresRevalidation: true },
     });
     await expect(readLatest(workDir)).resolves.toMatchObject({
       analysis: { id: baseline.analysisId, status: 'completed' },
@@ -737,7 +741,7 @@ describe('certified full analyze production path', () => {
       resetHint: 'tomorrow 8pm (Africa/Cairo)',
     });
     expect(failure instanceof Error ? failure.message : '').toMatch(
-      /saved as the latest attempted run.*Core API callers can resume.*CLI\/dashboard Resume actions are not wired yet.*starting a new run may repeat/is,
+      /saved as the latest attempted run.*truecourse analyze status.*Core API callers can attempt Resume.*CLI\/dashboard Resume actions remain later.*starting a new run may repeat paid calls/is,
     );
 
     expect(provider.stages).toEqual(['analyze.module']);

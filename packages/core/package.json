@@ -8,6 +8,10 @@
       "types": "./dist/commands/analyze-in-process.d.ts",
       "import": "./dist/commands/analyze-in-process.js"
     },
+    "./commands/analyze-run-status": {
+      "types": "./dist/commands/analyze-run-status.d.ts",
+      "import": "./dist/commands/analyze-run-status.js"
+    },
     "./commands/analyze-core": {
       "types": "./dist/commands/analyze-core.d.ts",
       "import": "./dist/commands/analyze-core.js"
