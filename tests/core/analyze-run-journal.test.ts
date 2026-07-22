@@ -205,6 +205,204 @@ afterEach(() => {
 });
 
 describe('analyze run journal', () => {
+  it('exposes exact-latest initial ambiguity without rewriting durable schema v8', async () => {
+    const runId = 'latest-initial-ambiguous';
+    const startedAt = '2026-07-22T10:00:00.000Z';
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId,
+      candidateAnalysisId: 'latest-initial-analysis',
+      startedAt,
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'initial-ambiguous-commit',
+      completedBaselineId: null,
+    });
+    const work = [
+      { workId: 'analyze:v1:done', inputFingerprint: `sha256:${'a'.repeat(64)}` },
+      { workId: 'analyze:v1:pending-1', inputFingerprint: `sha256:${'b'.repeat(64)}` },
+      { workId: 'analyze:v1:pending-2', inputFingerprint: `sha256:${'c'.repeat(64)}` },
+    ];
+    const activation = await sealAnalyzeRunPlan(repoPath, {
+      kind: 'seal-plan',
+      runId,
+      sealedAt: '2026-07-22T10:00:01.000Z',
+      execution: { provider: 'claude-code', requestedModel: 'sonnet' },
+      work,
+    });
+    await admitInitialExecutionForTest(
+      activation,
+      runId,
+      work,
+      '2026-07-22T10:00:02.000Z',
+    );
+
+    const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+    const result = { violations: [] };
+    stored.revision = 3;
+    stored.updatedAt = '2026-07-22T10:00:03.000Z';
+    stored.plan.work[0] = {
+      ...stored.plan.work[0],
+      state: 'succeeded-checkpointed',
+      checkpoint: {
+        checkpointedAt: '2026-07-22T10:00:03.000Z',
+        attemptId: 'initial-attempt:done',
+        resultContractId: 'analyze.code@1',
+        resultFingerprint: fingerprint(result),
+        result,
+        usage: null,
+      },
+    };
+    fs.writeFileSync(file, JSON.stringify(stored));
+    const bytesBefore = fs.readFileSync(file);
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      schemaVersion: 8,
+      revision: 3,
+      rearm: {
+        evidence: {
+          runId,
+          runRevision: 3,
+          executionEpoch: {
+            kind: 'initial',
+            attemptNumber: 1,
+            activatedAt: startedAt,
+          },
+          admittedAt: '2026-07-22T10:00:02.000Z',
+          pendingWorkCount: 2,
+        },
+        checkpointedWorkCount: 1,
+        maxRepeatProviderCalls: 2,
+      },
+    });
+    await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({ rearm: null });
+    expect(fs.readFileSync(file)).toEqual(bytesBefore);
+  });
+
+  it('binds exact-latest resumed ambiguity to the resumed epoch without rewriting schema v8', async () => {
+    const runId = 'latest-resumed-ambiguous';
+    const startedAt = '2026-07-22T11:00:00.000Z';
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId,
+      candidateAnalysisId: 'latest-resumed-analysis',
+      startedAt,
+      source: 'dashboard',
+      branch: 'main',
+      commitHash: 'resumed-ambiguous-commit',
+      completedBaselineId: null,
+    });
+    const work = [
+      { workId: 'analyze:v1:reused', inputFingerprint: `sha256:${'d'.repeat(64)}` },
+      { workId: 'analyze:v1:pending-1', inputFingerprint: `sha256:${'e'.repeat(64)}` },
+      { workId: 'analyze:v1:pending-2', inputFingerprint: `sha256:${'f'.repeat(64)}` },
+    ];
+    const activation = await sealAnalyzeRunPlan(repoPath, {
+      kind: 'seal-plan',
+      runId,
+      sealedAt: '2026-07-22T11:00:01.000Z',
+      execution: { provider: 'claude-code', requestedModel: 'sonnet' },
+      work,
+    });
+    await admitInitialExecutionForTest(
+      activation,
+      runId,
+      work,
+      '2026-07-22T11:00:02.000Z',
+    );
+
+    const file = path.join(repoPath, '.truecourse', 'analyses', 'runs', `${runId}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, any>;
+    const result = { violations: [] };
+    stored.revision = 6;
+    stored.updatedAt = '2026-07-22T11:00:06.000Z';
+    stored.executionAttempt = {
+      number: 2,
+      activatedAt: '2026-07-22T11:00:05.000Z',
+      initialAdmission: null,
+      resume: {
+        admission: 'executing',
+        admittedAt: '2026-07-22T11:00:06.000Z',
+        resumedFrom: {
+          reason: 'provider-session-limit',
+          resetHint: 'resets at 1pm',
+          blockedAt: '2026-07-22T11:00:04.000Z',
+        },
+        executionPin: {
+          provider: 'claude-code',
+          requestedModel: 'sonnet',
+          modelSelection: 'resolved',
+          resolvedModel: 'claude-sonnet-4-6',
+        },
+      },
+    };
+    stored.plan.work[0] = {
+      ...stored.plan.work[0],
+      state: 'succeeded-checkpointed',
+      checkpoint: {
+        checkpointedAt: '2026-07-22T11:00:03.000Z',
+        attemptId: 'initial-attempt:reused',
+        resultContractId: 'analyze.code@1',
+        resultFingerprint: fingerprint(result),
+        result,
+        usage: null,
+      },
+    };
+    fs.writeFileSync(file, JSON.stringify(stored));
+    const bytesBefore = fs.readFileSync(file);
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      schemaVersion: 8,
+      revision: 6,
+      rearm: {
+        evidence: {
+          runId,
+          runRevision: 6,
+          executionEpoch: {
+            kind: 'resume',
+            attemptNumber: 2,
+            activatedAt: '2026-07-22T11:00:05.000Z',
+          },
+          admittedAt: '2026-07-22T11:00:06.000Z',
+          pendingWorkCount: 2,
+        },
+        checkpointedWorkCount: 1,
+        maxRepeatProviderCalls: 2,
+      },
+    });
+    expect(fs.readFileSync(file)).toEqual(bytesBefore);
+
+    const noncanonical = structuredClone(stored);
+    noncanonical.executionAttempt.resume.admittedAt = '2026-07-22T13:00:06+02:00';
+    noncanonical.updatedAt = '2026-07-22T11:00:07.000Z';
+    noncanonical.plan.work[0].checkpoint.checkpointedAt = '2026-07-22T11:00:07.000Z';
+    fs.writeFileSync(file, JSON.stringify(noncanonical));
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt'))
+      .rejects.toBeInstanceOf(AnalyzeRunJournalCorruptError);
+
+    stored.schemaVersion = 7;
+    delete stored.executionAttempt.initialAdmission;
+    fs.writeFileSync(file, JSON.stringify(stored));
+    const legacyBytesBefore = fs.readFileSync(file);
+    resetAnalyzeRunStorage();
+
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
+      schemaVersion: 8,
+      revision: 6,
+      executionAttempt: {
+        number: 2,
+        resume: { admission: 'executing', admittedAt: '2026-07-22T11:00:06.000Z' },
+      },
+      rearm: null,
+    });
+    expect(fs.readFileSync(file)).toEqual(legacyBytesBefore);
+  });
+
   it('exports the hosted storage seam through the core package', async () => {
     const exported = await import('@truecourse/core/lib/analyze-run-journal');
 
@@ -405,6 +603,7 @@ describe('analyze run journal', () => {
         scope: 'structural',
         reason: 'run-not-resumable',
       },
+      rearm: null,
     });
 
     resetAnalyzeRunStorage();
@@ -1352,7 +1551,7 @@ describe('analyze run journal', () => {
       const bytesBefore = fs.readFileSync(file);
       resetAnalyzeRunStorage();
 
-      await expect(readAnalyzeRun(repoPath, { runId })).resolves.toMatchObject({
+      await expect(readAnalyzeRun(repoPath, 'latest-attempt')).resolves.toMatchObject({
         schemaVersion: 8,
         revision: 1,
         executionAttempt: {
@@ -1360,6 +1559,7 @@ describe('analyze run journal', () => {
           initialAdmission: { admission, admittedAt: null, evidence },
         },
         resume: { available: false, reason },
+        rearm: null,
       });
       expect(fs.readFileSync(file)).toEqual(bytesBefore);
     },
@@ -1548,7 +1748,7 @@ describe('analyze run journal', () => {
       '2026-07-19T01:36:56.000Z',
     );
 
-    await expect(readAnalyzeRun(repoPath, { runId: 'checkpointed-initial-admission' }))
+    await expect(readAnalyzeRun(repoPath, 'latest-attempt'))
       .resolves.toMatchObject({
         state: 'running',
         counts: { pending: 0, succeeded: 1 },
@@ -1556,6 +1756,7 @@ describe('analyze run journal', () => {
           initialAdmission: { admission: 'executing', evidence: 'explicit' },
         },
         resume: { available: false, reason: 'run-not-resumable' },
+        rearm: null,
       });
   });
 

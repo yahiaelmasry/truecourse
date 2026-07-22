@@ -43,6 +43,11 @@ import {
   inspectAnalyzeRunResumeActivationCertification,
   type AnalyzeRunResumeActivationCertification,
 } from './analyze-run-resume-activation-certification.js';
+import {
+  buildAnalyzeRunAmbiguousRearmOffer,
+  type AnalyzeRunAmbiguousRearmExecutionEpochState,
+  type AnalyzeRunAmbiguousRearmOffer,
+} from './analyze-run-ambiguous-rearm.js';
 import { certifyClaudeSessionResetAt } from '@truecourse/shared/llm';
 
 export type { AnalyzeRunExecutionCompletion } from './analyze-run-execution-completion.js';
@@ -389,6 +394,8 @@ export interface AnalyzeRunView {
     preparedAt: string | null;
   };
   resume: AnalyzeRunResumeAvailability;
+  /** Exact-latest structural risk evidence; execution still requires full revalidation. */
+  rearm: AnalyzeRunAmbiguousRearmOffer | null;
 }
 
 export type StoredAnalyzeRunWork = {
@@ -449,6 +456,11 @@ export interface StoredAnalyzeRun {
         work: StoredAnalyzeRunWork[];
       };
 }
+
+const sourceAnalyzeRunSchemaVersions = new WeakMap<
+  StoredAnalyzeRun,
+  ParsedLatestAttemptPointer['schemaVersion']
+>();
 
 export type NewStoredAnalyzeRun = Omit<StoredAnalyzeRun, 'attemptSequence'>;
 
@@ -1701,13 +1713,13 @@ export async function readAnalyzeRun(
   const stored = selector === 'latest-attempt'
     ? await activeStorage.readLatest(repoKey)
     : await activeStorage.read(repoKey, validateRunId(selector.runId));
-  return stored ? toView(stored) : null;
+  return stored ? toView(stored, selector === 'latest-attempt') : null;
 }
 
 /** Inspect the newest durable attempt without repairing or rewriting its pointer. */
 export async function inspectLatestAnalyzeRun(repoKey: string): Promise<AnalyzeRunView | null> {
   const stored = await activeStorage.inspectLatest(repoKey);
-  return stored ? toView(stored) : null;
+  return stored ? toView(stored, true) : null;
 }
 
 /** Persist one schema-validated provider success before the run may become terminal. */
@@ -1833,7 +1845,7 @@ export async function checkpointAnalyzeRunWork(
   }
 }
 
-function toView(run: StoredAnalyzeRun): AnalyzeRunView {
+function toView(run: StoredAnalyzeRun, isLatestAttempt = false): AnalyzeRunView {
   const counts = run.plan.state === 'sealed'
     ? {
         total: run.plan.work.length,
@@ -1936,6 +1948,47 @@ function toView(run: StoredAnalyzeRun): AnalyzeRunView {
           scope: 'structural',
           reason: resumeUnavailableReason(run),
         },
+    rearm: buildAnalyzeRunAmbiguousRearmOffer({
+      isLatestAttempt,
+      admissionEvidence: (sourceAnalyzeRunSchemaVersions.get(run) ?? SCHEMA_VERSION)
+          === SCHEMA_VERSION
+        ? 'current-schema'
+        : 'legacy-schema',
+      runId: run.runId,
+      runRevision: run.revision,
+      state: run.status.state,
+      finalizationPresent: run.finalizationIntent !== null,
+      executionEpoch: ambiguousRearmExecutionEpoch(run.executionAttempt),
+      plan: run.plan.state === 'unsealed'
+        ? { state: 'unsealed' }
+        : {
+            state: 'sealed',
+            executionBound: run.plan.execution !== null,
+            workStates: run.plan.work.map((work) => work.state),
+          },
+    }),
+  };
+}
+
+function ambiguousRearmExecutionEpoch(
+  attempt: AnalyzeRunExecutionAttempt,
+): AnalyzeRunAmbiguousRearmExecutionEpochState {
+  if (attempt.number === 1) {
+    return {
+      kind: 'initial',
+      attemptNumber: attempt.number,
+      activatedAt: attempt.activatedAt,
+      admission: attempt.initialAdmission?.admission ?? 'ambiguous',
+      admittedAt: attempt.initialAdmission?.admittedAt ?? null,
+      evidence: attempt.initialAdmission?.evidence ?? 'legacy-ambiguous',
+    };
+  }
+  return {
+    kind: 'resume',
+    attemptNumber: attempt.number,
+    activatedAt: attempt.activatedAt,
+    admission: attempt.resume?.admission ?? 'activated',
+    admittedAt: attempt.resume?.admittedAt ?? null,
   };
 }
 
@@ -3004,7 +3057,7 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     ? revision + 1
     : lifecycleRevision;
 
-  return {
+  const stored: StoredAnalyzeRun = {
     schemaVersion: SCHEMA_VERSION,
     attemptSequence: value.attemptSequence as number,
     revision: normalizedRevision,
@@ -3021,6 +3074,8 @@ function parseStoredRunUnchecked(value: unknown, file: string): StoredAnalyzeRun
     finalizationIntent,
     plan,
   };
+  sourceAnalyzeRunSchemaVersions.set(stored, schemaVersion);
+  return stored;
 }
 
 function parseStoredFinalizationIntent(
@@ -3170,6 +3225,15 @@ function parseStoredExecutionAttempt(
   if (value.initialAdmission !== null) {
     throw new AnalyzeRunJournalCorruptError(
       `Resumed analyze attempt contains initial admission state: ${file}`,
+    );
+  }
+  const resumedAdmittedAt = legacyShape.resume?.admittedAt ?? null;
+  if (
+    resumedAdmittedAt !== null
+    && new Date(resumedAdmittedAt).toISOString() !== resumedAdmittedAt
+  ) {
+    throw new AnalyzeRunJournalCorruptError(
+      `Resumed execution admission timestamp is not canonical UTC: ${file}`,
     );
   }
   return { ...legacyShape, initialAdmission: null };

@@ -75,8 +75,14 @@ export async function readAnalyzeRunStatus(repositoryKey: string): Promise<Analy
       );
     }
   }
+  const visibleLatestAttempt = latestAttempt !== null
+    && latestAttempt.rearm !== null
+    && activeCompletedId !== null
+    && latestAttempt.completedBaselineId !== activeCompletedId
+    ? { ...latestAttempt, rearm: null }
+    : latestAttempt;
   return {
-    latestAttempt,
+    latestAttempt: visibleLatestAttempt,
     activeCompletedAnalysis: latest && activeCompletedId
       ? {
           analysisId: activeCompletedId,

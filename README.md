@@ -163,6 +163,16 @@ checkpoint, and a prepared finalization can be replayed without provider work;
 the CLI's optional reset wait does not schedule or durably rearm a run. A
 crash in an admitted attempt while work is still pending fails closed as
 ambiguous rather than guessing whether an uncheckpointed provider call ran.
+For an exact latest schema-v8 attempt, the core read model can describe that
+ambiguity as a structural rearm offer. The evidence binds the run revision,
+initial or resumed execution epoch, admission time, and literal pending-work
+count, and reports every pending item as the maximum possible repeated-provider
+call exposure. This offer does not authorize or perform a retry: callers must
+obtain exact duplicate-charge acknowledgement, then a later execution boundary
+must revalidate the latest attempt and every durable input before any provider
+contact. Legacy journals, historical run-ID reads, and unsafe or fully
+checkpointed states expose no rearm offer. Inspection does not change the
+schema or rewrite the attempted-run journal or completed `LATEST.json` baseline.
 Resume accounting is derived once from the complete durable checkpoint ledger,
 deduplicated by provider attempt ID, and preserves each call's original
 checkpoint timestamp while discarding the provider's overlapping transient

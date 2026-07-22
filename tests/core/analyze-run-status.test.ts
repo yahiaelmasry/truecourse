@@ -38,6 +38,111 @@ afterEach(() => {
 });
 
 describe('analyze run status', () => {
+  it('shows bounded duplicate-spend evidence only on the latest attempted run', async () => {
+    const work = [
+      { workId: 'analyze:v1:pending-1', inputFingerprint: `sha256:${'a'.repeat(64)}` },
+      { workId: 'analyze:v1:pending-2', inputFingerprint: `sha256:${'b'.repeat(64)}` },
+    ];
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'latest-ambiguous-attempt',
+      candidateAnalysisId: 'latest-ambiguous-analysis',
+      startedAt: '2026-07-22T12:00:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'ambiguous123',
+      completedBaselineId: null,
+    });
+    const activation = await sealAnalyzeRunPlan(repoPath, {
+      kind: 'seal-plan',
+      runId: 'latest-ambiguous-attempt',
+      sealedAt: '2026-07-22T12:00:01.000Z',
+      execution: {
+        provider: 'claude-cli',
+        requestedModel: 'sonnet',
+        promptSchemaVersion: 'test-prompt-v1',
+        outputSchemaVersion: 'test-output-v1',
+      },
+      work,
+    });
+    await admitInitialExecutionForTest(
+      activation,
+      'latest-ambiguous-attempt',
+      work,
+      '2026-07-22T12:00:02.000Z',
+    );
+
+    await expect(readAnalyzeRunStatus(repoPath)).resolves.toMatchObject({
+      latestAttempt: {
+        runId: 'latest-ambiguous-attempt',
+        resume: { available: false, reason: 'resume-execution-ambiguous' },
+        rearm: {
+          evidence: {
+            runId: 'latest-ambiguous-attempt',
+            runRevision: 2,
+            executionEpoch: {
+              kind: 'initial',
+              attemptNumber: 1,
+              activatedAt: '2026-07-22T12:00:00.000Z',
+            },
+            admittedAt: '2026-07-22T12:00:02.000Z',
+            pendingWorkCount: 2,
+          },
+          maxRepeatProviderCalls: 2,
+          requiredAcknowledgement: 'possible-duplicate-provider-charges',
+        },
+      },
+      activeCompletedAnalysis: null,
+    });
+  });
+
+  it('does not offer rearm after a newer completed baseline supersedes the attempt', async () => {
+    const completed = completedLatest();
+    await writeLatest(repoPath, completed);
+    const work = [{
+      workId: 'analyze:v1:superseded-pending',
+      inputFingerprint: `sha256:${'c'.repeat(64)}`,
+    }];
+    await dispatchAnalyzeRun(repoPath, {
+      kind: 'begin',
+      runId: 'superseded-ambiguous-attempt',
+      candidateAnalysisId: 'superseded-ambiguous-analysis',
+      startedAt: '2026-07-22T12:10:00.000Z',
+      source: 'cli',
+      branch: 'main',
+      commitHash: 'superseded123',
+      completedBaselineId: 'older-completed-analysis',
+    });
+    const activation = await sealAnalyzeRunPlan(repoPath, {
+      kind: 'seal-plan',
+      runId: 'superseded-ambiguous-attempt',
+      sealedAt: '2026-07-22T12:10:01.000Z',
+      execution: {
+        provider: 'claude-cli',
+        requestedModel: 'sonnet',
+        promptSchemaVersion: 'test-prompt-v1',
+        outputSchemaVersion: 'test-output-v1',
+      },
+      work,
+    });
+    await admitInitialExecutionForTest(
+      activation,
+      'superseded-ambiguous-attempt',
+      work,
+      '2026-07-22T12:10:02.000Z',
+    );
+
+    await expect(readAnalyzeRunStatus(repoPath)).resolves.toMatchObject({
+      latestAttempt: {
+        runId: 'superseded-ambiguous-attempt',
+        completedBaselineId: 'older-completed-analysis',
+        resume: { available: false, reason: 'resume-execution-ambiguous' },
+        rearm: null,
+      },
+      activeCompletedAnalysis: { analysisId: completed.analysis.id },
+    });
+  });
+
   it('keeps the latest interrupted attempt separate from the active completed analysis', async () => {
     const completed = completedLatest();
     await writeLatest(repoPath, completed);

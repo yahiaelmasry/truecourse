@@ -175,5 +175,6 @@ function run(options: {
           scope: 'structural',
           reason: options.resumeReason ?? 'run-not-resumable',
         },
+    rearm: null,
   };
 }
