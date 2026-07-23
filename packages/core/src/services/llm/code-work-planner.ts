@@ -210,7 +210,7 @@ export function planCodeViolationWork(
 ): PlannedCodeViolationWork {
   const repositoryRoot = execution.repositoryRoot;
   const preparedContext = canonicalContext(context, repositoryRoot);
-  const request = prepareCodeViolationRequest(preparedContext);
+  const request = prepareCodeViolationRequest(preparedContext, repositoryRoot);
   const sources = canonicalSources(preparedContext, repositoryRoot);
   const sourceScopes = canonicalSourceScopes(preparedContext.sourceScopes, repositoryRoot);
   const ruleKeys = [...new Set(preparedContext.llmRules.map((rule) => rule.key))].sort(compareText);

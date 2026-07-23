@@ -69,7 +69,10 @@ const codeContext: CodeViolationContext = {
 function withPrior<T extends ServiceViolationContext | DatabaseViolationContext | ModuleViolationContext>(
   context: T,
 ): T {
-  return { ...structuredClone(context), existingViolations: [prior] };
+  return {
+    ...structuredClone(context),
+    existingViolations: [{ ...prior, ruleKey: context.llmRules[0]?.key }],
+  };
 }
 
 function lifecycleCodeContext(): CodeViolationContext {
@@ -301,6 +304,38 @@ describe('planned violation result materialization', () => {
 
     expect(materialized.result).toEqual({
       violations: [expect.objectContaining({ filePath: 'src/orders.ts' })],
+    });
+  });
+
+  it('maps a portable full-file prompt path back to its runtime checkout path', () => {
+    const runtimePath = '/checkout/one/src/orders.ts';
+    const fullFileContext: CodeViolationContext = {
+      files: [{ path: runtimePath, content: 'export const order = 1;' }],
+      sourceScopes: [{ path: runtimePath, ranges: [{ lineStart: 1, lineEnd: 1 }] }],
+      sources: [{ path: runtimePath, selection: { kind: 'full-file' } }],
+      llmRules: [{ ...rule, key: 'bugs/llm/review' }],
+      tier: 'full-file',
+    };
+    const work = certified('code', 'bugs', 'normal', planCodeViolationWork(fullFileContext, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    }));
+
+    const materialized = materializePlannedViolationResult(
+      {
+        work,
+        result: {
+          violations: [{
+            ruleKey: 'bugs/llm/review', filePath: 'src/orders.ts', lineStart: 1, lineEnd: 1,
+            severity: 'high', title: 'Code issue', content: 'Fix code.', fixPrompt: null,
+          }],
+        },
+      },
+      { createId: () => 'unused', createdAt: () => '2026-07-19T12:00:00.000Z' },
+    );
+
+    expect(materialized.result).toEqual({
+      violations: [expect.objectContaining({ filePath: runtimePath, sourceTier: 'full-file' })],
     });
   });
 });
