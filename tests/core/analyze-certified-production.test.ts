@@ -142,6 +142,112 @@ class TargetedCodeCheckpointThenLimitProvider extends ClaudeCodeProvider {
   }
 }
 
+class DatabaseCheckpointThenLimitProvider extends ClaudeCodeProvider {
+  readonly stages: string[] = [];
+
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string },
+  ): Promise<string> {
+    const stage = options?.stage ?? 'unknown';
+    this.stages.push(stage);
+    if (stage === 'analyze.module') {
+      throw new LlmSessionLimitError('7pm (Africa/Cairo)');
+    }
+    const structuredOutput = stage === 'analyze.database'
+      ? {
+          violations: [{
+            type: 'database',
+            title: 'Checkpointed database finding',
+            content: 'The Order table needs a durable audit timestamp.',
+            severity: 'high',
+            targetDatabaseId: 'db-0',
+            targetTable: 'Order',
+            fixPrompt: null,
+            ruleKey: 'database/llm/missing-timestamps',
+          }],
+        }
+      : { violations: [], serviceDescriptions: [] };
+    return JSON.stringify({
+      structured_output: structuredOutput,
+      usage: { input_tokens: 100, output_tokens: 20 },
+      modelUsage: { 'claude-sonnet-4-5-20250929': { inputTokens: 100 } },
+      total_cost_usd: 0.0123,
+    });
+  }
+}
+
+class DatabaseSeedFindingProvider extends ClaudeCodeProvider {
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string },
+  ): Promise<string> {
+    const structuredOutput = options?.stage === 'analyze.database'
+      ? {
+          violations: [{
+            type: 'database',
+            title: 'Persistent database finding',
+            content: 'The Order table needs a durable audit timestamp.',
+            severity: 'high',
+            targetDatabaseId: 'db-0',
+            targetTable: 'Order',
+            fixPrompt: null,
+            ruleKey: 'database/llm/missing-timestamps',
+          }],
+        }
+      : { violations: [], serviceDescriptions: [] };
+    return JSON.stringify({
+      structured_output: structuredOutput,
+      usage: { input_tokens: 100, output_tokens: 20 },
+      modelUsage: { 'claude-sonnet-4-5-20250929': { inputTokens: 100 } },
+      total_cost_usd: 0.0123,
+    });
+  }
+}
+
+class DatabaseLifecycleCheckpointThenLimitProvider extends ClaudeCodeProvider {
+  readonly stages: string[] = [];
+
+  constructor() {
+    super(undefined, 'sonnet');
+  }
+
+  protected async spawnCLI(
+    _prompt: string,
+    _schema: string,
+    options?: { stage?: string },
+  ): Promise<string> {
+    const stage = options?.stage ?? 'unknown';
+    this.stages.push(stage);
+    if (stage === 'analyze.module') {
+      throw new LlmSessionLimitError('7pm (Africa/Cairo)');
+    }
+    const structuredOutput = stage === 'analyze.database-lifecycle'
+      ? {
+          resolvedViolationIds: ['prev-0'],
+          unchangedViolationIds: [],
+          newViolations: [],
+        }
+      : { violations: [], serviceDescriptions: [] };
+    return JSON.stringify({
+      structured_output: structuredOutput,
+      usage: { input_tokens: 100, output_tokens: 20 },
+      modelUsage: { 'claude-sonnet-4-5-20250929': { inputTokens: 100 } },
+      total_cost_usd: 0.0123,
+    });
+  }
+}
+
 class ResumingDirectClaudeProvider extends ClaudeCodeProvider {
   readonly stages: string[] = [];
   readonly modelOverrides: (string | undefined)[] = [];
@@ -395,6 +501,34 @@ describe('certified full analyze production path', () => {
     return { baseline, attempt, offer: attempt.rearm };
   }
 
+  function installDatabaseFixture(): void {
+    fs.writeFileSync(path.join(workDir, 'package.json'), JSON.stringify({
+      name: 'certified-production-fixture',
+      type: 'module',
+      dependencies: { '@prisma/client': '6.0.0' },
+    }));
+    fs.mkdirSync(path.join(workDir, 'prisma'), { recursive: true });
+    fs.writeFileSync(path.join(workDir, 'prisma', 'schema.prisma'), `
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Order {
+  id String @id
+}
+`);
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 't@t',
+    };
+    execSync('git add -A', { cwd: workDir, env });
+    execSync('git -c commit.gpgsign=false commit -q -m database-fixture', { cwd: workDir, env });
+  }
+
   function exactAmbiguousConsent(
     offer: AnalyzeRunAmbiguousRearmOffer,
   ): AnalyzeRunAmbiguousRearmConsent {
@@ -548,6 +682,115 @@ describe('certified full analyze production path', () => {
         expect.objectContaining({ totalTokens: 120 }),
         expect.objectContaining({ totalTokens: 120 }),
       ],
+    });
+  }, 30_000);
+
+  it('resumes pending sibling work without repeating a checkpointed database check', async () => {
+    installDatabaseFixture();
+    await writeProjectConfig(workDir, { enabledCategories: ['architecture', 'database'] });
+    await analyzeInProcess(project, {
+      enableLlmRulesOverride: false,
+      skipStash: true,
+    });
+
+    const initialProvider = new DatabaseCheckpointThenLimitProvider();
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: initialProvider,
+      enabledCategoriesOverride: ['architecture', 'database'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+
+    expect(blocked).toMatchObject({
+      state: 'blocked',
+      counts: { total: 3, succeeded: 2, pending: 1 },
+    });
+    expect([...initialProvider.stages].sort()).toEqual([
+      'analyze.database',
+      'analyze.module',
+      'analyze.service',
+    ]);
+
+    resetAnalyzeRunStorage();
+    const resumeProvider = new ResumingDirectClaudeProvider();
+    const resumed = await resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
+      provider: resumeProvider,
+    });
+
+    expect(resumeProvider.stages).toEqual(['analyze.module']);
+    const snapshot = await readAnalysis(workDir, resumed.filename);
+    const runtimeDatabaseId = snapshot?.graph.databases.find(({ name }) => name === 'postgres')?.id;
+    await expect(readLatest(workDir)).resolves.toMatchObject({
+      analysis: { id: resumed.analysisId, status: 'completed' },
+      violations: expect.arrayContaining([
+        expect.objectContaining({
+          title: 'Checkpointed database finding',
+          targetDatabaseId: runtimeDatabaseId,
+          targetTable: 'Order',
+        }),
+      ]),
+    });
+  }, 30_000);
+
+  it('resumes a checkpointed database lifecycle partition without repeating the paid check', async () => {
+    installDatabaseFixture();
+    await writeProjectConfig(workDir, { enabledCategories: ['architecture', 'database'] });
+    await analyzeInProcess(project, {
+      source: 'cli',
+      provider: new DatabaseSeedFindingProvider(),
+      enabledCategoriesOverride: ['architecture', 'database'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    });
+    const previous = (await readLatest(workDir))?.violations.find(
+      (violation) => violation.title === 'Persistent database finding',
+    );
+    expect(previous).toMatchObject({
+      status: 'new',
+      targetDatabaseName: 'postgres',
+      targetTable: 'Order',
+    });
+
+    const initialProvider = new DatabaseLifecycleCheckpointThenLimitProvider();
+    await expect(analyzeInProcess(project, {
+      source: 'cli',
+      provider: initialProvider,
+      enabledCategoriesOverride: ['architecture', 'database'],
+      enableLlmRulesOverride: true,
+      onLlmEstimate: async () => true,
+      skipStash: true,
+    })).rejects.toMatchObject({ code: 'LLM_SESSION_LIMIT' });
+    const blocked = await readAnalyzeRun(workDir, 'latest-attempt');
+    expect(blocked).toMatchObject({
+      state: 'blocked',
+      counts: { total: 3, succeeded: 2, pending: 1 },
+    });
+    expect([...initialProvider.stages].sort()).toEqual([
+      'analyze.database-lifecycle',
+      'analyze.module',
+      'analyze.service',
+    ]);
+
+    resetAnalyzeRunStorage();
+    const resumeProvider = new ResumingDirectClaudeProvider();
+    const resumed = await resumeAnalyzeInProcess(project, {
+      runId: blocked!.runId,
+      provider: resumeProvider,
+    });
+
+    expect(resumeProvider.stages).toEqual(['analyze.module']);
+    await expect(readAnalysis(workDir, resumed.filename)).resolves.toMatchObject({
+      id: resumed.analysisId,
+      violations: {
+        resolved: expect.arrayContaining([
+          expect.objectContaining({ id: previous!.id }),
+        ]),
+      },
     });
   }, 30_000);
 
