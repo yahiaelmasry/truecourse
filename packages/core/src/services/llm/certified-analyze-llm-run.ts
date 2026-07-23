@@ -39,6 +39,7 @@ import {
   planCodeViolationWork,
   type PlannedCodeViolationWork,
 } from './code-work-planner.js';
+import { compileInlineFullFileCodeWork } from './inline-full-file-code-work.js';
 import {
   planDatabaseViolationWork,
   type PlannedDatabaseViolationWork,
@@ -336,18 +337,14 @@ export function certifyAnalyzeLlmRun(
   for (const candidate of input.code) {
     work.push(certify('code', candidate.domain, () => {
       validateCodeDomain(candidate.domain, candidate.context);
-      const planned = planCodeViolationWork(candidate.context, {
+      const executionIntent = {
         ...execution,
         repositoryRoot: input.repositoryRoot,
-      });
-      if (planned.request.toolPolicy === 'read') {
-        throw new AnalyzeLlmPlanError(
-          'read-snapshot-unavailable',
-          'Read-enabled analyze work requires a certified repository snapshot',
-          'code',
-          candidate.domain,
-        );
-      }
+      };
+      const readPlan = planCodeViolationWork(candidate.context, executionIntent);
+      const planned = readPlan.request.toolPolicy === 'read'
+        ? compileInlineFullFileCodeWork(candidate.context, executionIntent)
+        : readPlan;
       return Object.freeze({
         family: 'code' as const,
         domain: candidate.domain,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AnalysisRule, FileAnalysis } from '@truecourse/shared';
-import { routeContext } from '../../packages/core/src/services/llm/context-router.js';
+import { estimateContext, routeContext } from '../../packages/core/src/services/llm/context-router.js';
 
 function ruleFor(tier: 'metadata' | 'targeted' | 'full-file'): AnalysisRule {
   return {
@@ -29,6 +29,18 @@ function fileAnalysis(path: string, functions: unknown[] = []): FileAnalysis {
 }
 
 describe('context router source scopes', () => {
+  it('prices full-file context as inline source text when Read is unavailable', () => {
+    const files = [fileAnalysis('/repo/a.ts')];
+    const contents = new Map([
+      ['/repo/a.ts', { content: 'x'.repeat(8_000), lineCount: 1 }],
+    ]);
+
+    const inline = estimateContext([ruleFor('full-file')], files, contents, { useFilePaths: false });
+    const read = estimateContext([ruleFor('full-file')], files, contents, { useFilePaths: true });
+
+    expect(inline.tiers[0]!.estimatedTokens).toBeGreaterThan(read.tiers[0]!.estimatedTokens);
+  });
+
   it('records whole-file bounds for metadata batches', () => {
     const files = [fileAnalysis('/repo/a.ts'), fileAnalysis('/repo/b.ts')];
     const contents = new Map([

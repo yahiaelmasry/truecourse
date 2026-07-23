@@ -51,7 +51,6 @@ import {
   selectCertifiedArchitectureContexts,
 } from './llm/certified-architecture-phase.js';
 import { fingerprintCertifiedAnalysisInputs } from './llm/certified-analysis-input-fingerprint.js';
-import { codeViolationToolPolicy } from './llm/prepared-code-violation-request.js';
 
 /** Throw if the abort signal has been triggered. */
 function throwIfAborted(signal?: AbortSignal) {
@@ -565,7 +564,7 @@ async function runViolationPipelineInternal(
   // ---------------------------------------------------------------------------
   if (hasLlm && input.onLlmEstimate) {
     const codeEstimate = enabledLlmCodeRules.length > 0 && fileContents.size > 0
-      ? estimateContext(enabledLlmCodeRules, result.fileAnalyses || [], fileContents, { useFilePaths: true })
+      ? estimateContext(enabledLlmCodeRules, result.fileAnalyses || [], fileContents, { useFilePaths: false })
       : { tiers: [], totalEstimatedTokens: 0 };
 
     const archRuleCount = archLlmRules.length;
@@ -1374,7 +1373,6 @@ async function runViolationPipelineInternal(
   const certifiedCompletePlan = Boolean(
     certifiedRun
     && (certifiedArchitectureContexts || certifiedCode.length > 0 || dbSchemaContext)
-    && certifiedCode.every(({ context }) => codeViolationToolPolicy(context) === 'none')
     && isCertifiedExecutionAdapter(provider)
     && provider.execution.provider !== 'transport:unverified',
   );
