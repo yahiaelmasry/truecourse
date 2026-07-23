@@ -12,17 +12,21 @@ import {
 } from './schemas.js';
 
 export interface PreparedDatabaseOwnership {
-  readonly databaseNames: readonly string[];
-  readonly tables: readonly {
+  readonly databases: readonly {
+    readonly promptId: string;
     readonly databaseName: string;
     readonly tableNames: readonly string[];
   }[];
   readonly ruleKeys: readonly string[];
   readonly priorFindings: readonly {
+    readonly promptId: string;
     readonly type: string;
     readonly title: string;
     readonly content: string;
     readonly severity: string;
+    readonly ruleKey: string | null;
+    readonly targetDatabaseName: string | null;
+    readonly targetTable: string | null;
   }[];
 }
 
@@ -73,23 +77,39 @@ export function prepareDatabaseViolationRequest(
   mode: 'normal' | 'lifecycle',
 ): PreparedDatabaseViolationRequest {
   const lifecycle = mode === 'lifecycle';
+  if (lifecycle && (context.existingViolations ?? []).some((violation) =>
+    typeof violation.ruleKey !== 'string' || violation.ruleKey.trim().length === 0)) {
+    throw new Error('Database lifecycle prior is missing stable rule ownership');
+  }
   const { vars, idMap } = buildDatabaseTemplateVars(context);
   const bindings = Object.freeze(
     [...idMap.entries()].map(([promptId, runtimeId]) =>
       Object.freeze({ promptId, runtimeId })),
   );
+  const databaseBindings = bindings.filter(({ promptId }) => promptId.startsWith('db-'));
+  const priorBindings = bindings.filter(({ promptId }) => promptId.startsWith('prev-'));
+  if (
+    new Set(databaseBindings.map(({ runtimeId }) => runtimeId)).size !== databaseBindings.length
+    || new Set(priorBindings.map(({ runtimeId }) => runtimeId)).size !== priorBindings.length
+  ) {
+    throw new Error('Database request cannot bind one runtime ID to multiple prompt aliases');
+  }
   const ownership = Object.freeze({
-    databaseNames: Object.freeze(context.databases.map((database) => database.name)),
-    tables: Object.freeze(context.databases.map((database) => Object.freeze({
+    databases: Object.freeze(context.databases.map((database, index) => Object.freeze({
+      promptId: databaseBindings[index]!.promptId,
       databaseName: database.name,
       tableNames: Object.freeze((database.tables ?? []).map((table) => table.name)),
     }))),
     ruleKeys: Object.freeze(context.llmRules.map((rule) => rule.key)),
-    priorFindings: Object.freeze((context.existingViolations ?? []).map((violation) => Object.freeze({
+    priorFindings: Object.freeze((context.existingViolations ?? []).map((violation, index) => Object.freeze({
+      promptId: priorBindings[index]!.promptId,
       type: violation.type,
       title: violation.title,
       content: violation.content,
       severity: violation.severity,
+      ruleKey: violation.ruleKey ?? null,
+      targetDatabaseName: violation.targetDatabaseName ?? null,
+      targetTable: violation.targetTable ?? null,
     }))),
   });
   const common = {

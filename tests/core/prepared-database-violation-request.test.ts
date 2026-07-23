@@ -36,6 +36,9 @@ function databaseContext(withPrior = false): DatabaseViolationContext {
       title: 'Orders need an index',
       content: 'The orders lookup is not indexed.',
       severity: 'high',
+      ruleKey: RULE_KEY,
+      targetDatabaseName: 'orders-db',
+      targetTable: 'orders',
     }] : undefined,
   };
 }
@@ -71,7 +74,7 @@ describe('prepared database violation requests', () => {
     expect(prepared.prompt).not.toContain('runtime-prior-id');
     expect(prepared.prompt).not.toContain('mutated');
     expect(prepared.ownership).toEqual(expect.objectContaining({
-      databaseNames: ['orders-db'],
+      databases: [expect.objectContaining({ promptId: 'db-0', databaseName: 'orders-db' })],
       ruleKeys: [RULE_KEY],
       priorFindings: [expect.objectContaining({ title: 'Orders need an index' })],
     }));
@@ -79,6 +82,56 @@ describe('prepared database violation requests', () => {
     expect(Object.isFrozen(prepared.bindings)).toBe(true);
     expect(Object.isFrozen(prepared.ownership)).toBe(true);
     expect(Object.isFrozen(prepared.ownership.priorFindings[0])).toBe(true);
+  });
+
+  it.each([
+    ['database IDs', (context: DatabaseViolationContext) => {
+      context.databases.push({
+        ...structuredClone(context.databases[0]),
+        name: 'archive-db',
+      });
+    }],
+    ['prior IDs', (context: DatabaseViolationContext) => {
+      context.existingViolations!.push({
+        ...context.existingViolations![0],
+        title: 'Different prior finding',
+      });
+    }],
+  ] as const)('fails closed when duplicate %s would own multiple prompt aliases', (_case, arrange) => {
+    const context = databaseContext(true);
+    arrange(context);
+
+    expect(() => prepareDatabaseViolationRequest(context, 'lifecycle'))
+      .toThrow(/one runtime ID/);
+  });
+
+  it('allows database and prior aliases to share a runtime value across typed namespaces', () => {
+    const context = databaseContext(true);
+    context.existingViolations![0].id = context.databases[0].id;
+
+    expect(prepareDatabaseViolationRequest(context, 'lifecycle').bindings).toEqual([
+      { promptId: 'db-0', runtimeId: 'runtime-database-id' },
+      { promptId: 'prev-0', runtimeId: 'runtime-database-id' },
+    ]);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['empty', ''],
+  ] as const)('rejects a lifecycle prior with %s rule ownership before execution', (_case, ruleKey) => {
+    const context = databaseContext(true);
+    context.existingViolations![0].ruleKey = ruleKey;
+
+    expect(() => prepareDatabaseViolationRequest(context, 'lifecycle'))
+      .toThrow(/missing stable.*ownership/);
+  });
+
+  it('retains stable prior ownership when that rule is no longer active', () => {
+    const context = databaseContext(true);
+    context.existingViolations![0].ruleKey = 'database/llm/inactive';
+
+    expect(prepareDatabaseViolationRequest(context, 'lifecycle').ownership.priorFindings[0])
+      .toEqual(expect.objectContaining({ ruleKey: 'database/llm/inactive' }));
   });
 
   it('makes the provider execute the exact prepared normal request', async () => {

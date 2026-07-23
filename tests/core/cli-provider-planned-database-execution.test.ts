@@ -37,6 +37,9 @@ function databaseContext(mode: 'normal' | 'lifecycle'): DatabaseViolationContext
       title: 'Orders need an index',
       content: 'The orders lookup is not indexed.',
       severity: 'high',
+      ruleKey: RULE_KEY,
+      targetDatabaseName: 'orders-db',
+      targetTable: 'orders',
     }] : undefined,
   };
 }
@@ -92,6 +95,47 @@ describe('planned database violation execution', () => {
         timeoutMs: planned.request.timeoutMs,
       });
       expect(captured?.user).not.toContain('mutated');
+    },
+  );
+
+  it.each(['normal', 'lifecycle'] as const)(
+    'rejects an unowned %s result before ordinary provider materialization',
+    async (mode) => {
+      const context = databaseContext(mode);
+      const transport: LlmTransport = async () => JSON.stringify(mode === 'lifecycle'
+        ? {
+            resolvedViolationIds: [],
+            unchangedViolationIds: ['prev-0'],
+            newViolations: [{
+              type: 'database',
+              title: 'Foreign rule finding',
+              content: 'This does not belong to the prepared rule.',
+              severity: 'high',
+              targetDatabaseId: 'db-0',
+              targetTable: 'orders',
+              fixPrompt: null,
+              ruleKey: 'database/llm/foreign',
+            }],
+          }
+        : {
+            violations: [{
+              type: 'database',
+              title: 'Foreign rule finding',
+              content: 'This does not belong to the prepared rule.',
+              severity: 'high',
+              targetDatabaseId: 'db-0',
+              targetTable: 'orders',
+              fixPrompt: null,
+              ruleKey: 'database/llm/foreign',
+            }],
+          });
+      const provider = new PlannedDatabaseProvider(transport, 'sonnet');
+
+      const execution = mode === 'lifecycle'
+        ? provider.generateDatabaseViolationsWithLifecycle(context)
+        : provider.generateDatabaseViolations(context);
+
+      await expect(execution).rejects.toThrow(/not owned/);
     },
   );
 });

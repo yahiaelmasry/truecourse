@@ -43,6 +43,7 @@ import {
   planDatabaseViolationWork,
   type PlannedDatabaseViolationWork,
 } from './database-work-planner.js';
+import { certifyDatabaseViolationResult } from './database-result-certification.js';
 import {
   planModuleViolationWork,
   type PlannedModuleViolationWork,
@@ -825,7 +826,7 @@ export function certifyAnalyzeLlmRun(
       checkpointResolvedModel = usage.resolvedModel;
       let result: unknown;
       try {
-        result = item.planned.request.parse(checkpoint.result);
+        result = parseAndCertifyResult(item, checkpoint.result);
       } catch {
         return incompatibleInspection('checkpoint-result-invalid');
       }
@@ -1359,7 +1360,7 @@ function certifyExecutionOutcome(
   }
   let result: unknown;
   try {
-    result = work.planned.request.parse(outcome.result);
+    result = parseAndCertifyResult(work, outcome.result);
   } catch (error) {
     throw new AnalyzeLlmPlanError(
       'result-not-certified',
@@ -1370,6 +1371,15 @@ function certifyExecutionOutcome(
     );
   }
   return Object.freeze({ ...outcome, result });
+}
+
+function parseAndCertifyResult(
+  work: CertifiedAnalyzeLlmWork,
+  value: unknown,
+): unknown {
+  return work.family === 'database'
+    ? certifyDatabaseViolationResult(work.planned.request, value)
+    : work.planned.request.parse(value);
 }
 
 function isCanonicalUtcTimestamp(value: unknown): value is string {

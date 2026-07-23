@@ -37,6 +37,8 @@ export interface ServiceViolationContext {
 }
 
 export interface DatabaseViolationContext {
+  /** Broader certified-analysis configuration/rule compatibility evidence. */
+  analysisInputFingerprint?: string;
   databases: {
     id: string;
     name: string;
@@ -51,8 +53,13 @@ export interface DatabaseViolationContext {
     relations?: { sourceTable: string; targetTable: string; foreignKeyColumn: string }[];
   }[];
   llmRules: { key: string; name: string; severity: string; prompt: string }[];
-  /** When provided, switches to diff prompt/schema to produce lifecycle results */
-  existingViolations?: ExistingViolation[];
+  /** When provided, switches to diff prompt/schema to produce lifecycle results. */
+  existingViolations?: Array<ExistingViolation & {
+    /** Stable rule/target ownership used to prevent lifecycle replay collisions. */
+    ruleKey?: string;
+    targetDatabaseName?: string | null;
+    targetTable?: string | null;
+  }>;
 }
 
 export interface ModuleViolationContext {

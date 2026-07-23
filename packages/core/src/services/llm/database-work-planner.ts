@@ -72,6 +72,7 @@ function canonicalContext(context: DatabaseViolationContext): DatabaseViolationC
   }
 
   return {
+    analysisInputFingerprint: context.analysisInputFingerprint,
     databases,
     llmRules: sortCanonical(context.llmRules.map((rule) => ({ ...rule }))),
     existingViolations: context.existingViolations ? existingViolations : undefined,
@@ -117,6 +118,7 @@ export function planDatabaseViolationWork(
       mode,
       toolPolicy: request.toolPolicy,
       timeoutMs: request.timeoutMs,
+      analysisInputFingerprint: preparedContext.analysisInputFingerprint ?? null,
     }),
     request: fingerprint({
       stage: request.stage,
@@ -135,6 +137,7 @@ export function planDatabaseViolationWork(
     resultContract: fingerprint({
       resultContractId: request.resultContractId,
       promptAliases: request.bindings.map((binding) => binding.promptId),
+      certificationPolicy: 'database-result-ownership@1',
     }),
   });
   const inputFingerprint = fingerprint(componentFingerprints);
