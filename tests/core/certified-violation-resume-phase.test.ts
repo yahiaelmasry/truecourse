@@ -61,6 +61,19 @@ const code = [
   { domain: 'security' as const, context: codeContext('security', 'b') },
 ];
 
+const fullFileThenPendingCode = [
+  {
+    domain: 'bugs' as const,
+    context: {
+      ...codeContext('bugs', 'a'),
+      files: [{ path: '/repo/src/a.ts', content: 'export const a = 1;' }],
+      sources: [{ path: '/repo/src/a.ts', selection: { kind: 'full-file' as const } }],
+      tier: 'full-file' as const,
+    },
+  },
+  code[1]!,
+];
+
 const service: ServiceViolationContext = {
   architecture: 'services',
   services: [{
@@ -215,6 +228,19 @@ describe('certified violation resume phase', () => {
     expect(resumed.results.map(({ domain }) => domain)).toEqual(['bugs', 'security']);
     expect(resumed.usage.map(({ totalTokens }) => totalTokens)).toEqual([120, 80]);
     expect(resumed.usage.reduce((sum, usage) => sum + usage.totalTokens, 0)).toBe(200);
+  });
+
+  it('reuses a checkpointed inline full-file result after a provider limit', async () => {
+    await createBlockedAttempt({ code: fullFileThenPendingCode });
+    const adapter = new ResumeAdapter();
+
+    const resumed = await resumeCertifiedViolationPhase(resumeInput(adapter, {
+      code: fullFileThenPendingCode,
+    }));
+
+    expect(adapter.calls.map(({ domain }) => domain)).toEqual(['security']);
+    expect(resumed.results.map(({ domain }) => domain).sort()).toEqual(['bugs', 'security']);
+    expect(resumed.usage.map(({ totalTokens }) => totalTokens).sort((left, right) => left - right)).toEqual([80, 120]);
   });
 
   it('materializes a reused finding at the durable run start time', async () => {
@@ -486,13 +512,13 @@ function exactAmbiguousConsent(offer: AnalyzeRunAmbiguousRearmOffer) {
 }
 
 async function createBlockedAttempt(
-  overrides: Pick<CertifiedViolationResumePhaseInput, 'service'> = {},
+  overrides: Pick<CertifiedViolationResumePhaseInput, 'code' | 'service'> = {},
 ): Promise<void> {
   const certified = certifyAnalyzeLlmRun({
     runId,
     journalKey: repoPath,
     repositoryRoot: '/repo',
-    code,
+    code: overrides.code ?? code,
     ...overrides,
   }, new PartialAdapter());
   await dispatchAnalyzeRun(repoPath, {

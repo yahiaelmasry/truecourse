@@ -933,7 +933,7 @@ describe('certified analyze LLM run', () => {
     expect(adapter.calls).toEqual([]);
   });
 
-  it('rejects unverified provider identity and read-enabled work before execution', () => {
+  it('rejects unverified provider identity and compiles full-file work before execution', async () => {
     const unverified: AnalyzeLlmExecutionAdapter = {
       execution: Object.freeze({
         provider: 'transport:unverified',
@@ -949,15 +949,29 @@ describe('certified analyze LLM run', () => {
       code: [{ domain: 'bugs', context: codeContext }],
     }, unverified)).toThrow(expect.objectContaining({ code: 'provider-not-certifiable' }));
 
-    expect(() => certifyAnalyzeLlmRun({
+    const adapter = new RecordingAdapter();
+    const certified = certifyAnalyzeLlmRun({
       runId: 'live-read',
       journalKey: journalRepository,
       repositoryRoot: '/repo',
       code: [{ domain: 'bugs', context: fullFileCodeContext }],
-    }, new RecordingAdapter())).toThrow(expect.objectContaining({
-      code: 'read-snapshot-unavailable',
+    }, adapter);
+
+    expect(certified.manifest.work).toEqual([expect.objectContaining({
       family: 'code',
-    }));
+      workId: expect.stringMatching(/^llm\.code:/),
+    })]);
+    await certified.execute(await activate(certified, 'inline-full-file'));
+    expect(adapter.calls).toEqual([expect.objectContaining({
+      family: 'code',
+      planned: expect.objectContaining({
+        request: expect.objectContaining({
+          toolPolicy: 'none',
+          sourceBindings: [{ promptPath: 'src/a.ts', runtimePath: '/repo/src/a.ts' }],
+          prompt: expect.stringContaining('=== src/a.ts ===\n1: export const a = 1;'),
+        }),
+      }),
+    })]);
   });
 
   it.each([
