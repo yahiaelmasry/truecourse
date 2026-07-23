@@ -14,6 +14,8 @@ import {
   type CodeViolationContext,
   type CodeViolationRaw,
   type CodeViolationsResult,
+  type DatabaseViolationsLifecycleResult,
+  type DatabaseViolationsResult,
   type DiffViolationItem,
   type LLMProvider,
   type ViolationsResult,
@@ -1371,8 +1373,7 @@ async function runViolationPipelineInternal(
   );
   const certifiedCompletePlan = Boolean(
     certifiedRun
-    && !dbSchemaContext
-    && (certifiedArchitectureContexts || certifiedCode.length > 0)
+    && (certifiedArchitectureContexts || certifiedCode.length > 0 || dbSchemaContext)
     && certifiedCode.every(({ context }) => codeViolationToolPolicy(context) === 'none')
     && isCertifiedExecutionAdapter(provider)
     && provider.execution.provider !== 'transport:unverified',
@@ -1477,11 +1478,14 @@ async function runViolationPipelineInternal(
   if ((!dbSchemaContext || llmSkipped) && previousDatabaseLlmViolations.length > 0) {
     carryPreviousDatabaseViolationsForward();
   }
-  if (dbSchemaContext && !llmSkipped) {
+  const databaseSchemaTracker = dbSchemaContext && !domainCodeBatches.has('database')
+    ? llmTrackers.get('database')
+    : undefined;
+  if (dbSchemaContext && !llmSkipped && !certifiedCompletePlan) {
     // Shared tracker exists only when schema is the sole database LLM path.
     // When code batches also exist, the code-batch tracker dominates and
     // schema runs silently (pre-existing aggregation limitation).
-    const schemaLl = domainCodeBatches.has('database') ? undefined : llmTrackers.get('database');
+    const schemaLl = databaseSchemaTracker;
 
     domainLlmPromises.push((async (): Promise<DomainLlmResult> => {
       log.info(`[LLM] database-schema: starting`);
@@ -1610,6 +1614,8 @@ async function runViolationPipelineInternal(
           onWorkStart(work) {
             if (work.family === 'code') {
               llmTrackers.get(work.domain)?.onCallStart();
+            } else if (work.family === 'database') {
+              databaseSchemaTracker?.onCallStart();
             } else if (work.family === 'service' || work.family === 'module') {
               archOnCallStart(work.family);
             }
@@ -1617,6 +1623,8 @@ async function runViolationPipelineInternal(
           onWorkDone(work, state) {
             if (work.family === 'code') {
               llmTrackers.get(work.domain)?.onCallDone(state.started);
+            } else if (work.family === 'database') {
+              databaseSchemaTracker?.onCallDone(state.started);
             } else if (work.family === 'service' || work.family === 'module') {
               archOnCallDone(work.family);
             }
@@ -1627,6 +1635,7 @@ async function runViolationPipelineInternal(
               run: input.certifiedLlmResume.run,
               adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
               code: certifiedCode,
+              database: dbSchemaContext,
               service: certifiedArchitectureContexts?.service,
               module: certifiedArchitectureContexts?.module,
               activatedAt: input.certifiedLlmResume.activatedAt,
@@ -1638,6 +1647,7 @@ async function runViolationPipelineInternal(
                 run: input.certifiedLlmRearm.run,
                 adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
                 code: certifiedCode,
+                database: dbSchemaContext,
                 service: certifiedArchitectureContexts?.service,
                 module: certifiedArchitectureContexts?.module,
                 consent: input.certifiedLlmRearm.consent,
@@ -1647,10 +1657,11 @@ async function runViolationPipelineInternal(
               })
           : await executeCertifiedViolationPhase({
               run: input.certifiedLlmRun!,
-              analysisTimestamp: now,
-              adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
-              code: certifiedCode,
-              service: certifiedArchitectureContexts?.service,
+                analysisTimestamp: now,
+                adapter: provider as LLMProvider & AnalyzeLlmExecutionAdapter,
+                code: certifiedCode,
+                database: dbSchemaContext,
+                service: certifiedArchitectureContexts?.service,
               module: certifiedArchitectureContexts?.module,
               observer,
             });
@@ -1663,6 +1674,23 @@ async function runViolationPipelineInternal(
           repoPath,
           tracker,
         );
+        const certifiedDatabase = materializeCertifiedDatabaseSchema(
+          certifiedPhase,
+          Boolean(dbSchemaContext),
+          analysisId,
+          now,
+          previousDatabaseLlmViolations,
+          dbIdMap,
+        );
+        added.push(...certifiedDatabase.added);
+        unchanged.push(...certifiedDatabase.unchanged);
+        resolved.push(...certifiedDatabase.resolved);
+        resolvedRefs.push(...certifiedDatabase.resolvedRefs);
+        if (dbSchemaContext && !domainCodeBatches.has('database')) {
+          const detCount = violationsByDomain.get('database') ?? 0;
+          const total = detCount + certifiedDatabase.activeCount;
+          tracker?.done('database', total > 0 ? `${total} violations` : 'Clean');
+        }
         archResult = mergeCertifiedArchitectureResults(
           violationInput,
           certifiedPhase,
@@ -2135,6 +2163,104 @@ function materializeCertifiedCodeDomains(
     materialized.push({ domain, violations: processed, resolvedIds, unchangedIds });
   }
   return materialized;
+}
+
+function materializeCertifiedDatabaseSchema(
+  phase: CertifiedViolationPhaseResult,
+  expected: boolean,
+  analysisId: string,
+  now: string,
+  previousActiveViolations: readonly ActiveViolation[],
+  databaseNameToId: ReadonlyMap<string, string>,
+): {
+  added: ViolationRecord[];
+  unchanged: ViolationRecord[];
+  resolved: ViolationRecord[];
+  resolvedRefs: ResolvedViolationRef[];
+  activeCount: number;
+} {
+  const outcomes = phase.results.filter((result) => result.family === 'database');
+  const expectedCount = expected ? 1 : 0;
+  if (outcomes.length !== expectedCount) {
+    throw new Error(
+      `Certified database plan returned ${outcomes.length} results for ${expectedCount} schema checks`,
+    );
+  }
+  const outcome = outcomes[0];
+  if (!outcome) {
+    return {
+      added: [],
+      unchanged: [],
+      resolved: [],
+      resolvedRefs: [],
+      activeCount: 0,
+    };
+  }
+
+  if (outcome.mode === 'lifecycle') {
+    const result = outcome.result as DatabaseViolationsLifecycleResult;
+    const lifecycle = computeViolationLifecycle({
+      analysisId,
+      now,
+      newViolations: result.newViolations.map((violation) => ({
+        ...violation,
+        targetServiceId: null,
+        targetModuleId: null,
+        targetMethodId: null,
+        targetServiceName: null,
+        targetModuleName: null,
+        targetMethodName: null,
+      })),
+      resolvedViolationIds: result.resolvedViolationIds,
+      previousActiveViolations: [...previousActiveViolations],
+      databaseNameToId: new Map(databaseNameToId),
+    });
+    return {
+      added: lifecycle.added,
+      unchanged: lifecycle.unchanged,
+      resolved: lifecycle.resolved,
+      resolvedRefs: lifecycle.resolvedRefs,
+      activeCount: result.newViolations.length + result.unchangedViolationIds.length,
+    };
+  }
+
+  const result = outcome.result as DatabaseViolationsResult;
+  return {
+    added: result.violations.map((violation) => ({
+      id: violation.id,
+      type: 'database',
+      category: 'rule',
+      subcategory: null,
+      title: violation.title,
+      content: violation.content,
+      severity: violation.severity,
+      status: 'new',
+      targetServiceId: null,
+      targetDatabaseId: violation.targetDatabaseId || null,
+      targetModuleId: null,
+      targetMethodId: null,
+      targetTable: violation.targetTable || null,
+      relatedServiceId: null,
+      relatedModuleId: null,
+      fixPrompt: violation.fixPrompt || null,
+      ruleKey: violation.ruleKey || 'unknown',
+      firstSeenAnalysisId: analysisId,
+      firstSeenAt: now,
+      previousViolationId: null,
+      resolvedAt: null,
+      filePath: null,
+      lineStart: null,
+      lineEnd: null,
+      columnStart: null,
+      columnEnd: null,
+      snippet: null,
+      createdAt: violation.createdAt,
+    })),
+    unchanged: [],
+    resolved: [],
+    resolvedRefs: [],
+    activeCount: result.violations.length,
+  };
 }
 
 function processLlmCodeViolations(
