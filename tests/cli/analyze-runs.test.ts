@@ -27,6 +27,27 @@ describe('analyze run CLI status', () => {
     ]);
   });
 
+  it('shows durable failure and finalization recovery facts without replacing the baseline', () => {
+    const status = blockedStatus();
+    status.latestAttempt!.state = 'failed';
+    status.latestAttempt!.failure = {
+      code: 'finalization-failed',
+      message: '/private/repo/token=secret provider detail',
+      failedAt: '2026-07-19T10:01:00.000Z',
+    };
+    status.latestAttempt!.finalization = {
+      persistence: 'prepared',
+      finalizingAt: '2026-07-19T10:00:30.000Z',
+      preparedAt: '2026-07-19T10:00:45.000Z',
+    };
+
+    expect(formatAnalyzeRunStatus(status)).toEqual(expect.arrayContaining([
+      'Failure: finalization-failed at 2026-07-19T10:01:00.000Z — Analysis attempt failed; check the local analyze log for diagnostics.',
+      'Finalization: prepared · started 2026-07-19T10:00:30.000Z · prepared 2026-07-19T10:00:45.000Z',
+      'Active completed analysis: analysis-completed · 2026-07-19T09:00:00.000Z · main@abc1234',
+    ]));
+  });
+
   it('reads status without creating analysis state in a fresh repository', async () => {
     const repoPath = fs.mkdtempSync(path.join(os.tmpdir(), 'truecourse-cli-status-'));
     const lines: string[] = [];

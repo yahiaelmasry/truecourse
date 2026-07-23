@@ -44,7 +44,7 @@ describe('dashboard analyze-run status route', () => {
         runId: 'attempt-2',
         candidateAnalysisId: 'candidate-analysis',
         completedBaselineId: 'completed-analysis',
-        state: 'running',
+        state: 'failed',
         startedAt: '2026-07-22T08:00:00.000Z',
         updatedAt: '2026-07-22T09:00:00.000Z',
         source: 'dashboard',
@@ -57,6 +57,11 @@ describe('dashboard analyze-run status route', () => {
           resetHint: 'tomorrow 8pm (Africa/Cairo)',
           blockedAt: '2026-07-22T08:45:00.000Z',
           resetAt: '2026-07-23T17:00:00.000Z',
+        },
+        failure: {
+          code: 'finalization-failed',
+          message: '/private/repository/provider token diagnostic',
+          failedAt: '2026-07-22T09:00:00.000Z',
         },
         finalization: null,
         resume: {
@@ -83,7 +88,7 @@ describe('dashboard analyze-run status route', () => {
       activeMode: null,
       latestAttempt: {
         runId: 'attempt-2',
-        state: 'running',
+        state: 'failed',
         startedAt: '2026-07-22T08:00:00.000Z',
         updatedAt: '2026-07-22T09:00:00.000Z',
         source: 'dashboard',
@@ -95,6 +100,12 @@ describe('dashboard analyze-run status route', () => {
           blockedAt: '2026-07-22T08:45:00.000Z',
           resetAt: '2026-07-23T17:00:00.000Z',
         },
+        failure: {
+          code: 'finalization-failed',
+          message: 'Analysis attempt failed. Check the local analyze log for diagnostics.',
+          failedAt: '2026-07-22T09:00:00.000Z',
+        },
+        finalization: null,
         resume: {
           available: true,
           scope: 'structural',
