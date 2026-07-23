@@ -612,7 +612,7 @@ function formatExistingViolations(
 /** Build template vars for violations-code prompt. */
 export function buildCodeTemplateVars(
   context: CodeViolationContext,
-  options?: { useFilePaths?: boolean },
+  options?: { useFilePaths?: boolean; preframedInlineContent?: string },
 ): TemplateVarsResult {
   const idMap: PromptIdMap = new Map();
 
@@ -621,7 +621,9 @@ export function buildCodeTemplateVars(
     .join('\n');
 
   let fileList: string;
-  if (options?.useFilePaths) {
+  if (options?.preframedInlineContent !== undefined) {
+    fileList = options.preframedInlineContent;
+  } else if (options?.useFilePaths) {
     // CLI mode: pass file paths only — Claude reads them via Read tool
     fileList = context.files
       .map((f) => `=== ${f.path} ===\nRead this file using the Read tool before analyzing.`)
@@ -646,6 +648,13 @@ export function buildCodeTemplateVars(
     : '(none)';
 
   return { vars: { llmRules, fileList, existingViolations }, idMap };
+}
+
+export function formatInlineCodeFileList(files: readonly { path: string; content: string }[]): string {
+  return files.map((file) => {
+    const numbered = file.content.split('\n').map((line, index) => `${index + 1}: ${line}`).join('\n');
+    return `=== ${file.path} ===\n${numbered}`;
+  }).join('\n\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -696,11 +705,9 @@ export function getPrompt(
   name: PromptName,
   variables?: Record<string, string>
 ): string {
-  let text = PROMPT_DEFINITIONS[name].prompt as string;
-  if (variables) {
-    for (const [key, value] of Object.entries(variables)) {
-      text = text.replaceAll(`{{${key}}}`, value);
-    }
-  }
-  return text;
+  const template = PROMPT_DEFINITIONS[name].prompt as string;
+  if (!variables) return template;
+  return template.replace(/\{\{([A-Za-z][A-Za-z0-9_]*)\}\}/g, (token, key: string) =>
+    Object.prototype.hasOwnProperty.call(variables, key) ? variables[key]! : token,
+  );
 }

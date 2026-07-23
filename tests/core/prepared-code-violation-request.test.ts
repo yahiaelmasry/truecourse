@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { LlmRequest, LlmTransport } from '../../packages/shared/src/llm/transport.js';
 import { createLLMProvider, type CodeViolationContext } from '../../packages/core/src/services/llm/provider.js';
-import { prepareCodeViolationRequest } from '../../packages/core/src/services/llm/prepared-code-violation-request.js';
+import {
+  INLINE_FULL_FILE_SOURCE_DELIVERY,
+  prepareCodeViolationRequest,
+  prepareInlineFullFileCodeViolationRequest,
+} from '../../packages/core/src/services/llm/prepared-code-violation-request.js';
 import { planCodeViolationWork } from '../../packages/core/src/services/llm/code-work-planner.js';
 
 function targetedContext(withPrior = false): CodeViolationContext {
@@ -41,6 +45,126 @@ function targetedContext(withPrior = false): CodeViolationContext {
 }
 
 describe('prepared code violation requests', () => {
+  it('rejects direct inline preparation with an absolute or incomplete source set', () => {
+    const context: CodeViolationContext = {
+      files: [{ path: '/checkout/src/orders.ts', content: 'export const order = true;' }],
+      sourceScopes: [],
+      sources: [],
+      llmRules: [{ key: 'bugs/llm/review', name: 'Review', severity: 'high', prompt: 'Review it.' }],
+      tier: 'full-file',
+    };
+    const delivery = {
+      contract: INLINE_FULL_FILE_SOURCE_DELIVERY,
+      sourceBindings: [{ promptPath: 'src/orders.ts', runtimePath: '/checkout/src/orders.ts' }],
+      fileList: '=== src/orders.ts ===\n1: export const order = true;',
+    };
+
+    expect(() => prepareInlineFullFileCodeViolationRequest(context, '/checkout', delivery))
+      .toThrow(/exact non-empty repository-relative file, source, and scope sets/i);
+  });
+
+  it('rejects an inline lifecycle prior outside the owned source set', () => {
+    const context: CodeViolationContext = {
+      files: [{ path: 'src/orders.ts', content: 'export const order = true;' }],
+      sourceScopes: [{ path: 'src/orders.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] }],
+      sources: [{ path: 'src/orders.ts', selection: { kind: 'full-file' } }],
+      llmRules: [{ key: 'bugs/llm/review', name: 'Review', severity: 'high', prompt: 'Review it.' }],
+      tier: 'full-file',
+      existingViolations: [{
+        id: 'prior', filePath: '../secret.ts', lineStart: 1, lineEnd: 1,
+        ruleKey: 'bugs/llm/review', severity: 'high', title: 'Prior', content: 'Prior issue.',
+      }],
+    };
+    const delivery = {
+      contract: INLINE_FULL_FILE_SOURCE_DELIVERY,
+      sourceBindings: [{ promptPath: 'src/orders.ts', runtimePath: '/checkout/src/orders.ts' }],
+      fileList: '=== src/orders.ts ===\n1: export const order = true;',
+    };
+
+    expect(() => prepareInlineFullFileCodeViolationRequest(context, '/checkout', delivery))
+      .toThrow(/lifecycle prior is outside its source set/i);
+  });
+
+  it('rejects an inline lifecycle prior outside its owned source range', () => {
+    const context: CodeViolationContext = {
+      files: [{ path: 'src/orders.ts', content: 'first\nsecond\nthird' }],
+      sourceScopes: [{ path: 'src/orders.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] }],
+      sources: [{ path: 'src/orders.ts', selection: { kind: 'full-file' } }],
+      llmRules: [{ key: 'bugs/llm/review', name: 'Review', severity: 'high', prompt: 'Review it.' }],
+      tier: 'full-file',
+      existingViolations: [{
+        id: 'prior', filePath: 'src/orders.ts', lineStart: 3, lineEnd: 3,
+        ruleKey: 'bugs/llm/review', severity: 'high', title: 'Prior', content: 'Prior issue.',
+      }],
+    };
+    const delivery = {
+      contract: INLINE_FULL_FILE_SOURCE_DELIVERY,
+      sourceBindings: [{ promptPath: 'src/orders.ts', runtimePath: '/checkout/src/orders.ts' }],
+      fileList: '=== src/orders.ts ===\n1: first\n2: second\n3: third',
+    };
+
+    expect(() => prepareInlineFullFileCodeViolationRequest(context, '/checkout', delivery))
+      .toThrow(/lifecycle prior is outside its owned source range/i);
+  });
+
+  it('snapshots inline delivery fields before validating them', () => {
+    const context: CodeViolationContext = {
+      files: [{ path: 'src/orders.ts', content: 'export const order = true;' }],
+      sourceScopes: [{ path: 'src/orders.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] }],
+      sources: [{ path: 'src/orders.ts', selection: { kind: 'full-file' } }],
+      llmRules: [{ key: 'bugs/llm/review', name: 'Review', severity: 'high', prompt: 'Review it.' }],
+      tier: 'full-file',
+    };
+    let sourceBindingReads = 0;
+    const delivery = {
+      contract: INLINE_FULL_FILE_SOURCE_DELIVERY,
+      get sourceBindings() {
+        sourceBindingReads += 1;
+        return sourceBindingReads === 1
+          ? [{ promptPath: 'src/orders.ts', runtimePath: '/checkout/src/orders.ts' }]
+          : [];
+      },
+      get fileList() {
+        return '=== src/orders.ts ===\n1: export const order = true;';
+      },
+    };
+
+    const prepared = prepareInlineFullFileCodeViolationRequest(context, '/checkout', delivery);
+
+    expect(sourceBindingReads).toBe(1);
+    expect(prepared.sourceBindings).toEqual([
+      { promptPath: 'src/orders.ts', runtimePath: '/checkout/src/orders.ts' },
+    ]);
+  });
+
+  it('uses one context snapshot for inline validation and ownership', () => {
+    let sourceScopeReads = 0;
+    const context = {
+      files: [{ path: 'src/orders.ts', content: 'export const order = true;' }],
+      get sourceScopes() {
+        sourceScopeReads += 1;
+        return sourceScopeReads === 1
+          ? [{ path: 'src/orders.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] }]
+          : [{ path: '../outside.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] }];
+      },
+      sources: [{ path: 'src/orders.ts', selection: { kind: 'full-file' as const } }],
+      llmRules: [{ key: 'bugs/llm/review', name: 'Review', severity: 'high', prompt: 'Review it.' }],
+      tier: 'full-file' as const,
+    } satisfies CodeViolationContext;
+    const delivery = {
+      contract: INLINE_FULL_FILE_SOURCE_DELIVERY,
+      sourceBindings: [{ promptPath: 'src/orders.ts', runtimePath: '/checkout/src/orders.ts' }],
+      fileList: '=== src/orders.ts ===\n1: export const order = true;',
+    };
+
+    const prepared = prepareInlineFullFileCodeViolationRequest(context, '/checkout', delivery);
+
+    expect(sourceScopeReads).toBe(1);
+    expect(prepared.ownership.sourceScopes).toEqual([
+      { path: 'src/orders.ts', ranges: [{ lineStart: 1, lineEnd: 1 }] },
+    ]);
+  });
+
   it('freezes a provider-independent targeted lifecycle request and its runtime bindings', () => {
     const context = targetedContext(true);
     const prepared = prepareCodeViolationRequest(context);

@@ -6,9 +6,14 @@ import type {
 } from './provider.js';
 import {
   bindCodeSourceHeaderAliases,
+  INLINE_FULL_FILE_SOURCE_DELIVERY,
+  prepareInlineFullFileCodeViolationRequest,
   prepareCodeViolationRequest,
+  runtimePathForRepositoryRoot,
+  type InlineFullFileSourceDelivery,
   type PreparedCodeViolationRequest,
 } from './prepared-code-violation-request.js';
+import { formatInlineCodeFileList } from './prompts.js';
 import {
   assertUniqueLlmIdentity,
   canonicalJson,
@@ -31,6 +36,17 @@ export interface PlannedCodeViolationWork {
   readonly inputFingerprint: string;
   readonly componentFingerprints: CodeWorkComponentFingerprints;
   readonly request: PreparedCodeViolationRequest;
+}
+
+function snapshotInlineDelivery(inline: InlineFullFileSourceDelivery): InlineFullFileSourceDelivery {
+  return Object.freeze({
+    contract: inline.contract,
+    fileList: inline.fileList,
+    sourceBindings: Object.freeze(inline.sourceBindings.map((binding) => Object.freeze({
+      promptPath: binding.promptPath,
+      runtimePath: binding.runtimePath,
+    }))),
+  });
 }
 
 function normalizeRepositoryPath(filePath: string, repositoryRoot?: string | null): string {
@@ -199,6 +215,37 @@ function canonicalContext(
   };
 }
 
+function validateInlineDelivery(
+  context: CodeViolationContext,
+  sources: readonly CodeContextSource[],
+  execution: CodeWorkExecutionIntent,
+  inline: InlineFullFileSourceDelivery,
+): void {
+  if (inline.contract !== INLINE_FULL_FILE_SOURCE_DELIVERY) {
+    throw new Error('Inline code delivery requires the compiler-owned contract');
+  }
+  if (context.tier !== 'full-file' || sources.some((source) => source.selection.kind !== 'full-file')) {
+    throw new Error('Inline code delivery requires complete full-file sources');
+  }
+  if (!execution.repositoryRoot || !(/^(?:\/|[a-z]:\/)/i.test(execution.repositoryRoot.replaceAll('\\', '/')))) {
+    throw new Error('Inline code delivery requires an absolute repository root');
+  }
+  const expectedPaths = context.files.map((file) => file.path).sort(compareText);
+  const expectedBindings = expectedPaths.map((promptPath) => ({
+    promptPath,
+    runtimePath: runtimePathForRepositoryRoot(execution.repositoryRoot!, promptPath),
+  }));
+  if (JSON.stringify(inline.sourceBindings) !== JSON.stringify(expectedBindings)) {
+    throw new Error('Inline code delivery bindings do not match its full-file sources');
+  }
+  if (inline.fileList !== formatInlineCodeFileList(context.files.map((file) => ({
+    path: file.path,
+    content: file.content,
+  })))) {
+    throw new Error('Inline code delivery text does not match its full-file sources');
+  }
+}
+
 /**
  * Prepare and certify the stable identity of one real code-check work unit.
  * This function only plans execution; durable storage and reuse remain outside
@@ -207,11 +254,16 @@ function canonicalContext(
 export function planCodeViolationWork(
   context: CodeViolationContext,
   execution: CodeWorkExecutionIntent,
+  inline?: InlineFullFileSourceDelivery,
 ): PlannedCodeViolationWork {
   const repositoryRoot = execution.repositoryRoot;
   const preparedContext = canonicalContext(context, repositoryRoot);
-  const request = prepareCodeViolationRequest(preparedContext, repositoryRoot);
   const sources = canonicalSources(preparedContext, repositoryRoot);
+  const delivery = inline ? snapshotInlineDelivery(inline) : undefined;
+  if (delivery) validateInlineDelivery(preparedContext, sources, execution, delivery);
+  const request = delivery
+    ? prepareInlineFullFileCodeViolationRequest(preparedContext, repositoryRoot!, delivery)
+    : prepareCodeViolationRequest(preparedContext, repositoryRoot);
   const sourceScopes = canonicalSourceScopes(preparedContext.sourceScopes, repositoryRoot);
   const ruleKeys = [...new Set(preparedContext.llmRules.map((rule) => rule.key))].sort(compareText);
   const workId = `llm.code:${fingerprint({
@@ -246,6 +298,7 @@ export function planCodeViolationWork(
       tier: preparedContext.tier ?? 'full-file',
       selections: sources.map((source) => source.selection),
       toolPolicy: request.toolPolicy,
+      sourceDelivery: delivery?.contract.kind ?? 'provider-read@1',
       timeoutMs: request.timeoutMs,
       analysisInputFingerprint: preparedContext.analysisInputFingerprint ?? null,
     }),
