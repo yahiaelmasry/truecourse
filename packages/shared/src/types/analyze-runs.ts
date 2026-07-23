@@ -72,6 +72,16 @@ export interface AnalyzeRunStatusResponse {
       /** Strictly certified UTC instant; null when provider wording is not trustworthy. */
       resetAt: string | null;
     } | null;
+    failure: {
+      code: string;
+      message: string;
+      failedAt: string;
+    } | null;
+    finalization: {
+      persistence: 'unprepared' | 'prepared';
+      finalizingAt: string;
+      preparedAt: string | null;
+    } | null;
     resume: AnalyzeRunResumeStatus;
     /** Server-classified replacement safety; clients must not infer this from state. */
     startOver: AnalyzeRunStartOverStatus;

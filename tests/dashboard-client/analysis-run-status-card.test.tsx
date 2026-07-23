@@ -21,6 +21,8 @@ const blockedStatus: AnalyzeRunStatusResponse = {
       blockedAt: '2026-07-22T08:10:00.000Z',
       resetAt: '2026-07-23T17:00:00.000Z',
     },
+    failure: null,
+    finalization: null,
     resume: {
       available: true,
       scope: 'structural',
@@ -43,6 +45,31 @@ const blockedStatus: AnalyzeRunStatusResponse = {
 };
 
 describe('AnalysisRunStatusCard', () => {
+  it('shows projected failure and finalization facts without exposing a recovery label for completion', () => {
+    const status: AnalyzeRunStatusResponse = {
+      ...blockedStatus,
+      latestAttempt: {
+        ...blockedStatus.latestAttempt!,
+        state: 'failed',
+        failure: {
+          code: 'finalization-failed',
+          message: 'Analysis attempt failed. Check the local analyze log for diagnostics.',
+          failedAt: '2026-07-22T08:11:00.000Z',
+        },
+        finalization: {
+          persistence: 'prepared',
+          finalizingAt: '2026-07-22T08:10:30.000Z',
+          preparedAt: '2026-07-22T08:10:45.000Z',
+        },
+      },
+    };
+    render(<AnalysisRunStatusCard status={status} resumeRunId={null} resumeError={null} startOverRunId={null} startOverError={null} onResume={async () => undefined} onStartOver={async () => undefined} />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('finalization-failed');
+    expect(screen.getByText('Finalization recovery')).toBeInTheDocument();
+    expect(screen.getByText('Persistence: prepared')).toBeInTheDocument();
+  });
+
   it('keeps the baseline distinct and starts Resume for the exact attempted run', async () => {
     const onResume = vi.fn(async () => undefined);
     render(

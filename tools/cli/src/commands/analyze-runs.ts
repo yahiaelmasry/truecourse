@@ -244,6 +244,15 @@ export function formatAnalyzeRunStatus(status: AnalyzeRunStatus): string[] {
         lines.push(`Verified reset time: ${run.lastProviderLimit.resetAt}`);
       }
     }
+    if (run.failure) {
+      lines.push(`Failure: ${run.failure.code} at ${run.failure.failedAt} — Analysis attempt failed; check the local analyze log for diagnostics.`);
+    }
+    if (run.finalization) {
+      const prepared = run.finalization.preparedAt
+        ? ` · prepared ${run.finalization.preparedAt}`
+        : '';
+      lines.push(`Finalization: ${run.finalization.persistence} · started ${run.finalization.finalizingAt}${prepared}`);
+    }
     if (!run.resume.available && run.resume.reason === 'resume-execution-ambiguous') {
       lines.push(`Resume: unavailable — ${resumeUnavailableMessage(run.resume.reason)}`);
     } else if (attemptWasSuperseded(status)) {

@@ -129,6 +129,25 @@ export function AnalysisRunStatusCard({
                 )}
               </div>
             )}
+            {attempt.failure && (
+              <div className="rounded-md border border-destructive/25 bg-destructive/5 p-2 text-[11px] leading-4 text-destructive" role="alert">
+                <div className="font-medium">Attempt failed: {attempt.failure.code}</div>
+                <div>{attempt.failure.message}</div>
+                <div className="mt-1 font-mono text-[10px]">Failed at: {attempt.failure.failedAt}</div>
+              </div>
+            )}
+            {attempt.finalization && (
+              <div className="rounded-md bg-muted/60 p-2 text-[11px] leading-4 text-muted-foreground">
+                <div className="font-medium text-foreground">
+                  {attempt.state === 'completed' ? 'Finalization' : 'Finalization recovery'}
+                </div>
+                <div>Persistence: {attempt.finalization.persistence}</div>
+                <div className="font-mono text-[10px]">Started: {attempt.finalization.finalizingAt}</div>
+                {attempt.finalization.preparedAt && (
+                  <div className="font-mono text-[10px]">Prepared: {attempt.finalization.preparedAt}</div>
+                )}
+              </div>
+            )}
             {attempt.resume.available ? (
               <div className="space-y-2 rounded-md bg-muted/60 p-2 text-[11px] leading-4 text-muted-foreground">
                 <button

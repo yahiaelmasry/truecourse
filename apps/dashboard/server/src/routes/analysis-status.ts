@@ -62,6 +62,20 @@ function toAnalyzeRunStatusResponse(
                 resetAt: attempt.lastProviderLimit.resetAt,
               }
             : null,
+          failure: attempt.failure
+            ? {
+                code: attempt.failure.code,
+                message: publicFailureStatusMessage(attempt.failure.code),
+                failedAt: attempt.failure.failedAt,
+              }
+            : null,
+          finalization: attempt.finalization
+            ? {
+                persistence: attempt.finalization.persistence,
+                finalizingAt: attempt.finalization.finalizingAt,
+                preparedAt: attempt.finalization.preparedAt,
+              }
+            : null,
           resume: toResumeStatus(attempt.resume),
           startOver: toStartOverStatus(status),
         }
@@ -75,6 +89,11 @@ function toAnalyzeRunStatusResponse(
         }
       : null,
   };
+}
+
+/** Durable failure text may contain provider or local-path diagnostics; never project it to clients. */
+function publicFailureStatusMessage(_code: string): string {
+  return 'Analysis attempt failed. Check the local analyze log for diagnostics.';
 }
 
 function toStartOverStatus(status: AnalyzeRunStatus): AnalyzeRunStartOverStatus {
