@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { CodeViolationContext } from './provider.js';
 import { buildCodeTemplateVars, getPrompt } from './prompts.js';
 import {
@@ -72,11 +73,55 @@ function compareText(left: string, right: string): number {
   return Buffer.from(left).compare(Buffer.from(right));
 }
 
+function isPortableAbsolutePath(value: string): boolean {
+  const portable = value.replaceAll('\\', '/');
+  return path.posix.isAbsolute(portable) || /^[a-z]:\//i.test(portable);
+}
+
+function runtimePathForPortablePrompt(repositoryRoot: string, promptPath: string): string {
+  if (promptPath === '.' || promptPath === '..' || promptPath.startsWith('../')) {
+    throw new Error(`Read-enabled code source is outside the repository root: ${promptPath}`);
+  }
+  const portableRoot = repositoryRoot.replaceAll('\\', '/').replace(/\/$/, '') || '/';
+  if (!isPortableAbsolutePath(portableRoot)) {
+    throw new Error(`Read-enabled code work requires an absolute repository root: ${repositoryRoot}`);
+  }
+  if (/^[a-z]:\//i.test(portableRoot)) return `${portableRoot}/${promptPath}`;
+  return path.resolve(repositoryRoot, promptPath);
+}
+
+function prepareReadSourceBindings(
+  context: CodeViolationContext,
+  repositoryRoot?: string | null,
+): readonly PreparedCodeSourceBinding[] {
+  if (!repositoryRoot) return Object.freeze([]);
+  const promptPaths = [...new Set(context.sourceScopes.map((scope) => scope.path))].sort(compareText);
+  const expectedPaths = new Set(promptPaths);
+  const files = context.files.map((file) => file.path);
+  const sources = context.sources?.map((source) => source.path) ?? promptPaths;
+  if (
+    files.length !== expectedPaths.size
+    || sources.length !== expectedPaths.size
+    || files.some((filePath) => !expectedPaths.has(filePath))
+    || sources.some((sourcePath) => !expectedPaths.has(sourcePath))
+  ) {
+    throw new Error('Read-enabled code prompt and ownership source sets do not match');
+  }
+  if ((context.existingViolations ?? []).some((violation) => !expectedPaths.has(violation.filePath))) {
+    throw new Error('Read-enabled code lifecycle prior is outside its source set');
+  }
+  return Object.freeze(promptPaths.map((promptPath) => Object.freeze({
+    promptPath,
+    runtimePath: runtimePathForPortablePrompt(repositoryRoot, promptPath),
+  })));
+}
+
 function prepareSourceBindings(
   context: CodeViolationContext,
   toolPolicy: PreparedCodeViolationRequest['toolPolicy'],
+  repositoryRoot?: string | null,
 ): readonly PreparedCodeSourceBinding[] {
-  if (toolPolicy === 'read') return Object.freeze([]);
+  if (toolPolicy === 'read') return prepareReadSourceBindings(context, repositoryRoot);
   const paths = [...new Set(context.sourceScopes.map((scope) => scope.path))].sort(compareText);
   return Object.freeze(paths.map((runtimePath, index) => Object.freeze({
     promptPath: `file-${index}`,
@@ -143,10 +188,11 @@ function bindSourceAliases(
  */
 export function prepareCodeViolationRequest(
   context: CodeViolationContext,
+  repositoryRoot?: string | null,
 ): PreparedCodeViolationRequest {
   const lifecycle = (context.existingViolations?.length ?? 0) > 0;
   const toolPolicy = codeViolationToolPolicy(context);
-  const sourceBindings = prepareSourceBindings(context, toolPolicy);
+  const sourceBindings = prepareSourceBindings(context, toolPolicy, repositoryRoot);
   const promptContext = bindSourceAliases(context, sourceBindings);
   const promptName = context.tier === 'metadata'
     ? lifecycle ? 'violations-code-metadata-lifecycle' : 'violations-code-metadata'

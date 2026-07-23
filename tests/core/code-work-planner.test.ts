@@ -185,6 +185,29 @@ describe('code work planner', () => {
     expect(planned.request.ownership.sourceScopes[0].path).toBe('src/orders.ts');
   });
 
+  it('keeps a full-file Read request portable while retaining its runtime binding', () => {
+    const first = planCodeViolationWork(lifecycleContext('/checkout/one'), {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    });
+    const relocated = planCodeViolationWork(lifecycleContext('/different/checkout'), {
+      ...execution,
+      repositoryRoot: '/different/checkout',
+    });
+
+    expect(first.request.toolPolicy).toBe('read');
+    expect(first.request.prompt).toContain('src/orders.ts');
+    expect(first.request.prompt).not.toContain('/checkout/one');
+    expect(first.request.sourceBindings).toEqual([
+      { promptPath: 'src/orders.ts', runtimePath: '/checkout/one/src/orders.ts' },
+    ]);
+    expect(relocated.request.sourceBindings).toEqual([
+      { promptPath: 'src/orders.ts', runtimePath: '/different/checkout/src/orders.ts' },
+    ]);
+    expect(first.workId).toBe(relocated.workId);
+    expect(first.inputFingerprint).toBe(relocated.inputFingerprint);
+  });
+
   it('keeps semantic work identity independent of checkout roots, runtime IDs, and mutable inputs', () => {
     const original = lifecycleContext('/checkout/one');
     addSecondSemanticInput(original, '/checkout/one');
