@@ -12,6 +12,7 @@ import {
   type CodeViolationContext,
 } from '../../packages/core/src/services/llm/provider.js';
 import { planCodeViolationWork } from '../../packages/core/src/services/llm/code-work-planner.js';
+import { INLINE_FULL_FILE_SOURCE_DELIVERY } from '../../packages/core/src/services/llm/prepared-code-violation-request.js';
 
 function lifecycleContext(root = '/checkout/one'): CodeViolationContext {
   const filePath = `${root}/src/orders.ts`;
@@ -71,6 +72,27 @@ const execution = {
 } as const;
 
 describe('code work planner', () => {
+  it('snapshots inline delivery before deriving its configuration fingerprint', () => {
+    const context = lifecycleContext();
+    let contractReads = 0;
+    const inline = {
+      get contract() {
+        contractReads += 1;
+        return INLINE_FULL_FILE_SOURCE_DELIVERY;
+      },
+      sourceBindings: [{ promptPath: 'src/orders.ts', runtimePath: '/checkout/one/src/orders.ts' }],
+      fileList: '=== src/orders.ts ===\n1: export async function placeOrder() { await saveOrder(); }',
+    };
+
+    const planned = planCodeViolationWork(context, {
+      ...execution,
+      repositoryRoot: '/checkout/one',
+    }, inline);
+
+    expect(contractReads).toBe(1);
+    expect(planned.componentFingerprints.configuration).toBeTruthy();
+  });
+
   it('rejects repository inputs that escape the certified root', () => {
     expect(() => planCodeViolationWork(lifecycleContext('/checkout/one'), execution))
       .toThrow(/outside repository root/);
