@@ -62,12 +62,18 @@ function lifecycleContext(): DatabaseViolationContext {
       title: 'Orders need an index',
       content: 'The customer lookup is not indexed.',
       severity: 'high',
+      ruleKey: 'database/llm/index-review',
+      targetDatabaseName: 'orders-db',
+      targetTable: 'orders',
     }, {
       id: 'runtime-prior-b',
       type: 'database',
       title: 'Customers need retention',
       content: 'The schema has no retention field.',
       severity: 'medium',
+      ruleKey: 'database/llm/schema-review',
+      targetDatabaseName: 'customers-db',
+      targetTable: 'customers',
     }],
   };
 }

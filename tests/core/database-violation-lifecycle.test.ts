@@ -73,6 +73,9 @@ function databaseContext(): DatabaseViolationContext {
       title: 'Previous database review',
       content: 'Previously detected database problem.',
       severity: 'high',
+      ruleKey: DATABASE_RULE_KEY,
+      targetDatabaseName: 'orders-db',
+      targetTable: 'orders',
     }],
   };
 }
@@ -85,6 +88,7 @@ type DatabaseLifecycleMode =
   | 'unchanged-duplicate'
   | 'resolved-duplicate'
   | 'targets'
+  | 'valid-targets'
   | 'failed';
 
 class DatabaseLifecycleProvider extends ClaudeCodeProvider {
@@ -122,10 +126,10 @@ class DatabaseLifecycleProvider extends ClaudeCodeProvider {
       : [];
     const unchangedViolationIds = this.mode === 'outsider'
       ? ['prev-99']
-      : ['unchanged', 'overlap', 'targets', 'unchanged-duplicate'].includes(this.mode)
+      : ['unchanged', 'overlap', 'targets', 'valid-targets', 'unchanged-duplicate'].includes(this.mode)
         ? ['prev-0']
         : [];
-    const newViolations = this.mode === 'targets'
+    const newViolations = ['targets', 'valid-targets'].includes(this.mode)
       ? [{
           type: 'database',
           title: 'Orders need an index',
@@ -135,7 +139,7 @@ class DatabaseLifecycleProvider extends ClaudeCodeProvider {
           targetTable: 'orders',
           fixPrompt: 'Add the index to `orders`.',
           ruleKey: DATABASE_RULE_KEY,
-        }, {
+        }, ...(this.mode === 'targets' ? [{
           type: 'database',
           title: 'Unknown database target',
           content: 'This target was not present in the prompt.',
@@ -153,7 +157,7 @@ class DatabaseLifecycleProvider extends ClaudeCodeProvider {
           targetTable: 'orders',
           fixPrompt: null,
           ruleKey: DATABASE_RULE_KEY,
-        }]
+        }] : [])]
       : ['unchanged-duplicate', 'resolved-duplicate'].includes(this.mode)
         ? [{
             type: 'database',
@@ -295,19 +299,11 @@ afterEach(() => {
 });
 
 describe('database violation lifecycle', () => {
-  it('rebinds current database aliases and rejects unknown alias namespaces', async () => {
+  it('rejects unknown database aliases before materializing lifecycle results', async () => {
     const provider = new DatabaseLifecycleProvider('targets');
 
-    const result = await provider.generateDatabaseViolationsWithLifecycle(databaseContext());
-
-    expect(result.newViolations.map((violation) => ({
-      targetDatabaseId: violation.targetDatabaseId,
-      targetTable: violation.targetTable,
-    }))).toEqual([
-      { targetDatabaseId: 'current-database-runtime-id', targetTable: 'orders' },
-      { targetDatabaseId: null, targetTable: 'unknown_table' },
-      { targetDatabaseId: null, targetTable: 'orders' },
-    ]);
+    await expect(provider.generateDatabaseViolationsWithLifecycle(databaseContext()))
+      .rejects.toThrow(/not owned/);
   });
 
   it('surfaces an ordinary database lifecycle transport failure', async () => {
@@ -369,10 +365,10 @@ describe('database violation lifecycle', () => {
     },
   );
 
-  it('persists new lifecycle targets while retaining an explicitly unchanged prior', async () => {
+  it('persists owned lifecycle targets while retaining an explicitly unchanged prior', async () => {
     const result = await runDatabasePipeline(
       repoPath,
-      new DatabaseLifecycleProvider('targets'),
+      new DatabaseLifecycleProvider('valid-targets'),
     );
 
     expect(result.unchanged.filter((violation) => violation.type === 'database')).toHaveLength(1);
@@ -381,8 +377,6 @@ describe('database violation lifecycle', () => {
         targetDatabaseId: 'current-database-runtime-id',
         targetTable: 'orders',
       }),
-      expect.objectContaining({ targetDatabaseId: null, targetTable: 'unknown_table' }),
-      expect.objectContaining({ targetDatabaseId: null, targetTable: 'orders' }),
     ]);
   });
 

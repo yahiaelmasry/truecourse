@@ -1280,7 +1280,16 @@ async function runViolationPipelineInternal(
     .map((v) => ({ id: v.id, type: v.type, title: v.title, content: v.content, severity: v.severity }));
   const existingDatabaseViolations = llmOnlyPreviousViolations
     .filter((v) => v.type === 'database')
-    .map((v) => ({ id: v.id, type: v.type, title: v.title, content: v.content, severity: v.severity }));
+    .map((v) => ({
+      id: v.id,
+      type: v.type,
+      title: v.title,
+      content: v.content,
+      severity: v.severity,
+      ruleKey: v.ruleKey,
+      targetDatabaseName: v.targetDatabaseName,
+      targetTable: v.targetTable,
+    }));
   const existingModuleViolations = llmOnlyPreviousViolations
     .filter((v) => v.type === 'module' || v.type === 'function')
     .map((v) => ({ id: v.id, type: v.type, title: v.title, content: v.content, severity: v.severity }));
@@ -1289,6 +1298,7 @@ async function runViolationPipelineInternal(
 
   const dbSchemaContext = (dbSchemaLlmRules.length > 0 && result.databaseResult?.databases.length)
     ? {
+        ...(analysisInputFingerprint ? { analysisInputFingerprint } : {}),
         databases: result.databaseResult.databases.map((d) => ({
           id: dbIdMap.get(d.name)!,
           name: d.name,

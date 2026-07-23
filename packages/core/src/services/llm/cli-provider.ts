@@ -82,6 +82,7 @@ import {
   type MaterializedPlannedViolationResult,
   type PlannedViolationResultRequest,
 } from './planned-violation-result.js';
+import { certifyDatabaseViolationResult } from './database-result-certification.js';
 import type {
   LLMProvider,
   UsageRecord,
@@ -838,6 +839,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
         startMessage: '[CLI] Lifecycle database call starting...',
         doneMessage: (result, dur) =>
           `[CLI] Lifecycle database call done in ${dur}ms — resolved: ${result.resolvedViolationIds.length}, new: ${result.newViolations.length}`,
+        accept: (result) => { certifyDatabaseViolationResult(request, result); },
         onStart: opts?.onStart,
         onSuccess: opts?.onSuccess,
         resumeModelPin: opts?.resumeModelPin,
@@ -853,6 +855,7 @@ export abstract class BaseCLIProvider implements LLMProvider, AnalyzeLlmExecutio
       startMessage: '[CLI] Database violations call starting...',
       doneMessage: (result, dur) =>
         `[CLI] Database violations call done in ${dur}ms — ${result.violations.length} violations`,
+      accept: (result) => { certifyDatabaseViolationResult(request, result); },
       onStart: opts?.onStart,
       onSuccess: opts?.onSuccess,
       resumeModelPin: opts?.resumeModelPin,

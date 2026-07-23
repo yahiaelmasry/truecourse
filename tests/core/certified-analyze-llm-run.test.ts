@@ -160,7 +160,9 @@ function validResultFor(work: CertifiedAnalyzeLlmWork): unknown {
   const lifecycle = {
     newViolations: [],
     resolvedViolationIds: [],
-    unchangedViolationIds: [],
+    unchangedViolationIds: work.family === 'database'
+      ? work.planned.request.ownership.priorFindings.map((finding) => finding.promptId)
+      : [],
   };
   return work.family === 'service'
     ? { ...lifecycle, serviceDescriptions: [] }
@@ -388,6 +390,9 @@ describe('certified analyze LLM run', () => {
       title: 'Prior database issue',
       content: 'The prior database issue remains relevant.',
       severity: 'medium',
+      ruleKey: 'database/llm/test',
+      targetDatabaseName: 'app',
+      targetTable: 'users',
     }];
     const service = structuredClone(serviceContext);
     const module = structuredClone(validLifecycleModuleContext);
@@ -556,6 +561,45 @@ describe('certified analyze LLM run', () => {
       code: 'result-not-certified',
       family: 'code',
       domain: 'bugs',
+    });
+  });
+
+  it('rejects unowned database output before writing a durable checkpoint', async () => {
+    const adapter: AnalyzeLlmExecutionAdapter = {
+      execution: Object.freeze({ provider: 'claude-code', requestedModel: 'opus[1m]' }),
+      async execute(work) {
+        return outcomeFor(work, {
+          violations: [{
+            type: 'database',
+            title: 'Foreign database result',
+            content: 'This result names a rule outside the planned database work.',
+            severity: 'high',
+            targetDatabaseId: 'db-0',
+            targetTable: 'users',
+            fixPrompt: null,
+            ruleKey: 'database/llm/foreign',
+          }],
+        });
+      },
+    };
+    const runId = 'database-result-ownership';
+    const certified = certifyAnalyzeLlmRun({
+      runId,
+      journalKey: journalRepository,
+      repositoryRoot: '/repo',
+      code: [],
+      database: databaseContext,
+    }, adapter);
+    const activation = await activate(certified, runId);
+
+    await expect(certified.execute(activation)).rejects.toMatchObject({
+      code: 'result-not-certified',
+      family: 'database',
+      domain: 'database',
+    });
+    await expect(readAnalyzeRun(journalRepository, { runId })).resolves.toMatchObject({
+      plan: 'sealed',
+      counts: { total: 1, pending: 1, running: 0, succeeded: 0, failed: 0 },
     });
   });
 
